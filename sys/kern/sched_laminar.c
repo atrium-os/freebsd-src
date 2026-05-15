@@ -879,33 +879,69 @@ sched_laminar_wakeup(struct thread *td, int srqflags)
 
 /*
  * Binding / affinity.
+ *
+ * sched_bind pins the current thread to a specific CPU; sched_unbind
+ * releases the pin.  sched_affinity is called when a thread's
+ * cpuset_t changes and recomputes whether its current CPU placement
+ * is still valid.  In A.3d every thread runs on the CPU that
+ * enqueued it, so the affinity recompute is a no-op until cross-CPU
+ * placement lands.
  */
 static void
 sched_laminar_bind(struct thread *td, int cpu)
 {
+	struct td_sched *ts;
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED | MA_NOTRECURSED);
+	KASSERT(td == curthread,
+	    ("sched_laminar_bind: not curthread"));
+
+	ts = td_get_sched(td);
+	ts->ts_flags |= TSF_BOUND;
+	ts->ts_cpu = cpu;
+#ifdef SMP
+	if (PCPU_GET(cpuid) == cpu)
+		return;
+	/*
+	 * Cross-CPU bind would require migration here (which depends on
+	 * the cross-CPU enqueue path landing in A.3e/A.4).  Until then
+	 * the bind only takes effect at the next sched_add, and we do
+	 * not synchronously switch the thread off.
+	 */
+#endif
 }
 
 static void
 sched_laminar_unbind(struct thread *td)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	KASSERT(td == curthread,
+	    ("sched_laminar_unbind: not curthread"));
+	td_get_sched(td)->ts_flags &= ~TSF_BOUND;
 }
 
 static int
 sched_laminar_is_bound(struct thread *td)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	return ((td_get_sched(td)->ts_flags & TSF_BOUND) != 0);
 }
 
 static void
 sched_laminar_affinity(struct thread *td)
 {
 
-	UNIMPL();
+	/*
+	 * cpuset change notification.  With single-CPU enqueue (A.3d)
+	 * we have nothing to recompute: the thread already runs only on
+	 * the CPU that enqueued it, and re-spawn after cpuset change
+	 * will pick the right CPU via the new mask.  When cross-CPU
+	 * placement lands, this slot becomes a real recompute and
+	 * possibly an IPI to force migration.
+	 */
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
 }
 
 /*
