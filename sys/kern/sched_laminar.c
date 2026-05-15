@@ -56,6 +56,7 @@
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/turnstile.h>
+#include <machine/smp.h>
 
 /*
  * Per-thread scheduler state.  Appended to each struct thread; accessed
@@ -71,6 +72,10 @@
 
 /* Per-scheduler use of generic td_flags bits (mirrors ULE / 4BSD). */
 #define	TDF_SLICEEND	TDF_SCHED2	/* Thread time slice is over. */
+
+/* Common scheduler predicates (mirror ULE / 4BSD definitions). */
+#define	THREAD_CAN_SCHED(td, cpu)					\
+    CPU_ISSET((cpu), &(td)->td_cpuset->cs_mask)
 
 struct td_sched {
 	/* Picker hot fields. */
@@ -138,6 +143,7 @@ struct laminar_tdq {
 	/* Per-CPU current state. */
 	struct thread	*ltdq_curthread; /* (t) Running thread. */
 	u_char		ltdq_lowpri;	/* (ts) Lowest priority on rq. */
+	u_char		ltdq_owepreempt; /* (ts) Remote preempt pending. */
 	short		ltdq_switchcnt;	/* (l) Switches this tick. */
 	short		ltdq_oldswitchcnt; /* (l) Switches last tick. */
 };
@@ -291,6 +297,76 @@ tdq_choose(struct laminar_tdq *tdq)
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	return (runq_choose(&tdq->ltdq_runq));
 }
+
+#ifdef SMP
+/*
+ * Pick a target CPU for the thread.  A.3e bring-up policy: ALWAYS
+ * return the current CPU.  This intentionally disables cross-CPU
+ * enqueue, isolating the cross-CPU lock dance as the source of any
+ * remaining instability.  A real ts_cpu-honoring pickcpu lands in
+ * a follow-up commit once stability is confirmed.
+ */
+static int
+sched_laminar_pickcpu(struct thread *td, int flags)
+{
+
+	(void)td;
+	(void)flags;
+	return (PCPU_GET(cpuid));
+}
+
+/*
+ * Move a thread to a target CPU's runqueue.  Ported from ULE's
+ * sched_setcpu.  Drops the caller's thread lock and acquires the
+ * target tdq's lock, switching td_lock atomically across the change.
+ */
+static struct laminar_tdq *
+sched_laminar_setcpu(struct thread *td, int cpu, int flags)
+{
+	struct laminar_tdq *tdq;
+	struct mtx *mtx;
+
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	tdq = LAMINAR_TDQ_CPU(cpu);
+	td_get_sched(td)->ts_cpu = cpu;
+	if (td->td_lock == LAMINAR_TDQ_LOCKPTR(tdq)) {
+		KASSERT((flags & SRQ_HOLD) == 0,
+		    ("sched_laminar_setcpu: SRQ_HOLD with same lock"));
+		return (tdq);
+	}
+	spinlock_enter();
+	mtx = thread_lock_block(td);
+	if ((flags & SRQ_HOLD) == 0)
+		mtx_unlock_spin(mtx);
+	LAMINAR_TDQ_LOCK(tdq);
+	thread_lock_unblock(td, LAMINAR_TDQ_LOCKPTR(tdq));
+	spinlock_exit();
+	return (tdq);
+}
+
+/*
+ * Send a preempt IPI to the CPU if the newly-enqueued thread's
+ * priority warrants displacing the currently-running one.  Ported
+ * from ULE's tdq_notify (without the idle-aware optimization).
+ */
+static void
+tdq_notify(struct laminar_tdq *tdq, int lowpri)
+{
+	int cpu;
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	if (tdq->ltdq_owepreempt)
+		return;
+	if (tdq->ltdq_lowpri >= lowpri)	/* new one not higher priority */
+		return;
+	atomic_thread_fence_seq_cst();
+	cpu = LAMINAR_TDQ_ID(tdq);
+	if (cpu == PCPU_GET(cpuid))
+		return;			/* same CPU; no IPI needed */
+	tdq->ltdq_owepreempt = 1;
+	ipi_cpu(cpu, IPI_PREEMPT);
+}
+#endif /* SMP */
 
 /*
  * Enqueue a thread on the tdq.  Returns the previous lowpri so callers
@@ -760,9 +836,26 @@ sched_laminar_add(struct thread *td, int flags)
 {
 	struct laminar_tdq *tdq;
 	int lowpri;
+#ifdef SMP
+	int cpu;
+#endif
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 
+#ifdef SMP
+	/*
+	 * Pick a target CPU and acquire its tdq lock, migrating the
+	 * thread lock if needed.  sched_laminar_setcpu returns with that
+	 * tdq's lock held and td_lock pointed at it.
+	 */
+	cpu = sched_laminar_pickcpu(td, flags);
+	tdq = sched_laminar_setcpu(td, cpu, flags);
+	lowpri = tdq_add_internal(tdq, td, flags);
+	if (cpu != PCPU_GET(cpuid))
+		tdq_notify(tdq, td->td_priority);
+	else if ((flags & SRQ_YIELDING) == 0)
+		sched_laminar_setpreempt(td->td_priority);
+#else
 	tdq = LAMINAR_TDQ_SELF();
 	if (td->td_lock != LAMINAR_TDQ_LOCKPTR(tdq)) {
 		LAMINAR_TDQ_LOCK(tdq);
@@ -774,6 +867,7 @@ sched_laminar_add(struct thread *td, int flags)
 	lowpri = tdq_add_internal(tdq, td, flags);
 	if ((flags & SRQ_YIELDING) == 0)
 		sched_laminar_setpreempt(td->td_priority);
+#endif
 	if ((flags & SRQ_HOLDTD) == 0)
 		thread_unlock(td);
 	(void)lowpri;
@@ -889,7 +983,11 @@ sched_laminar_wakeup(struct thread *td, int srqflags)
 {
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
-	td_get_sched(td)->ts_cpu = PCPU_GET(cpuid);
+	/*
+	 * Let sched_laminar_add's pickcpu pick the target CPU.  ts_cpu is
+	 * preserved from the thread's last run, which gives natural soft
+	 * affinity until a real cost-minimizing pickcpu lands.
+	 */
 	sched_laminar_add(td, srqflags);
 }
 
