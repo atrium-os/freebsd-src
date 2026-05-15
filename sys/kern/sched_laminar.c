@@ -47,6 +47,7 @@
 #include <sys/types.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/cpuset.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
@@ -254,19 +255,24 @@ sched_laminar_runnable(void)
 
 /*
  * Proc/thread lifecycle hooks.
+ *
+ * The subset that does not need sched_choose / mi_switch lands in this
+ * commit (A.3c).  fork_exit, throw, idletd, and ap_entry are tightly
+ * coupled with sched_choose and land with the runqueue ops (A.3d).
  */
 static void
 sched_laminar_exit(struct proc *p, struct thread *childtd)
 {
 
-	UNIMPL();
+	PROC_LOCK_ASSERT(p, MA_OWNED);
+	sched_exit_thread(FIRST_THREAD_IN_PROC(p), childtd);
 }
 
 static void
 sched_laminar_fork(struct thread *td, struct thread *childtd)
 {
 
-	UNIMPL();
+	sched_fork_thread(td, childtd);
 }
 
 static void
@@ -321,7 +327,14 @@ static void
 sched_laminar_exit_thread(struct thread *td, struct thread *child)
 {
 
-	UNIMPL();
+	thread_lock(child);
+	/*
+	 * Load decrement on the exiting thread happens during the
+	 * scheduler-rem path which is wired up in A.3d.  Until then this
+	 * is a no-op; thread state outside the scheduler is torn down by
+	 * the caller.
+	 */
+	thread_unlock(child);
 }
 
 static u_int
@@ -340,8 +353,26 @@ sched_laminar_estcpu(struct thread *td)
 static void
 sched_laminar_fork_thread(struct thread *td, struct thread *child)
 {
+	struct td_sched *ts, *tsc;
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	child->td_oncpu = NOCPU;
+	child->td_lastcpu = NOCPU;
+	child->td_lock = LAMINAR_TDQ_LOCKPTR(LAMINAR_TDQ_SELF());
+	child->td_cpuset = cpuset_ref(td->td_cpuset);
+	child->td_domain.dr_policy = td->td_cpuset->cs_domain;
+	child->td_priority = child->td_base_pri;
+
+	ts = td_get_sched(child);
+	tsc = td_get_sched(td);
+
+	bzero(ts, sizeof(*ts));
+	ts->ts_vruntime = tsc->ts_vruntime;	/* inherit; halved at A.3d */
+	ts->ts_eff_weight = tsc->ts_eff_weight;
+	ts->ts_weight = tsc->ts_weight;
+	ts->ts_cpu = tsc->ts_cpu;
+	ts->ts_class = tsc->ts_class;
+	ts->ts_home_node = -1;
 }
 
 /*
@@ -449,7 +480,10 @@ static void
 sched_laminar_sleep(struct thread *td, int prio)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	td->td_slptick = ticks;
+	if (prio != 0 && PRI_BASE(td->td_pri_class) == PRI_TIMESHARE)
+		sched_laminar_prio(td, prio);
 }
 
 static void
@@ -498,7 +532,10 @@ static void
 sched_laminar_userret_slowpath(struct thread *td)
 {
 
-	UNIMPL();
+	thread_lock(td);
+	td->td_priority = td->td_user_pri;
+	td->td_base_pri = td->td_user_pri;
+	thread_unlock(td);
 }
 
 /*
