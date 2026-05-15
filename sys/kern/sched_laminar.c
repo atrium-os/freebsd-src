@@ -76,6 +76,7 @@
 /* Common scheduler predicates (mirror ULE / 4BSD definitions). */
 #define	THREAD_CAN_SCHED(td, cpu)					\
     CPU_ISSET((cpu), &(td)->td_cpuset->cs_mask)
+#define	THREAD_CAN_MIGRATE(td)	((td)->td_pinned == 0)
 
 struct td_sched {
 	/* Picker hot fields. */
@@ -304,13 +305,17 @@ tdq_choose(struct laminar_tdq *tdq)
 #ifdef SMP
 /*
  * Pick a target CPU for the thread.  A.3e bring-up policy: ALWAYS
- * return the current CPU.  The ts_cpu-honoring cross-CPU enqueue
- * path is fully implemented in sched_laminar_setcpu below but is
- * not yet exercised: a follow-up kgdb session is needed to
- * diagnose a witness panic ("acquiring blockable sleep lock with
- * spinlock or critical section held") that surfaces when the
- * cross-CPU branch fires under load.  Defer the trigger until
- * proper in-kernel tracing is set up.
+ * return the current CPU.  The full ts_cpu-honoring path
+ * (commented out below) is the planned policy but exposes a
+ * cross-CPU recursion bug -- sched_laminar.c:355
+ * "mtx_lock_spin: recursed on non-recursive mutex sched lock 0"
+ * triggered from softclock_call_cc -> sched_laminar_add via a
+ * callout-driven wakeup.  Root-cause analysis identified the
+ * exact source line and mtx instance via kgdb, but pinning down
+ * which outer context already holds the target tdq lock requires
+ * a focused live-breakpoint session with the kgdb workflow.
+ * Defer until the next session can attach gdb at the entry to
+ * sched_laminar_setcpu and walk the lock owner field.
  */
 static int
 sched_laminar_pickcpu(struct thread *td, int flags)
