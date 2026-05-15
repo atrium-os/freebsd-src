@@ -69,6 +69,9 @@
 #define	TSF_IDLE_CLASS	0x0004	/* PRI_IDLE: bypass vruntime ordering. */
 #define	TSF_RT_CLASS	0x0008	/* PRI_ITHD/REALTIME: real-time runq. */
 
+/* Per-scheduler use of generic td_flags bits (mirrors ULE / 4BSD). */
+#define	TDF_SLICEEND	TDF_SCHED2	/* Thread time slice is over. */
+
 struct td_sched {
 	/* Picker hot fields. */
 	uint64_t	ts_vruntime;	/* Virtual runtime. */
@@ -111,16 +114,20 @@ struct laminar_tdq {
 	struct mtx_padalign ltdq_lock;	/* Run queue spin mutex. */
 	struct cpu_group *ltdq_cg;	/* (c) Topology pointer. */
 
-	/* Timeshare class: SoA Laminar arrays. */
-	uint32_t	ltdq_ts_n;	/* (t) Slot count. */
-	uint32_t	ltdq_ts_cap;	/* (c) Slot array capacity. */
-	uint64_t	*ltdq_vruntime;	/* (t) Hot, SIMD-scannable. */
-	struct thread	**ltdq_slot;	/* (t) Cold, indexed by winner. */
-	uint64_t	ltdq_vtime;	/* (t) Virtual time floor. */
-
-	/* RT and IDLE classes: standard runq. */
-	struct runq	ltdq_rt;	/* (t) ITHD + REALTIME. */
-	struct runq	ltdq_idle;	/* (t) IDLE. */
+	/*
+	 * Run queue.  A single struct runq covering all priority bands
+	 * (RT, TIMESHARE, IDLE) -- the same shape ULE uses.  Threads at
+	 * different priorities land in different priority buckets within
+	 * this runq.  Phase A.4 introduces an SoA scan that replaces the
+	 * timeshare bucket lookup with min-vruntime; the SoA arrays below
+	 * are declared now and remain unused until then.
+	 */
+	struct runq	ltdq_runq;	/* (t) Active runq for all classes. */
+	uint32_t	ltdq_ts_n;	/* (t) Timeshare SoA slot count. */
+	uint32_t	ltdq_ts_cap;	/* (c) Timeshare SoA capacity. */
+	uint64_t	*ltdq_vruntime;	/* (t) Hot, SIMD-scannable (A.4). */
+	struct thread	**ltdq_slot;	/* (t) Cold, by winner index (A.4). */
+	uint64_t	ltdq_vtime;	/* (t) Virtual time floor (A.4). */
 
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
@@ -182,8 +189,7 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 
 	if (bootverbose)
 		printf("laminar: setup cpu %d\n", id);
-	runq_init(&tdq->ltdq_rt);
-	runq_init(&tdq->ltdq_idle);
+	runq_init(&tdq->ltdq_runq);
 	tdq->ltdq_id = id;
 	tdq->ltdq_ts_n = 0;
 	tdq->ltdq_ts_cap = 0;		/* Allocated in commit A.4. */
@@ -215,6 +221,90 @@ sched_setup_smp(void)
 	PCPU_SET(sched, DPCPU_PTR(ltdq));
 }
 #endif
+
+/*
+ * Per-CPU runqueue primitives.  These mirror the ULE shape and serve
+ * as the foundation for the slot implementations that follow.
+ */
+
+static __inline void
+tdq_load_add(struct laminar_tdq *tdq, struct thread *td)
+{
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	tdq->ltdq_load++;
+	if ((td->td_flags & TDF_NOLOAD) == 0)
+		tdq->ltdq_sysload++;
+}
+
+static __inline void
+tdq_load_rem(struct laminar_tdq *tdq, struct thread *td)
+{
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	KASSERT(tdq->ltdq_load > 0,
+	    ("tdq_load_rem: load underflow on cpu %d", tdq->ltdq_id));
+	tdq->ltdq_load--;
+	if ((td->td_flags & TDF_NOLOAD) == 0)
+		tdq->ltdq_sysload--;
+}
+
+static __inline void
+tdq_runq_add(struct laminar_tdq *tdq, struct thread *td, int flags)
+{
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	THREAD_LOCK_BLOCKED_ASSERT(td, MA_OWNED);
+	runq_add(&tdq->ltdq_runq, td, flags);
+}
+
+static __inline void
+tdq_runq_rem(struct laminar_tdq *tdq, struct thread *td)
+{
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	(void)runq_remove(&tdq->ltdq_runq, td);
+}
+
+/*
+ * Pick the highest-priority thread on this runqueue.  Phase A.4
+ * replaces the timeshare scan with min-vruntime; until then this is
+ * pure priority order across all three priority bands.
+ */
+static struct thread *
+tdq_choose(struct laminar_tdq *tdq)
+{
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	return (runq_choose(&tdq->ltdq_runq));
+}
+
+/*
+ * Enqueue a thread on the tdq.  Returns the previous lowpri so callers
+ * can detect whether they should request preemption.  Assumes the
+ * caller already holds the tdq lock and the thread lock.
+ */
+static int
+tdq_add_internal(struct laminar_tdq *tdq, struct thread *td, int flags)
+{
+	int lowpri;
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	THREAD_LOCK_BLOCKED_ASSERT(td, MA_OWNED);
+	KASSERT(td->td_inhibitors == 0,
+	    ("tdq_add_internal: inhibited thread"));
+	KASSERT(TD_CAN_RUN(td) || TD_IS_RUNNING(td),
+	    ("tdq_add_internal: bad thread state"));
+	KASSERT((td->td_flags & TDF_INMEM) != 0,
+	    ("tdq_add_internal: thread swapped out"));
+
+	lowpri = tdq->ltdq_lowpri;
+	if (td->td_priority < lowpri)
+		tdq->ltdq_lowpri = td->td_priority;
+	tdq_runq_add(tdq, td, flags);
+	tdq_load_add(tdq, td);
+	return (lowpri);
+}
 
 /*
  * General scheduling info.
@@ -278,8 +368,17 @@ sched_laminar_fork(struct thread *td, struct thread *childtd)
 static void
 sched_laminar_fork_exit(struct thread *td)
 {
+	struct laminar_tdq *tdq;
+	int cpuid;
 
-	UNIMPL();
+	KASSERT(curthread->td_md.md_spinlock_count == 1,
+	    ("sched_laminar_fork_exit: invalid spinlock count"));
+	cpuid = PCPU_GET(cpuid);
+	tdq = LAMINAR_TDQ_SELF();
+	LAMINAR_TDQ_LOCK(tdq);
+	spinlock_exit();
+	MPASS(td->td_lock == LAMINAR_TDQ_LOCKPTR(tdq));
+	td->td_oncpu = cpuid;
 }
 
 static void
@@ -316,11 +415,35 @@ sched_laminar_nice(struct proc *p, int nice)
 	}
 }
 
+/*
+ * Common: choose the next thread to run while in a spinlock section.
+ * Returns with the tdq lock dropped.
+ */
+static struct thread *
+sched_laminar_throw_grab(struct laminar_tdq *tdq)
+{
+	struct thread *newtd;
+
+	newtd = choosethread();
+	spinlock_enter();
+	LAMINAR_TDQ_UNLOCK(tdq);
+	return (newtd);
+}
+
 static void
 sched_laminar_ap_entry(void)
 {
+	struct laminar_tdq *tdq;
+	struct thread *newtd;
 
-	UNIMPL();
+	tdq = LAMINAR_TDQ_SELF();
+	THREAD_LOCKPTR_ASSERT(curthread, LAMINAR_TDQ_LOCKPTR(tdq));
+	LAMINAR_TDQ_LOCK(tdq);
+	spinlock_exit();
+	PCPU_SET(switchtime, cpu_ticks());
+	PCPU_SET(switchticks, ticks);
+	newtd = sched_laminar_throw_grab(tdq);
+	cpu_throw(NULL, newtd);		/* does not return */
 }
 
 static void
@@ -489,15 +612,78 @@ sched_laminar_sleep(struct thread *td, int prio)
 static void
 sched_laminar_sswitch(struct thread *td, int flags)
 {
+	struct laminar_tdq *tdq;
+	struct thread *newtd;
+	struct mtx *mtx;
+	int srqflag, preempted;
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+
+	tdq = LAMINAR_TDQ_SELF();
+	td->td_lastcpu = td->td_oncpu;
+	preempted = (td->td_flags & TDF_SLICEEND) == 0 &&
+	    (flags & SW_PREEMPT) != 0;
+	td->td_flags &= ~TDF_SLICEEND;
+	ast_unsched_locked(td, TDA_SCHED);
+	td->td_owepreempt = 0;
+	if (!TD_IS_IDLETHREAD(td))
+		tdq->ltdq_switchcnt++;
+
+	mtx = thread_lock_block(td);
+	spinlock_enter();
+	if (TD_IS_IDLETHREAD(td)) {
+		MPASS(mtx == LAMINAR_TDQ_LOCKPTR(tdq));
+		TD_SET_CAN_RUN(td);
+	} else if (TD_IS_RUNNING(td)) {
+		MPASS(mtx == LAMINAR_TDQ_LOCKPTR(tdq));
+		srqflag = SRQ_OURSELF | SRQ_YIELDING |
+		    (preempted ? SRQ_PREEMPTED : 0);
+		tdq_runq_add(tdq, td, srqflag);
+	} else {
+		/* Thread is going to sleep. */
+		if (mtx != LAMINAR_TDQ_LOCKPTR(tdq)) {
+			mtx_unlock_spin(mtx);
+			LAMINAR_TDQ_LOCK(tdq);
+		}
+		tdq_load_rem(tdq, td);
+	}
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED | MA_NOTRECURSED);
+	MPASS(td == tdq->ltdq_curthread);
+	newtd = choosethread();
+	LAMINAR_TDQ_UNLOCK(tdq);
+
+	if (td != newtd) {
+		td->td_oncpu = NOCPU;
+		cpu_switch(td, newtd, mtx);
+		td->td_oncpu = PCPU_GET(cpuid);
+	} else {
+		/* No context switch.  Restore the thread lock. */
+		td->td_lock = LAMINAR_TDQ_LOCKPTR(tdq);
+		spinlock_enter();
+		mtx_unlock_spin(mtx);
+	}
+	KASSERT(curthread->td_md.md_spinlock_count == 1,
+	    ("sched_laminar_sswitch: invalid spinlock count"));
 }
 
 static void
 sched_laminar_throw(struct thread *td)
 {
+	struct laminar_tdq *tdq;
+	struct thread *newtd;
 
-	UNIMPL();
+	tdq = LAMINAR_TDQ_SELF();
+	MPASS(td != NULL);
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	THREAD_LOCKPTR_ASSERT(td, LAMINAR_TDQ_LOCKPTR(tdq));
+
+	tdq_load_rem(tdq, td);
+	td->td_lastcpu = td->td_oncpu;
+	td->td_oncpu = NOCPU;
+	thread_lock_block(td);
+	newtd = sched_laminar_throw_grab(tdq);
+	cpu_switch(td, newtd, LAMINAR_TDQ_LOCKPTR(tdq));   /* no return */
 }
 
 static void
@@ -540,61 +726,155 @@ sched_laminar_userret_slowpath(struct thread *td)
 
 /*
  * Run queue manipulation.
+ *
+ * Placement on enqueue is intentionally simple in this commit: every
+ * sched_add lands on the current CPU.  Real cross-CPU placement
+ * (sched_pickcpu) is added in A.3e; until then the box runs but the
+ * APs only execute work that is spawned on them.  This is enough to
+ * reach multiuser.
  */
+static void
+sched_laminar_setpreempt(int pri)
+{
+	struct thread *ctd;
+
+	ctd = curthread;
+	THREAD_LOCK_ASSERT(ctd, MA_OWNED);
+	if (pri < ctd->td_priority)
+		ast_sched_locked(ctd, TDA_SCHED);
+}
+
 static void
 sched_laminar_add(struct thread *td, int flags)
 {
+	struct laminar_tdq *tdq;
+	int lowpri;
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+
+	tdq = LAMINAR_TDQ_SELF();
+	if (td->td_lock != LAMINAR_TDQ_LOCKPTR(tdq)) {
+		LAMINAR_TDQ_LOCK(tdq);
+		if ((flags & SRQ_HOLD) != 0)
+			td->td_lock = LAMINAR_TDQ_LOCKPTR(tdq);
+		else
+			thread_lock_set(td, LAMINAR_TDQ_LOCKPTR(tdq));
+	}
+	lowpri = tdq_add_internal(tdq, td, flags);
+	if ((flags & SRQ_YIELDING) == 0)
+		sched_laminar_setpreempt(td->td_priority);
+	if ((flags & SRQ_HOLDTD) == 0)
+		thread_unlock(td);
+	(void)lowpri;
+}
+
+static void
+sched_laminar_rem(struct thread *td)
+{
+	struct laminar_tdq *tdq;
+
+	tdq = LAMINAR_TDQ_CPU(td_get_sched(td)->ts_cpu);
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	MPASS(td->td_lock == LAMINAR_TDQ_LOCKPTR(tdq));
+	KASSERT(TD_ON_RUNQ(td),
+	    ("sched_laminar_rem: thread not on run queue"));
+	tdq_runq_rem(tdq, td);
+	tdq_load_rem(tdq, td);
+	TD_SET_CAN_RUN(td);
+	if (td->td_priority == tdq->ltdq_lowpri)
+		tdq->ltdq_lowpri = PRI_MAX_IDLE;
 }
 
 static struct thread *
 sched_laminar_choose(void)
 {
+	struct laminar_tdq *tdq;
+	struct thread *td;
 
-	UNIMPL();
+	tdq = LAMINAR_TDQ_SELF();
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	td = tdq_choose(tdq);
+	if (td != NULL) {
+		tdq_runq_rem(tdq, td);
+		tdq_load_rem(tdq, td);
+		tdq->ltdq_lowpri = td->td_priority;
+	} else {
+		tdq->ltdq_lowpri = PRI_MAX_IDLE;
+		td = PCPU_GET(idlethread);
+	}
+	tdq->ltdq_curthread = td;
+	return (td);
 }
 
 static void
 sched_laminar_clock(struct thread *td, int cnt)
 {
+	struct laminar_tdq *tdq;
+	struct td_sched *ts;
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	tdq = LAMINAR_TDQ_SELF();
+	ts = td_get_sched(td);
+
+	/*
+	 * Account work to the thread's vruntime.  Phase A.4 wires this
+	 * to ts_eff_weight; for now ts_eff_weight is 1 for everyone, so
+	 * vruntime accumulates at the unit rate -- enough to maintain
+	 * monotonicity but not yet enforcing proportional share.
+	 */
+	ts->ts_vruntime += (uint64_t)cnt;
+	tdq->ltdq_switchcnt = tdq->ltdq_switchcnt + 1;
 }
 
 static void
 sched_laminar_idletd(void *dummy)
 {
+	struct laminar_tdq *tdq;
+	struct thread *td;
 
-	UNIMPL();
+	td = curthread;
+	tdq = LAMINAR_TDQ_SELF();
+	THREAD_NO_SLEEPING();
+	for (;;) {
+		while (atomic_load_int(&tdq->ltdq_load) == 0) {
+			cpu_idle(0);
+		}
+		thread_lock(td);
+		mi_switch(SW_VOL | SWT_IDLE);
+	}
 }
 
 static void
 sched_laminar_preempt(struct thread *td)
 {
+	int flags;
 
-	UNIMPL();
+	thread_lock(td);
+	if (td->td_critnest > 1) {
+		td->td_owepreempt = 1;
+	} else {
+		flags = SW_INVOL | SW_PREEMPT;
+		flags |= TD_IS_IDLETHREAD(td) ? SWT_REMOTEWAKEIDLE :
+		    SWT_REMOTEPREEMPT;
+		mi_switch(flags);
+	}
 }
 
 static void
 sched_laminar_relinquish(struct thread *td)
 {
 
-	UNIMPL();
-}
-
-static void
-sched_laminar_rem(struct thread *td)
-{
-
-	UNIMPL();
+	thread_lock(td);
+	mi_switch(SW_VOL | SWT_RELINQUISH);
 }
 
 static void
 sched_laminar_wakeup(struct thread *td, int srqflags)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	td_get_sched(td)->ts_cpu = PCPU_GET(cpuid);
+	sched_laminar_add(td, srqflags);
 }
 
 /*
