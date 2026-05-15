@@ -171,6 +171,19 @@ static struct laminar_tdq laminar_tdq_cpu;
 static int __read_mostly realstathz = 127;
 static int __read_mostly sched_slice = 10;
 
+/*
+ * Restore a thread's td_lock after thread_lock_block().  ULE-style:
+ * an atomic store of the saved mtx releases the BLOCKED_LOCK marker.
+ * This is NOT a mutex unlock.
+ */
+static __inline void
+thread_unblock_switch(struct thread *td, struct mtx *mtx)
+{
+
+	atomic_store_rel_ptr((volatile uintptr_t *)&td->td_lock,
+	    (uintptr_t)mtx);
+}
+
 static void __dead2
 sched_laminar_unimpl(const char *fn)
 {
@@ -658,10 +671,8 @@ sched_laminar_sswitch(struct thread *td, int flags)
 		cpu_switch(td, newtd, mtx);
 		td->td_oncpu = PCPU_GET(cpuid);
 	} else {
-		/* No context switch.  Restore the thread lock. */
-		td->td_lock = LAMINAR_TDQ_LOCKPTR(tdq);
-		spinlock_enter();
-		mtx_unlock_spin(mtx);
+		/* No context switch: just unblock the thread lock. */
+		thread_unblock_switch(td, mtx);
 	}
 	KASSERT(curthread->td_md.md_spinlock_count == 1,
 	    ("sched_laminar_sswitch: invalid spinlock count"));
@@ -795,8 +806,13 @@ sched_laminar_choose(void)
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	td = tdq_choose(tdq);
 	if (td != NULL) {
+		/*
+		 * Pull off the runq; do NOT decrement load.  Load tracks
+		 * threads associated with this CPU (running + on runq).
+		 * choose moves the thread from runq to running, so the
+		 * load count is unchanged.  Mirrors ULE's tdq_choose.
+		 */
 		tdq_runq_rem(tdq, td);
-		tdq_load_rem(tdq, td);
 		tdq->ltdq_lowpri = td->td_priority;
 	} else {
 		tdq->ltdq_lowpri = PRI_MAX_IDLE;
