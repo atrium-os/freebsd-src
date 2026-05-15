@@ -153,6 +153,15 @@ static struct laminar_tdq laminar_tdq_cpu;
 #define	LAMINAR_TDQ_LOCK_ASSERT(t, type)				\
     mtx_assert(LAMINAR_TDQ_LOCKPTR((t)), (type))
 
+/*
+ * Tick-domain constants set in sched_laminar_initticks(), once stathz is
+ * known.  sched_slice is the default time slice in stathz ticks before a
+ * thread is reconsidered for preemption.
+ */
+#define	SCHED_SLICE_DEFAULT_DIVISOR	10	/* ~94 ms at stathz=127 */
+static int __read_mostly realstathz = 127;
+static int __read_mostly sched_slice = 10;
+
 static void __dead2
 sched_laminar_unimpl(const char *fn)
 {
@@ -163,27 +172,83 @@ sched_laminar_unimpl(const char *fn)
 #define	UNIMPL()	sched_laminar_unimpl(__func__)
 
 /*
+ * Initialize a per-CPU runqueue.  Called once per CPU at boot.
+ */
+static void
+tdq_setup(struct laminar_tdq *tdq, int id)
+{
+
+	if (bootverbose)
+		printf("laminar: setup cpu %d\n", id);
+	runq_init(&tdq->ltdq_rt);
+	runq_init(&tdq->ltdq_idle);
+	tdq->ltdq_id = id;
+	tdq->ltdq_ts_n = 0;
+	tdq->ltdq_ts_cap = 0;		/* Allocated in commit A.4. */
+	tdq->ltdq_vruntime = NULL;
+	tdq->ltdq_slot = NULL;
+	tdq->ltdq_vtime = 0;
+	mtx_init(LAMINAR_TDQ_LOCKPTR(tdq), "laminar sched lock", "sched lock",
+	    MTX_SPIN);
+}
+
+#ifdef SMP
+/*
+ * Walk the topology and initialize one runqueue per CPU.  Called from
+ * sched_laminar_setup() on the boot CPU.
+ */
+static void
+sched_setup_smp(void)
+{
+	struct laminar_tdq *tdq;
+	int i;
+
+	CPU_FOREACH(i) {
+		tdq = LAMINAR_TDQ_CPU(i);
+		tdq_setup(tdq, i);
+		tdq->ltdq_cg = smp_topo_find(cpu_top, i);
+		if (tdq->ltdq_cg == NULL)
+			panic("laminar: no cpu group for cpu %d", i);
+	}
+	PCPU_SET(sched, DPCPU_PTR(ltdq));
+}
+#endif
+
+/*
  * General scheduling info.
  */
 static int
 sched_laminar_load(void)
 {
+#ifdef SMP
+	int total, i;
 
-	UNIMPL();
+	total = 0;
+	CPU_FOREACH(i)
+		total += atomic_load_int(&LAMINAR_TDQ_CPU(i)->ltdq_sysload);
+	return (total);
+#else
+	return (atomic_load_int(&LAMINAR_TDQ_SELF()->ltdq_sysload));
+#endif
 }
 
 static int
 sched_laminar_rr_interval(void)
 {
 
-	UNIMPL();
+	/* Convert sched_slice (stathz ticks) to hz ticks. */
+	return (imax(1, (sched_slice * hz + realstathz / 2) / realstathz));
 }
 
 static bool
 sched_laminar_runnable(void)
 {
+	struct laminar_tdq *tdq;
+	int load;
 
-	UNIMPL();
+	tdq = LAMINAR_TDQ_SELF();
+	load = atomic_load_int(&tdq->ltdq_load);
+	return (load > (TD_IS_IDLETHREAD(curthread) ? 0 : 1));
 }
 
 /*
@@ -436,31 +501,32 @@ static int
 sched_laminar_sizeof_proc(void)
 {
 
-	UNIMPL();
+	return (sizeof(struct proc));
 }
 
 static int
 sched_laminar_sizeof_thread(void)
 {
 
-	UNIMPL();
+	return (sizeof(struct thread) + sizeof(struct td_sched));
 }
 
 /*
- * KTR thread-name accessors.
+ * KTR thread-name accessors.  The KTR-cached "%s tid %d" form is added
+ * in a later commit (alongside the SDT probes); for now we expose the
+ * thread's bare name.
  */
 static char *
 sched_laminar_tdname(struct thread *td)
 {
 
-	UNIMPL();
+	return (td->td_name);
 }
 
 static void
 sched_laminar_clear_tdname(struct thread *td)
 {
 
-	UNIMPL();
 }
 
 /*
@@ -470,52 +536,111 @@ static bool
 sched_laminar_do_timer_accounting(void)
 {
 
-	UNIMPL();
+	return (true);
 }
 
 static int
 sched_laminar_find_l2_neighbor(int cpuid)
 {
 
-	UNIMPL();
+	/*
+	 * Deferred to a later phase.  Returning -1 indicates "no L2
+	 * neighbor known"; callers fall back to non-L2-aware paths.
+	 */
+	return (-1);
 }
 
 /*
- * Initialization.
+ * Initialization.  Called once on the boot CPU before any thread runs.
  */
 static void
 sched_laminar_init(void)
 {
+	struct td_sched *ts0;
 
-	UNIMPL();
+	ts0 = td_get_sched(&thread0);
+	ts0->ts_vruntime = 0;
+	ts0->ts_eff_weight = 1;
+	ts0->ts_weight = 1;
+	ts0->ts_slot = 0;
+	ts0->ts_cpu = curcpu;
+	ts0->ts_flags = 0;
+	ts0->ts_class = 0;		/* refined in a later phase */
+	ts0->ts_class_pri = 0;
+	ts0->ts_dom_waker = NULL;
+	ts0->ts_dom_waker_conf = 0;
+	ts0->ts_home_node_conf = 0;
+	ts0->ts_home_node = -1;
+	ts0->ts_mem_bw = false;
 }
 
+/*
+ * Per-AP initialization.  Called from schedinit_ap() on each application
+ * processor before it enters the scheduler.
+ */
 static void
 sched_laminar_init_ap(void)
 {
 
-	UNIMPL();
+#ifdef SMP
+	PCPU_SET(sched, DPCPU_PTR(ltdq));
+#endif
+	PCPU_GET(idlethread)->td_lock =
+	    LAMINAR_TDQ_LOCKPTR(LAMINAR_TDQ_SELF());
 }
 
+/*
+ * Run-queue setup.  Called once at SI_SUB_RUN_QUEUE.  Initializes
+ * per-CPU runqueues and attaches thread0 to the boot CPU's queue.
+ */
 static void
 sched_laminar_setup(void)
 {
+	struct laminar_tdq *tdq;
 
-	UNIMPL();
+#ifdef SMP
+	sched_setup_smp();
+#else
+	tdq_setup(LAMINAR_TDQ_SELF(), 0);
+#endif
+	tdq = LAMINAR_TDQ_SELF();
+
+	/*
+	 * thread0 is already running; attach it to the boot tdq's lock
+	 * and bump the runnable counts so subsequent accounting balances
+	 * out.  Full enqueue logic lands with the runqueue ops commit.
+	 */
+	LAMINAR_TDQ_LOCK(tdq);
+	thread0.td_lock = LAMINAR_TDQ_LOCKPTR(tdq);
+	tdq->ltdq_load++;
+	if ((thread0.td_flags & TDF_NOLOAD) == 0)
+		tdq->ltdq_sysload++;
+	tdq->ltdq_curthread = &thread0;
+	tdq->ltdq_lowpri = thread0.td_priority;
+	LAMINAR_TDQ_UNLOCK(tdq);
 }
 
+/*
+ * Late tick-domain initialization, after stathz is known.
+ */
 static void
 sched_laminar_initticks(void)
 {
 
-	UNIMPL();
+	realstathz = stathz ? stathz : hz;
+	sched_slice = realstathz / SCHED_SLICE_DEFAULT_DIVISOR;
+	if (sched_slice < 1)
+		sched_slice = 1;
 }
 
+/*
+ * Periodic scheduler maintenance kproc entry.  No-op; Laminar's vruntime
+ * needs no %CPU window decay.
+ */
 static void
 sched_laminar_schedcpu(void)
 {
 
-	UNIMPL();
 }
 
 struct sched_instance sched_laminar_instance = {
