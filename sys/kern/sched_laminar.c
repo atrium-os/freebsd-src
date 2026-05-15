@@ -47,8 +47,111 @@
 #include <sys/types.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/pcpu.h>
 #include <sys/proc.h>
+#include <sys/runq.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
+
+/*
+ * Per-thread scheduler state.  Appended to each struct thread; accessed
+ * via td_get_sched(td).  All fields are protected by the owning per-CPU
+ * runqueue lock unless otherwise noted.
+ */
+
+/* ts_flags. */
+#define	TSF_BOUND	0x0001	/* sched_bind(): thread cannot migrate */
+#define	TSF_XFERABLE	0x0002	/* On a runqueue and transferable. */
+#define	TSF_IDLE_CLASS	0x0004	/* PRI_IDLE: bypass vruntime ordering. */
+#define	TSF_RT_CLASS	0x0008	/* PRI_ITHD/REALTIME: real-time runq. */
+
+struct td_sched {
+	/* Picker hot fields. */
+	uint64_t	ts_vruntime;	/* Virtual runtime. */
+	uint64_t	ts_eff_weight;	/* Precomputed jail_nthreads /
+					 * (weight * jail_weight). */
+	uint32_t	ts_weight;	/* Nice-derived per-thread weight. */
+	uint32_t	ts_slot;	/* Index in tdq SoA arrays. */
+	/* Placement / migration. */
+	int		ts_cpu;		/* Current or last CPU. */
+	uint16_t	ts_flags;	/* TSF_*. */
+	uint8_t		ts_class;	/* RT / TIMESHARE / IDLE. */
+	uint8_t		ts_class_pri;	/* Priority within RT/IDLE class. */
+	/* IPC affinity (whitepaper §6). */
+	struct thread	*ts_dom_waker;
+	uint16_t	ts_dom_waker_conf;
+	/* NUMA (whitepaper §8). */
+	uint16_t	ts_home_node_conf;
+	int16_t		ts_home_node;	/* -1 = unset. */
+	bool		ts_mem_bw;	/* Bandwidth-bound class flag. */
+};
+
+_Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
+    sizeof(struct thread0_storage),
+    "increase struct thread0_storage.t0st_sched size for Laminar");
+
+/*
+ * Per-CPU runqueue.  The timeshare class uses a packed structure-of-arrays
+ * for the Laminar min-vruntime pick (ltdq_vruntime[] hot, ltdq_slot[]
+ * cold).  The real-time and idle classes reuse the standard struct runq
+ * priority-bucket layout from sys/runq.h.
+ *
+ * Locking annotations:
+ * (c)  constant after init
+ * (l)  CPU-local accesses only
+ * (ls) stores by the local CPU; loads may be lockless
+ * (t)  protected by ltdq_lock
+ * (ts) stores under lock; loads may be lockless
+ */
+struct laminar_tdq {
+	struct mtx_padalign ltdq_lock;	/* Run queue spin mutex. */
+	struct cpu_group *ltdq_cg;	/* (c) Topology pointer. */
+
+	/* Timeshare class: SoA Laminar arrays. */
+	uint32_t	ltdq_ts_n;	/* (t) Slot count. */
+	uint32_t	ltdq_ts_cap;	/* (c) Slot array capacity. */
+	uint64_t	*ltdq_vruntime;	/* (t) Hot, SIMD-scannable. */
+	struct thread	**ltdq_slot;	/* (t) Cold, indexed by winner. */
+	uint64_t	ltdq_vtime;	/* (t) Virtual time floor. */
+
+	/* RT and IDLE classes: standard runq. */
+	struct runq	ltdq_rt;	/* (t) ITHD + REALTIME. */
+	struct runq	ltdq_idle;	/* (t) IDLE. */
+
+	/* Aggregate state. */
+	int		ltdq_load;	/* (ts) Total runnable. */
+	int		ltdq_sysload;	/* (ts) Non-ITHD load. */
+	int		ltdq_transferable; /* (ts) Migration-eligible count. */
+	int		ltdq_id;	/* (c) CPU id. */
+
+	/* Per-CPU current state. */
+	struct thread	*ltdq_curthread; /* (t) Running thread. */
+	u_char		ltdq_lowpri;	/* (ts) Lowest priority on rq. */
+	short		ltdq_switchcnt;	/* (l) Switches this tick. */
+	short		ltdq_oldswitchcnt; /* (l) Switches last tick. */
+};
+
+#ifdef SMP
+DPCPU_DEFINE_STATIC(struct laminar_tdq, ltdq);
+
+#define	LAMINAR_TDQ_SELF()	((struct laminar_tdq *)PCPU_GET(sched))
+#define	LAMINAR_TDQ_CPU(cpu)	(DPCPU_ID_PTR((cpu), ltdq))
+#define	LAMINAR_TDQ_ID(tdq)	((tdq)->ltdq_id)
+#else	/* !SMP */
+static struct laminar_tdq laminar_tdq_cpu;
+
+#define	LAMINAR_TDQ_SELF()	(&laminar_tdq_cpu)
+#define	LAMINAR_TDQ_CPU(cpu)	(&laminar_tdq_cpu)
+#define	LAMINAR_TDQ_ID(tdq)	(0)
+#endif
+
+#define	LAMINAR_TDQ_LOCKPTR(t)	((struct mtx *)(&(t)->ltdq_lock))
+#define	LAMINAR_TDQ_LOCK(t)	mtx_lock_spin(LAMINAR_TDQ_LOCKPTR((t)))
+#define	LAMINAR_TDQ_UNLOCK(t)	mtx_unlock_spin(LAMINAR_TDQ_LOCKPTR((t)))
+#define	LAMINAR_TDQ_LOCK_ASSERT(t, type)				\
+    mtx_assert(LAMINAR_TDQ_LOCKPTR((t)), (type))
 
 static void __dead2
 sched_laminar_unimpl(const char *fn)
