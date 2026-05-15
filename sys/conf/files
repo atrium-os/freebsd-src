@@ -4727,6 +4727,15 @@ sched_4bsd_ns.h			optional sched_4bsd \
 	${AWK} -f $S/tools/sched_impl_ns.awk > ${.TARGET}" \
 	no-obj no-implicit-rule before-depend local \
 	clean			"sched_4bsd_ns.h"
+kern/sched_laminar.c		optional sched_laminar
+sched_laminar_ns.h		optional sched_laminar \
+	dependency		"$S/kern/sched_ns.h $S/sys/sched.h \
+	$S/tools/sched_impl_ns.awk" \
+	compile-with		"${CPP} ${INCLUDES} -DSCHED_IMPLEMENTATION=laminar \
+	$S/kern/sched_ns.h | \
+	${AWK} -f $S/tools/sched_impl_ns.awk > ${.TARGET}" \
+	no-obj no-implicit-rule before-depend local \
+	clean			"sched_laminar_ns.h"
 kern/sched_ule.c		optional sched_ule
 sched_ule_ns.h			optional sched_ule \
 	dependency		"$S/kern/sched_ns.h $S/sys/sched.h \
