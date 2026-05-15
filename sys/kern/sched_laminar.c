@@ -146,6 +146,7 @@ struct laminar_tdq {
 	u_char		ltdq_owepreempt; /* (ts) Remote preempt pending. */
 	short		ltdq_switchcnt;	/* (l) Switches this tick. */
 	short		ltdq_oldswitchcnt; /* (l) Switches last tick. */
+	char		ltdq_name[24];	/* (c) Per-instance lock name. */
 };
 
 #ifdef SMP
@@ -215,7 +216,9 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	tdq->ltdq_vruntime = NULL;
 	tdq->ltdq_slot = NULL;
 	tdq->ltdq_vtime = 0;
-	mtx_init(LAMINAR_TDQ_LOCKPTR(tdq), "laminar sched lock", "sched lock",
+	snprintf(tdq->ltdq_name, sizeof(tdq->ltdq_name),
+	    "sched lock %d", id);
+	mtx_init(LAMINAR_TDQ_LOCKPTR(tdq), tdq->ltdq_name, "sched lock",
 	    MTX_SPIN);
 }
 
@@ -301,10 +304,13 @@ tdq_choose(struct laminar_tdq *tdq)
 #ifdef SMP
 /*
  * Pick a target CPU for the thread.  A.3e bring-up policy: ALWAYS
- * return the current CPU.  This intentionally disables cross-CPU
- * enqueue, isolating the cross-CPU lock dance as the source of any
- * remaining instability.  A real ts_cpu-honoring pickcpu lands in
- * a follow-up commit once stability is confirmed.
+ * return the current CPU.  The ts_cpu-honoring cross-CPU enqueue
+ * path is fully implemented in sched_laminar_setcpu below but is
+ * not yet exercised: a follow-up kgdb session is needed to
+ * diagnose a witness panic ("acquiring blockable sleep lock with
+ * spinlock or critical section held") that surfaces when the
+ * cross-CPU branch fires under load.  Defer the trigger until
+ * proper in-kernel tracing is set up.
  */
 static int
 sched_laminar_pickcpu(struct thread *td, int flags)
