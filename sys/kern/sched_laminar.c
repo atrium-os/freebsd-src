@@ -54,6 +54,7 @@
 #include <sys/runq.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
+#include <sys/turnstile.h>
 
 /*
  * Per-thread scheduler state.  Appended to each struct thread; accessed
@@ -279,14 +280,34 @@ static void
 sched_laminar_class(struct thread *td, int class)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	td->td_pri_class = class;
+	/*
+	 * Cross-class moves (e.g., timeshare -> realtime) need to migrate
+	 * the thread between SoA timeshare arrays and the std runq buckets.
+	 * That logic lands with the runqueue ops commit (A.3d); for now we
+	 * just update the class label.  Any class change while the thread
+	 * is on a runqueue is corrected at the next sched_add().
+	 */
 }
 
 static void
 sched_laminar_nice(struct proc *p, int nice)
 {
+	struct thread *td;
 
-	UNIMPL();
+	PROC_LOCK_ASSERT(p, MA_OWNED);
+	p->p_nice = nice;
+	/*
+	 * Laminar derives ts_weight (and consequently ts_eff_weight) from
+	 * the proc's nice value.  Weight re-derivation on per-thread state
+	 * lands with the runqueue ops commit (A.3d) where the precompute
+	 * site exists; for now we just record the nice value.
+	 */
+	FOREACH_THREAD_IN_PROC(p, td) {
+		thread_lock(td);
+		thread_unlock(td);
+	}
 }
 
 static void
@@ -307,7 +328,13 @@ static u_int
 sched_laminar_estcpu(struct thread *td)
 {
 
-	UNIMPL();
+	/*
+	 * Laminar accounts CPU use via vruntime, not estcpu.  Return 0;
+	 * consumers (mostly userland %CPU display) will see no
+	 * accumulation through this API until pctcpu/estcpu are derived
+	 * from vruntime in a later commit.
+	 */
+	return (0);
 }
 
 static void
@@ -319,47 +346,103 @@ sched_laminar_fork_thread(struct thread *td, struct thread *child)
 
 /*
  * Priority manipulation.
+ *
+ * Laminar's timeshare-class pick is vruntime-ordered, not priority-
+ * ordered, so changing a timeshare thread's priority does not affect its
+ * relative ordering on the local runqueue.  Real-time (PRI_ITHD,
+ * PRI_REALTIME) and idle (PRI_IDLE) classes use the standard struct runq
+ * with per-priority buckets and DO require a re-insert on priority
+ * change; that re-insert lands together with the runqueue ops commit
+ * (A.3d).  Until then, sched_priority() updates td_priority but does not
+ * touch a thread already on a runqueue.
  */
 static void
-sched_laminar_ithread_prio(struct thread *td, u_char prio)
+sched_priority(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	if (td->td_priority == prio)
+		return;
+	td->td_priority = prio;
+	/*
+	 * If the thread is on a runqueue, leave it where it is for now.
+	 * Re-insert on priority-bucket change is added in commit A.3d.
+	 */
+}
+
+static void
+sched_laminar_prio(struct thread *td, u_char prio)
+{
+	u_char oldprio;
+
+	td->td_base_pri = prio;
+
+	/*
+	 * If the thread is borrowing another thread's priority, never
+	 * lower it.
+	 */
+	if ((td->td_flags & TDF_BORROWING) != 0 && td->td_priority < prio)
+		return;
+
+	oldprio = td->td_priority;
+	sched_priority(td, prio);
+
+	if (TD_ON_LOCK(td) && oldprio != prio)
+		turnstile_adjust(td, oldprio);
 }
 
 static void
 sched_laminar_lend_prio(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	td->td_flags |= TDF_BORROWING;
+	sched_priority(td, prio);
 }
 
 static void
-sched_laminar_lend_user_prio(struct thread *td, u_char pri)
+sched_laminar_lend_user_prio(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	td->td_lend_user_pri = prio;
+	td->td_user_pri = min(prio, td->td_base_user_pri);
+	if (td->td_priority > td->td_user_pri)
+		sched_laminar_prio(td, td->td_user_pri);
+	else if (td->td_priority != td->td_user_pri)
+		ast_sched_locked(td, TDA_SCHED);
 }
 
 static void
-sched_laminar_lend_user_prio_cond(struct thread *td, u_char pri)
+sched_laminar_lend_user_prio_cond(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	if (td->td_lend_user_pri == prio)
+		return;
+	thread_lock(td);
+	sched_laminar_lend_user_prio(td, prio);
+	thread_unlock(td);
 }
 
+/*
+ * Idle-thread %CPU accounting is vruntime-derived in Laminar; the legacy
+ * estcpu / pctcpu values exposed through this API are zero until we wire
+ * the conversion (planned alongside the runqueue ops commit).
+ */
 static fixpt_t
 sched_laminar_pctcpu(struct thread *td)
 {
 
-	UNIMPL();
+	return (0);
 }
 
 static void
-sched_laminar_prio(struct thread *td, u_char prio)
+sched_laminar_ithread_prio(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	MPASS(td->td_pri_class == PRI_ITHD);
+	td->td_base_ithread_pri = prio;
+	sched_laminar_prio(td, prio);
 }
 
 static void
@@ -386,15 +469,29 @@ sched_laminar_throw(struct thread *td)
 static void
 sched_laminar_unlend_prio(struct thread *td, u_char prio)
 {
+	u_char base_pri;
 
-	UNIMPL();
+	if (td->td_base_pri >= PRI_MIN_TIMESHARE &&
+	    td->td_base_pri <= PRI_MAX_TIMESHARE)
+		base_pri = td->td_user_pri;
+	else
+		base_pri = td->td_base_pri;
+	if (prio >= base_pri) {
+		td->td_flags &= ~TDF_BORROWING;
+		sched_laminar_prio(td, base_pri);
+	} else
+		sched_laminar_lend_prio(td, prio);
 }
 
 static void
 sched_laminar_user_prio(struct thread *td, u_char prio)
 {
 
-	UNIMPL();
+	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	td->td_base_user_pri = prio;
+	if (td->td_lend_user_pri <= prio)
+		return;
+	td->td_user_pri = prio;
 }
 
 static void
