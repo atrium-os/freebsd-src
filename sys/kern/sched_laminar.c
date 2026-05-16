@@ -49,10 +49,12 @@
 #include <sys/kernel.h>
 #include <sys/cpuset.h>
 #include <sys/callout.h>
+#include <sys/jail.h>
 #include <sys/limits.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/sbuf.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
 #include <sys/runq.h>
@@ -153,6 +155,111 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
  * tunables further down where the sysctl_ctx is.  Definition is here
  * so pickcpu (earlier in the file) can reference it. */
 static int laminar_ipc_slack = 2;
+
+/*
+ * Phase E: per-jail proportional share.  Side-table keyed by
+ * prison id rather than fields on struct prison itself -- keeps
+ * the cross-tree ABI surface to zero at the cost of a small fixed
+ * table.  Entries are claimed on first sysctl write or first
+ * thread fork into the jail; lookup is lock-free (atomic int
+ * compare on lpr_id).  An empty slot has lpr_id = -1.
+ *
+ * eff_weight formula extension (whitepaper §6 / spec §11 phase E):
+ *
+ *   eff_weight = NICE_0_WEIGHT^2 * jail_nthreads
+ *              / (ts_weight        * jail_weight)
+ *
+ * Default jail_weight = NICE_0_WEIGHT, jail_nthreads = 1 -- both
+ * cancel out and we recover the phase A-D formula.  Configured
+ * jails get proportional share at the jail granularity: two jails
+ * weighted 50:50 split CPU 50:50 regardless of how many threads
+ * each runs.
+ */
+#define	LAMINAR_MAX_PRISONS	32
+struct laminar_prison {
+	int		lpr_id;		/* prison.pr_id, -1 = free */
+	uint32_t	lpr_weight;	/* user-set; LAMINAR_NICE_0_WEIGHT default */
+	uint32_t	lpr_nthreads;	/* atomic-updated runnable count */
+};
+static struct laminar_prison laminar_prisons[LAMINAR_MAX_PRISONS];
+
+/*
+ * Initialize all slots to "empty" (lpr_id = -1) at boot.  Done via
+ * a SYSINIT so the array is set up before any thread fork.
+ */
+static void
+laminar_prisons_init(void *arg __unused)
+{
+	int i;
+
+	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
+		laminar_prisons[i].lpr_id = -1;
+		laminar_prisons[i].lpr_weight = LAMINAR_NICE_0_WEIGHT;
+		laminar_prisons[i].lpr_nthreads = 0;
+	}
+}
+SYSINIT(laminar_prisons, SI_SUB_INTRINSIC, SI_ORDER_ANY,
+    laminar_prisons_init, NULL);
+
+/*
+ * Lock-free lookup by pr_id.  Returns NULL if no slot is claimed
+ * for this jail.  Linear scan -- LAMINAR_MAX_PRISONS is small.
+ */
+static struct laminar_prison *
+laminar_prison_lookup(int pr_id)
+{
+	int i, slot;
+
+	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
+		slot = atomic_load_int(&laminar_prisons[i].lpr_id);
+		if (slot == pr_id)
+			return (&laminar_prisons[i]);
+	}
+	return (NULL);
+}
+
+/*
+ * Lookup or claim a slot for pr_id.  Used on first thread fork or
+ * first sysctl write.  Compare-and-swap on lpr_id from -1 -> pr_id
+ * makes claim atomic.  Returns NULL only when the table is full.
+ */
+static struct laminar_prison *
+laminar_prison_claim(int pr_id)
+{
+	struct laminar_prison *lpr;
+	int i, expected;
+
+	lpr = laminar_prison_lookup(pr_id);
+	if (lpr != NULL)
+		return (lpr);
+	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
+		lpr = &laminar_prisons[i];
+		expected = -1;
+		if (atomic_cmpset_int(&lpr->lpr_id, expected, pr_id)) {
+			lpr->lpr_weight = LAMINAR_NICE_0_WEIGHT;
+			lpr->lpr_nthreads = 0;
+			return (lpr);
+		}
+		/* Lost the race?  Maybe this is now our pr_id. */
+		if (atomic_load_int(&lpr->lpr_id) == pr_id)
+			return (lpr);
+	}
+	return (NULL);
+}
+
+/*
+ * Prison helper for a thread; returns NULL safely (e.g. thread0
+ * during early init, or proc with no cred yet).
+ */
+static __inline struct prison *
+laminar_prison_of(struct thread *td)
+{
+
+	if (td == NULL || td->td_proc == NULL ||
+	    td->td_proc->p_ucred == NULL)
+		return (NULL);
+	return (td->td_proc->p_ucred->cr_prison);
+}
 static const uint32_t laminar_nice_weight[40] = {
 	/* -20 */ 88761, 71755, 56483, 46273, 36291,
 	/* -15 */ 29154, 23254, 18705, 14949, 11916,
@@ -226,21 +333,59 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
     "increase struct thread0_storage.t0st_sched size for Laminar");
 
 /*
- * Set ts_weight and recompute ts_eff_weight in O(1).  Centralised so
- * the formula has exactly one definition (currently nice-only; a
- * future jail-weight multiplier from phase E layers on here).
+ * Compute eff_weight including the optional jail term (phase E).
+ * Centralised so the formula has exactly one definition.
  *
- * eff_weight = NICE_0_WEIGHT^2 / weight.  Scaling by NICE_0_WEIGHT^2
- * keeps nice 0 threads at eff_weight == NICE_0_WEIGHT (1024) so the
- * per-tick vruntime increment stays in a comfortable integer range.
+ *   eff_weight = NICE_0_WEIGHT^2 * jail_nthreads
+ *              / (ts_weight       * jail_weight)
+ *
+ * When the thread's prison has no laminar slot (or the slot is
+ * the defaults), jail_weight = NICE_0_WEIGHT and jail_nthreads
+ * is treated as 1 -- both cancel and we recover the nice-only
+ * formula from phase A/D.
  */
+static __inline uint64_t
+laminar_compute_eff_weight(uint32_t ts_weight, struct prison *pr)
+{
+	struct laminar_prison *lpr;
+	uint64_t jail_w = LAMINAR_NICE_0_WEIGHT;
+	uint64_t jail_n = 1;
+
+	if (pr != NULL && (lpr = laminar_prison_lookup(pr->pr_id)) != NULL) {
+		jail_w = atomic_load_int(&lpr->lpr_weight);
+		jail_n = atomic_load_int(&lpr->lpr_nthreads);
+		if (jail_w == 0)
+			jail_w = LAMINAR_NICE_0_WEIGHT;
+		if (jail_n == 0)
+			jail_n = 1;
+	}
+	return (((uint64_t)LAMINAR_NICE_0_WEIGHT *
+	    LAMINAR_NICE_0_WEIGHT * jail_n) /
+	    ((uint64_t)ts_weight * jail_w));
+}
+
 static __inline void
 laminar_set_weight(struct td_sched *ts, uint32_t weight)
 {
 
 	ts->ts_weight = weight;
-	ts->ts_eff_weight = ((uint64_t)LAMINAR_NICE_0_WEIGHT *
-	    LAMINAR_NICE_0_WEIGHT) / weight;
+	/* Default path: no prison context; recover phase A/D formula. */
+	ts->ts_eff_weight = laminar_compute_eff_weight(weight, NULL);
+}
+
+/*
+ * Set weight for a thread including its current jail context.  Used
+ * after fork (when prison is known) and from sched_laminar_nice
+ * (for per-thread nice updates).
+ */
+static __inline void
+laminar_set_weight_for_thread(struct thread *td, uint32_t weight)
+{
+	struct td_sched *ts = td_get_sched(td);
+
+	ts->ts_weight = weight;
+	ts->ts_eff_weight = laminar_compute_eff_weight(weight,
+	    laminar_prison_of(td));
 }
 
 /*
@@ -1002,6 +1147,54 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ipc_slack, CTLFLAG_RW,
     "tolerated to honor dom_waker home CPU; 0 disables IPC pull)");
 
 /*
+ * Phase E: jail-table sysctl.  A single dump/set sysctl rather than
+ * dynamic per-jail tree because jails come and go and we don't want
+ * to register / unregister oids in the hot path.  Read prints
+ * "pr_id weight nthreads" lines; write parses "pr_id weight" and
+ * claims a slot (failing only if the table is full).
+ */
+static int
+laminar_jails_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	char ibuf[64];
+	int error, i, id, w;
+
+	if (req->newptr != NULL) {
+		if (req->newlen >= sizeof(ibuf))
+			return (EINVAL);
+		error = SYSCTL_IN(req, ibuf, req->newlen);
+		if (error != 0)
+			return (error);
+		ibuf[req->newlen] = '\0';
+		if (sscanf(ibuf, "%d %d", &id, &w) != 2 || id < 0 || w <= 0)
+			return (EINVAL);
+		struct laminar_prison *lpr = laminar_prison_claim(id);
+		if (lpr == NULL)
+			return (ENOMEM);
+		atomic_store_int(&lpr->lpr_weight, w);
+		return (0);
+	}
+	sbuf_new_for_sysctl(&sb, NULL, 128, req);
+	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
+		int slot = atomic_load_int(&laminar_prisons[i].lpr_id);
+		if (slot < 0)
+			continue;
+		sbuf_printf(&sb, "%d %u %u\n", slot,
+		    laminar_prisons[i].lpr_weight,
+		    laminar_prisons[i].lpr_nthreads);
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_sched, OID_AUTO, jails,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_jails_sysctl, "A",
+    "Laminar per-jail proportional share: read = "
+    "'pr_id weight nthreads\\n'... ; write = 'pr_id weight' to set");
+
+/*
  * Acquire two tdq locks in address order to avoid deadlock with any
  * other pair-locking site.  Mirrors ULE's tdq_lock_pair.
  */
@@ -1421,6 +1614,8 @@ sched_laminar_ap_entry(void)
 static void
 sched_laminar_exit_thread(struct thread *td, struct thread *child)
 {
+	struct prison *pr;
+	struct laminar_prison *lpr;
 
 	thread_lock(child);
 	/*
@@ -1430,6 +1625,21 @@ sched_laminar_exit_thread(struct thread *td, struct thread *child)
 	 * the caller.
 	 */
 	thread_unlock(child);
+
+	/*
+	 * Phase E: decrement the jail's thread counter.  Done outside
+	 * thread_lock since the atomic decrement is independent and we
+	 * don't want to lengthen the critical section.  The slot itself
+	 * is never freed -- leaving it claimed avoids races with
+	 * concurrent claim/decrement.  Costs ~24 bytes per ever-used
+	 * jail; bounded by LAMINAR_MAX_PRISONS.
+	 */
+	pr = laminar_prison_of(child);
+	if (pr != NULL && (lpr = laminar_prison_lookup(pr->pr_id)) != NULL) {
+		uint32_t n = atomic_load_int(&lpr->lpr_nthreads);
+		if (n > 0)
+			atomic_subtract_int(&lpr->lpr_nthreads, 1);
+	}
 }
 
 static u_int
@@ -1463,12 +1673,31 @@ sched_laminar_fork_thread(struct thread *td, struct thread *child)
 
 	bzero(ts, sizeof(*ts));
 	ts->ts_vruntime = tsc->ts_vruntime;	/* inherit; halved at A.3d */
-	ts->ts_eff_weight = tsc->ts_eff_weight;
 	ts->ts_weight = tsc->ts_weight;
 	ts->ts_cpu = tsc->ts_cpu;
 	ts->ts_class = tsc->ts_class;
 	ts->ts_home_node = -1;
 	ts->ts_dom_waker_cpu = -1;	/* no IPC home yet */
+	/*
+	 * Phase E: bump the child's jail nthreads counter (lazy claim
+	 * a slot if the jail has no configured laminar entry yet, but
+	 * skip the claim if the table is full -- defaults still apply).
+	 * Then recompute eff_weight with current jail context.  The
+	 * counter must be incremented BEFORE the recompute so the new
+	 * thread's own membership is reflected.
+	 */
+	{
+		struct prison *pr;
+
+		pr = laminar_prison_of(child);
+		if (pr != NULL) {
+			struct laminar_prison *lpr =
+			    laminar_prison_claim(pr->pr_id);
+			if (lpr != NULL)
+				atomic_add_int(&lpr->lpr_nthreads, 1);
+		}
+	}
+	laminar_set_weight_for_thread(child, ts->ts_weight);
 }
 
 /*
