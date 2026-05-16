@@ -107,6 +107,44 @@
 _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
     "LAMINAR_TS_CAP must be a multiple of LAMINAR_SHARD_SIZE");
 
+/*
+ * Nice -> ts_weight table.  Each step is a factor of ~1.25 (every
+ * one-unit nice change is ~10% CPU share), matching CFS's convention.
+ * Index = nice + 20, so [0]=nice -20, [20]=nice 0, [39]=nice +19.
+ * The picker keeps the same vruntime accumulator on every tick; with
+ * ts_eff_weight = LAMINAR_NICE_0_WEIGHT^2 / ts_weight, higher-weight
+ * (lower-nice) threads accumulate vruntime more slowly and therefore
+ * get picked more often, in correct proportion.
+ */
+#define	LAMINAR_NICE_0_WEIGHT	1024U
+static const uint32_t laminar_nice_weight[40] = {
+	/* -20 */ 88761, 71755, 56483, 46273, 36291,
+	/* -15 */ 29154, 23254, 18705, 14949, 11916,
+	/* -10 */  9548,  7620,  6100,  4904,  3906,
+	/*  -5 */  3121,  2501,  1991,  1586,  1277,
+	/*   0 */  1024,   820,   655,   526,   423,
+	/*   5 */   335,   272,   215,   172,   137,
+	/*  10 */   110,    87,    70,    56,    45,
+	/*  15 */    36,    29,    23,    18,    15,
+};
+
+static __inline uint32_t
+laminar_nice_to_weight(int nice)
+{
+	int idx = nice + 20;
+
+	if (idx < 0)
+		idx = 0;
+	else if (idx >= 40)
+		idx = 39;
+	return (laminar_nice_weight[idx]);
+}
+
+/*
+ * laminar_set_weight: defined after struct td_sched (further below)
+ * so the pointer dereferences typecheck.
+ */
+
 static MALLOC_DEFINE(M_LAMINAR, "laminar", "Laminar scheduler data");
 
 /* Per-scheduler use of generic td_flags bits (mirrors ULE / 4BSD). */
@@ -141,6 +179,24 @@ struct td_sched {
 _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
     sizeof(struct thread0_storage),
     "increase struct thread0_storage.t0st_sched size for Laminar");
+
+/*
+ * Set ts_weight and recompute ts_eff_weight in O(1).  Centralised so
+ * the formula has exactly one definition (currently nice-only; a
+ * future jail-weight multiplier from phase E layers on here).
+ *
+ * eff_weight = NICE_0_WEIGHT^2 / weight.  Scaling by NICE_0_WEIGHT^2
+ * keeps nice 0 threads at eff_weight == NICE_0_WEIGHT (1024) so the
+ * per-tick vruntime increment stays in a comfortable integer range.
+ */
+static __inline void
+laminar_set_weight(struct td_sched *ts, uint32_t weight)
+{
+
+	ts->ts_weight = weight;
+	ts->ts_eff_weight = ((uint64_t)LAMINAR_NICE_0_WEIGHT *
+	    LAMINAR_NICE_0_WEIGHT) / weight;
+}
 
 /*
  * Per-CPU runqueue.  The timeshare class uses a packed structure-of-arrays
@@ -759,17 +815,21 @@ static void
 sched_laminar_nice(struct proc *p, int nice)
 {
 	struct thread *td;
+	uint32_t w;
 
 	PROC_LOCK_ASSERT(p, MA_OWNED);
 	p->p_nice = nice;
+	w = laminar_nice_to_weight(nice);
 	/*
-	 * Laminar derives ts_weight (and consequently ts_eff_weight) from
-	 * the proc's nice value.  Weight re-derivation on per-thread state
-	 * lands with the runqueue ops commit (A.3d) where the precompute
-	 * site exists; for now we just record the nice value.
+	 * Apply the new weight to every thread in this proc.  Threads
+	 * share their proc's nice, so they all get the same ts_weight.
+	 * Holding thread_lock around laminar_set_weight pairs with the
+	 * locked readers in the picker; only the per-thread eff_weight
+	 * store is published, the vruntime accumulator is untouched.
 	 */
 	FOREACH_THREAD_IN_PROC(p, td) {
 		thread_lock(td);
+		laminar_set_weight(td_get_sched(td), w);
 		thread_unlock(td);
 	}
 }
@@ -1427,8 +1487,7 @@ sched_laminar_init(void)
 
 	ts0 = td_get_sched(&thread0);
 	ts0->ts_vruntime = 0;
-	ts0->ts_eff_weight = 1;
-	ts0->ts_weight = 1;
+	laminar_set_weight(ts0, laminar_nice_to_weight(0));
 	ts0->ts_slot = 0;
 	ts0->ts_cpu = curcpu;
 	ts0->ts_flags = 0;
