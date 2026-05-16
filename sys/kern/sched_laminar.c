@@ -234,6 +234,16 @@ struct laminar_tdq {
 	/* Hierarchical layer: per-shard cached min over ltdq_vruntime. */
 	uint64_t	ltdq_shard_min[LAMINAR_NSHARDS]; /* (t) per-shard min. */
 
+	/*
+	 * Power-aware migration barrier (phase B).  Added to ltdq_load
+	 * to form the effective placement cost; high values make a CPU
+	 * unattractive for wakeup placement and load balancing.  Tuned
+	 * via per-CPU sysctl kern.sched.laminar.cpu.<N>.resistance.
+	 * Loaded locklessly via atomic_load_int from pickcpu / balance
+	 * paths; staleness of a few hundred ms is harmless.
+	 */
+	int		ltdq_resistance;	/* (ts) additive placement R. */
+
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
 	int		ltdq_sysload;	/* (ts) Non-ITHD load. */
@@ -322,6 +332,7 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	tdq->ltdq_slot = malloc(tdq->ltdq_ts_cap *
 	    sizeof(*tdq->ltdq_slot), M_LAMINAR, M_WAITOK | M_ZERO);
 	tdq->ltdq_vtime = 0;
+	tdq->ltdq_resistance = 0;
 	for (int s = 0; s < LAMINAR_NSHARDS; s++)
 		tdq->ltdq_shard_min[s] = UINT64_MAX;
 	snprintf(tdq->ltdq_name, sizeof(tdq->ltdq_name),
@@ -513,6 +524,40 @@ sched_setup_smp(void)
 	}
 	PCPU_SET(sched, DPCPU_PTR(ltdq));
 }
+
+/*
+ * Register kern.sched.laminar.cpu.<N>.resistance for each online CPU.
+ * Run from a SYSINIT after sysctl is up but before userspace lands.
+ */
+static void
+laminar_sysctl_register(void *arg __unused)
+{
+	struct sysctl_oid *root, *cpu_node;
+	struct laminar_tdq *tdq;
+	char name[16];
+	int i;
+
+	root = SYSCTL_ADD_NODE(NULL,
+	    SYSCTL_STATIC_CHILDREN(_kern_sched), OID_AUTO, "laminar",
+	    CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "Laminar scheduler tunables");
+	if (root == NULL)
+		return;
+	CPU_FOREACH(i) {
+		tdq = LAMINAR_TDQ_CPU(i);
+		snprintf(name, sizeof(name), "cpu%d", i);
+		cpu_node = SYSCTL_ADD_NODE(NULL,
+		    SYSCTL_CHILDREN(root), OID_AUTO, name,
+		    CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "per-CPU tunables");
+		if (cpu_node == NULL)
+			continue;
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "resistance", CTLFLAG_RW, &tdq->ltdq_resistance, 0,
+		    "Power-aware placement R (added to load for pickcpu "
+		    "and balance ranking)");
+	}
+}
+SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
+    laminar_sysctl_register, NULL);
 #endif
 
 /*
@@ -601,31 +646,69 @@ tdq_choose(struct laminar_tdq *tdq)
 
 #ifdef SMP
 /*
- * Pick a target CPU for the thread.  Diagnostic build: honor ts_cpu
- * when smp is up, the thread can migrate, and its cpuset allows the
- * target.  Falls back to curcpu otherwise.
+ * Effective placement cost = current load + power-aware resistance R.
+ * Lockless read; staleness is bounded and harmless at pickcpu cadence.
+ */
+static __inline int
+laminar_placement_cost(const struct laminar_tdq *tdq)
+{
+
+	return (atomic_load_int(&tdq->ltdq_load) +
+	    atomic_load_int(&tdq->ltdq_resistance));
+}
+
+/*
+ * Pick a target CPU for the thread.  Phase B: honor ts_cpu by
+ * default (preserves the phase A behavior + lets the periodic
+ * balancer handle long-term spread), and only shop around when
+ * ts_cpu has nonzero resistance -- that is the explicit
+ * "drain this CPU" signal.  This keeps wake-time pickcpu O(1)
+ * in the common case and avoids regressing wake latency.
+ *
+ * If td is pinned (td_pinned > 0), it has to stay on ts_cpu.
  */
 static int
 sched_laminar_pickcpu(struct thread *td, int flags)
 {
 	struct td_sched *ts;
-	int self, target;
+	int self, ts_cpu, best_cpu, best_cost, cpu, cost;
 
 	(void)flags;
 
 	self = PCPU_GET(cpuid);
 	if (smp_started == 0)
 		return (self);
-	if (!THREAD_CAN_MIGRATE(td))
-		return (td_get_sched(td)->ts_cpu);
-
 	ts = td_get_sched(td);
-	target = ts->ts_cpu;
-	if (target == self)
-		return (self);
-	if (!THREAD_CAN_SCHED(td, target))
-		return (self);
-	return (target);
+	ts_cpu = ts->ts_cpu;
+	if (!THREAD_CAN_MIGRATE(td))
+		return (ts_cpu);
+
+	if (THREAD_CAN_SCHED(td, ts_cpu)) {
+		if (atomic_load_int(&LAMINAR_TDQ_CPU(ts_cpu)->ltdq_resistance)
+		    == 0)
+			return (ts_cpu);	/* fast path, no R pressure */
+		best_cpu = ts_cpu;
+		best_cost = laminar_placement_cost(LAMINAR_TDQ_CPU(ts_cpu));
+	} else {
+		best_cpu = self;
+		best_cost = laminar_placement_cost(LAMINAR_TDQ_CPU(self));
+	}
+	/*
+	 * Strictly less-than means equal-cost CPUs lose to the seeded
+	 * tiebreaker (ts_cpu or self), preserving soft affinity.
+	 */
+	CPU_FOREACH(cpu) {
+		if (cpu == best_cpu)
+			continue;
+		if (!THREAD_CAN_SCHED(td, cpu))
+			continue;
+		cost = laminar_placement_cost(LAMINAR_TDQ_CPU(cpu));
+		if (cost < best_cost) {
+			best_cost = cost;
+			best_cpu = cpu;
+		}
+	}
+	return (best_cpu);
 }
 
 /*
@@ -774,11 +857,21 @@ static bool
 laminar_balance_pair(struct laminar_tdq *high, struct laminar_tdq *low)
 {
 	struct thread *td;
-	int dst_cpu;
+	int dst_cpu, high_cost, low_cost;
 	bool moved = false;
 
 	laminar_tdq_lock_pair(high, low);
-	if (high->ltdq_load < low->ltdq_load + laminar_balance_threshold)
+	/*
+	 * Compare using (load + R) so a high-R donor is treated as
+	 * over-loaded (drains) and a high-R acceptor is treated as
+	 * already-loaded (refuses).
+	 */
+	high_cost = high->ltdq_load + high->ltdq_resistance;
+	low_cost = low->ltdq_load + low->ltdq_resistance;
+	if (high_cost < low_cost + laminar_balance_threshold)
+		goto out;
+	/* Sanity: don't migrate if source has no actual queued work. */
+	if (high->ltdq_load <= 1)
 		goto out;
 	dst_cpu = LAMINAR_TDQ_ID(low);
 	td = laminar_steal_timeshare(high, dst_cpu);
@@ -812,23 +905,23 @@ static void
 laminar_balance_cb(void *arg __unused)
 {
 	struct laminar_tdq *hi = NULL, *lo = NULL, *tdq;
-	int hi_load = -1, lo_load = INT_MAX;
-	int load, cpu;
+	int hi_cost = -1, lo_cost = INT_MAX;
+	int cost, cpu;
 
 	CPU_FOREACH(cpu) {
 		tdq = LAMINAR_TDQ_CPU(cpu);
-		load = atomic_load_int(&tdq->ltdq_load);
-		if (load > hi_load) {
-			hi_load = load;
+		cost = laminar_placement_cost(tdq);
+		if (cost > hi_cost) {
+			hi_cost = cost;
 			hi = tdq;
 		}
-		if (load < lo_load) {
-			lo_load = load;
+		if (cost < lo_cost) {
+			lo_cost = cost;
 			lo = tdq;
 		}
 	}
 	if (hi != NULL && lo != NULL && hi != lo &&
-	    hi_load >= lo_load + laminar_balance_threshold)
+	    hi_cost >= lo_cost + laminar_balance_threshold)
 		(void)laminar_balance_pair(hi, lo);
 
 	callout_reset(&laminar_balance_callout,
@@ -1210,7 +1303,28 @@ sched_laminar_sswitch(struct thread *td, int flags)
 		MPASS(mtx == LAMINAR_TDQ_LOCKPTR(tdq));
 		srqflag = SRQ_OURSELF | SRQ_YIELDING |
 		    (preempted ? SRQ_PREEMPTED : 0);
-		tdq_runq_add(tdq, td, srqflag);
+#ifdef SMP
+		if (td_get_sched(td)->ts_cpu != PCPU_GET(cpuid)) {
+			/*
+			 * sched_bind() set ts_cpu to a different CPU.  Move
+			 * ourselves to the target's tdq so the next time we
+			 * are picked we run there.  Mirrors ULE's
+			 * sched_switch_migrate.  Caller's mtx pointer is
+			 * updated so cpu_switch publishes td_lock = remote.
+			 */
+			struct laminar_tdq *tdn =
+			    LAMINAR_TDQ_CPU(td_get_sched(td)->ts_cpu);
+			tdq_load_rem(tdq, td);
+			LAMINAR_TDQ_UNLOCK(tdq);
+			LAMINAR_TDQ_LOCK(tdn);
+			(void)tdq_add_internal(tdn, td, srqflag);
+			tdq_notify(tdn, td->td_priority);
+			LAMINAR_TDQ_UNLOCK(tdn);
+			LAMINAR_TDQ_LOCK(tdq);
+			mtx = LAMINAR_TDQ_LOCKPTR(tdn);
+		} else
+#endif
+			tdq_runq_add(tdq, td, srqflag);
 	} else {
 		/* Thread is going to sleep. */
 		if (mtx != LAMINAR_TDQ_LOCKPTR(tdq)) {
@@ -1527,17 +1641,24 @@ sched_laminar_bind(struct thread *td, int cpu)
 	    ("sched_laminar_bind: not curthread"));
 
 	ts = td_get_sched(td);
+	if (ts->ts_flags & TSF_BOUND)
+		sched_unbind(td);
+	KASSERT(THREAD_CAN_MIGRATE(td), ("sched_laminar_bind: %p not migratable", td));
 	ts->ts_flags |= TSF_BOUND;
-	ts->ts_cpu = cpu;
+	sched_pin();
 #ifdef SMP
 	if (PCPU_GET(cpuid) == cpu)
 		return;
+	ts->ts_cpu = cpu;
 	/*
-	 * Cross-CPU bind would require migration here (which depends on
-	 * the cross-CPU enqueue path landing in A.3e/A.4).  Until then
-	 * the bind only takes effect at the next sched_add, and we do
-	 * not synchronously switch the thread off.
+	 * mi_switch routes through sched_laminar_sswitch's TD_IS_RUNNING
+	 * cross-CPU branch (now wired) which moves us to ts_cpu's tdq.
+	 * Returning from mi_switch we are running on the bound CPU.
 	 */
+	mi_switch(SW_VOL | SWT_BIND);
+	thread_lock(td);
+#else
+	ts->ts_cpu = cpu;
 #endif
 }
 
