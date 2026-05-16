@@ -48,6 +48,8 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/cpuset.h>
+#include <sys/callout.h>
+#include <sys/limits.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
@@ -298,6 +300,10 @@ sched_laminar_unimpl(const char *fn)
 
 #define	UNIMPL()	sched_laminar_unimpl(__func__)
 
+/* Forward declarations for the periodic balancer (defined below). */
+static int tdq_add_internal(struct laminar_tdq *, struct thread *, int);
+static void sched_laminar_rem(struct thread *);
+
 /*
  * Initialize a per-CPU runqueue.  Called once per CPU at boot.
  */
@@ -542,6 +548,11 @@ tdq_runq_add(struct laminar_tdq *tdq, struct thread *td, int flags)
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	THREAD_LOCK_BLOCKED_ASSERT(td, MA_OWNED);
+	/*
+	 * Mark the thread as on a runq.  Mirrors ULE's tdq_runq_add;
+	 * sched_rem callers (including the balancer) assert TD_ON_RUNQ.
+	 */
+	TD_SET_RUNQ(td);
 	if (laminar_is_timeshare(td))
 		laminar_slot_insert(tdq, td);
 	else
@@ -691,6 +702,148 @@ tdq_notify(struct laminar_tdq *tdq, int lowpri)
 		return;			/* same CPU; no IPI needed */
 	tdq->ltdq_owepreempt = 1;
 	ipi_cpu(cpu, IPI_PREEMPT);
+}
+
+/*
+ * Periodic cross-CPU load balancer.  Phase A version is intentionally
+ * minimal -- a single global callout that scans all CPUs every
+ * laminar_balance_interval ms, finds the most-loaded and least-loaded,
+ * and moves one transferable timeshare thread when the gap is large
+ * enough.  Phase C replaces this with the §3 RLC filter from the
+ * whitepaper.  Without this, all fork()s land on the parent's CPU and
+ * APs sit idle.
+ */
+static struct callout laminar_balance_callout;
+static int laminar_balance_interval = 100;	/* ms */
+static int laminar_balance_threshold = 2;	/* migrate when high - low >= this */
+
+SYSCTL_INT(_kern_sched, OID_AUTO, balance_interval, CTLFLAG_RW,
+    &laminar_balance_interval, 0,
+    "Laminar: cross-CPU balance period in ms");
+SYSCTL_INT(_kern_sched, OID_AUTO, balance_threshold, CTLFLAG_RW,
+    &laminar_balance_threshold, 0,
+    "Laminar: load difference required to trigger a migration");
+
+/*
+ * Acquire two tdq locks in address order to avoid deadlock with any
+ * other pair-locking site.  Mirrors ULE's tdq_lock_pair.
+ */
+static void
+laminar_tdq_lock_pair(struct laminar_tdq *a, struct laminar_tdq *b)
+{
+
+	if (a < b) {
+		LAMINAR_TDQ_LOCK(a);
+		mtx_lock_spin_flags(LAMINAR_TDQ_LOCKPTR(b), MTX_DUPOK);
+	} else {
+		LAMINAR_TDQ_LOCK(b);
+		mtx_lock_spin_flags(LAMINAR_TDQ_LOCKPTR(a), MTX_DUPOK);
+	}
+}
+
+/*
+ * Scan the timeshare SoA for a thread that can migrate to dst_cpu.
+ * Returns NULL if nothing transferable; caller holds the source tdq
+ * lock.
+ */
+static struct thread *
+laminar_steal_timeshare(struct laminar_tdq *from, int dst_cpu)
+{
+	struct thread *td;
+	uint32_t i;
+
+	LAMINAR_TDQ_LOCK_ASSERT(from, MA_OWNED);
+	for (i = 0; i < from->ltdq_ts_n; i++) {
+		td = from->ltdq_slot[i];
+		if (!THREAD_CAN_MIGRATE(td))
+			continue;
+		if (!THREAD_CAN_SCHED(td, dst_cpu))
+			continue;
+		return (td);
+	}
+	return (NULL);
+}
+
+/*
+ * If high has at least laminar_balance_threshold more load than low,
+ * move one transferable timeshare thread from high to low.  Both tdq
+ * locks acquired internally in address order.  Returns true if a
+ * migration occurred.
+ */
+static bool
+laminar_balance_pair(struct laminar_tdq *high, struct laminar_tdq *low)
+{
+	struct thread *td;
+	int dst_cpu;
+	bool moved = false;
+
+	laminar_tdq_lock_pair(high, low);
+	if (high->ltdq_load < low->ltdq_load + laminar_balance_threshold)
+		goto out;
+	dst_cpu = LAMINAR_TDQ_ID(low);
+	td = laminar_steal_timeshare(high, dst_cpu);
+	if (td == NULL)
+		goto out;
+	/*
+	 * We hold both tdq locks; thread's td_lock points at the source
+	 * tdq, so we own the thread lock too.  Wait for any concurrent
+	 * thread_lock_block in flight, then move: remove from source,
+	 * reassign td_lock + ts_cpu, add to dest, IPI dest if cross-CPU.
+	 */
+	thread_lock_block_wait(td);
+	sched_laminar_rem(td);
+	td->td_lock = LAMINAR_TDQ_LOCKPTR(low);
+	td_get_sched(td)->ts_cpu = dst_cpu;
+	(void)tdq_add_internal(low, td, SRQ_YIELDING);
+	if (dst_cpu != PCPU_GET(cpuid))
+		tdq_notify(low, td->td_priority);
+	moved = true;
+out:
+	LAMINAR_TDQ_UNLOCK(high);
+	LAMINAR_TDQ_UNLOCK(low);
+	return (moved);
+}
+
+/*
+ * Walk all CPUs to find the most- and least-loaded tdq.  If the gap
+ * is wide enough, move one thread.  Reschedule the callout afterwards.
+ */
+static void
+laminar_balance_cb(void *arg __unused)
+{
+	struct laminar_tdq *hi = NULL, *lo = NULL, *tdq;
+	int hi_load = -1, lo_load = INT_MAX;
+	int load, cpu;
+
+	CPU_FOREACH(cpu) {
+		tdq = LAMINAR_TDQ_CPU(cpu);
+		load = atomic_load_int(&tdq->ltdq_load);
+		if (load > hi_load) {
+			hi_load = load;
+			hi = tdq;
+		}
+		if (load < lo_load) {
+			lo_load = load;
+			lo = tdq;
+		}
+	}
+	if (hi != NULL && lo != NULL && hi != lo &&
+	    hi_load >= lo_load + laminar_balance_threshold)
+		(void)laminar_balance_pair(hi, lo);
+
+	callout_reset(&laminar_balance_callout,
+	    imax(1, hz * laminar_balance_interval / 1000),
+	    laminar_balance_cb, NULL);
+}
+
+static void
+laminar_balance_start(void)
+{
+
+	callout_init(&laminar_balance_callout, 1);
+	callout_reset(&laminar_balance_callout,
+	    imax(1, hz * laminar_balance_interval / 1000),
+	    laminar_balance_cb, NULL);
 }
 #endif /* SMP */
 
@@ -1544,6 +1697,9 @@ sched_laminar_setup(void)
 	tdq->ltdq_curthread = &thread0;
 	tdq->ltdq_lowpri = thread0.td_priority;
 	LAMINAR_TDQ_UNLOCK(tdq);
+#ifdef SMP
+	laminar_balance_start();
+#endif
 }
 
 /*
