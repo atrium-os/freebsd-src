@@ -56,6 +56,7 @@
 #include <sys/runq.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
+#include <sys/sysctl.h>
 #include <sys/turnstile.h>
 #include <machine/smp.h>
 
@@ -410,6 +411,12 @@ tdq_choose(struct laminar_tdq *tdq)
 	if (tdq->ltdq_ts_n != 0) {
 		uint32_t i = laminar_min_index(tdq->ltdq_vruntime,
 		    tdq->ltdq_ts_n);
+		/*
+		 * Advance the per-CPU vruntime floor to the winner's
+		 * vruntime.  Lockless readers (sched_laminar_wakeup's
+		 * lag-cap rebase) tolerate slightly stale values.
+		 */
+		atomic_store_64(&tdq->ltdq_vtime, tdq->ltdq_vruntime[i]);
 		return (tdq->ltdq_slot[i]);
 	}
 	return (rt);	/* IDLE or NULL */
@@ -1132,11 +1139,43 @@ sched_laminar_relinquish(struct thread *td)
 	mi_switch(SW_VOL | SWT_RELINQUISH);
 }
 
+/*
+ * Maximum lag (in vruntime units) by which a just-woken thread may
+ * sit below the per-CPU vruntime floor.  Without this cap a thread
+ * that slept for seconds would arrive with a stale (low) vruntime
+ * and starve every other timeshare thread on the CPU until its
+ * accumulator caught up.  Tunable for measurement.
+ */
+static u_long laminar_lag_cap = 1000000;
+SYSCTL_DECL(_kern_sched);
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lag_cap, CTLFLAG_RW,
+    &laminar_lag_cap, 0,
+    "Laminar: max vruntime units a waker may sit below the per-CPU floor");
+
 static void
 sched_laminar_wakeup(struct thread *td, int srqflags)
 {
+	struct td_sched *ts;
+	struct laminar_tdq *tdq;
+	uint64_t floor, cap;
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	/*
+	 * Bounded-lag rebase (whitepaper §7).  Pull the waker's
+	 * vruntime up to within laminar_lag_cap of the target CPU's
+	 * current vruntime floor.  The read of ltdq_vtime is
+	 * intentionally lockless -- it is a (ts) field, updated under
+	 * the tdq lock and stored as a single 64-bit atomic, and the
+	 * cap absorbs any staleness.
+	 */
+	ts = td_get_sched(td);
+	if (laminar_is_timeshare(td)) {
+		tdq = LAMINAR_TDQ_CPU(ts->ts_cpu);
+		floor = atomic_load_64(&tdq->ltdq_vtime);
+		cap = laminar_lag_cap;
+		if (floor > cap && ts->ts_vruntime < floor - cap)
+			ts->ts_vruntime = floor - cap;
+	}
 	/*
 	 * Let sched_laminar_add's pickcpu pick the target CPU.  ts_cpu is
 	 * preserved from the thread's last run, which gives natural soft
