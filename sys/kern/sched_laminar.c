@@ -445,7 +445,8 @@ struct laminar_tdq {
 	 * Loaded locklessly via atomic_load_int from pickcpu / balance
 	 * paths; staleness of a few hundred ms is harmless.
 	 */
-	int		ltdq_resistance;	/* (ts) additive placement R. */
+	int		ltdq_resistance;	/* (ts) user-set R via sysctl. */
+	int		ltdq_resistance_power;	/* (ts) controller-set R_power. */
 
 	/*
 	 * RLC balancer filter state (phase C, DESIGN.md §1).  All terms
@@ -560,6 +561,7 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	    sizeof(*tdq->ltdq_slot), M_LAMINAR, M_WAITOK | M_ZERO);
 	tdq->ltdq_vtime = 0;
 	tdq->ltdq_resistance = 0;
+	tdq->ltdq_resistance_power = 0;
 	tdq->ltdq_capacity = LAMINAR_CAP_BASE;
 	tdq->ltdq_signal_ewma = 0;
 	tdq->ltdq_streak = 0;
@@ -793,6 +795,11 @@ laminar_sysctl_register(void *arg __unused)
 		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
 		    "signal_ewma", CTLFLAG_RD, &tdq->ltdq_signal_ewma, 0,
 		    "Current smoothed scaled placement signal (read-only).");
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "resistance_power", CTLFLAG_RD,
+		    &tdq->ltdq_resistance_power, 0,
+		    "Closed-loop controller's R_power for this CPU (RD; "
+		    "nonzero = parked by controller).");
 	}
 }
 SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
@@ -930,7 +937,8 @@ laminar_raw_cost(const struct laminar_tdq *tdq)
 {
 
 	return (atomic_load_int(&tdq->ltdq_load) +
-	    atomic_load_int(&tdq->ltdq_resistance));
+	    atomic_load_int(&tdq->ltdq_resistance) +
+	    atomic_load_int(&tdq->ltdq_resistance_power));
 }
 
 /*
@@ -1054,8 +1062,10 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 	}
 
 	if (THREAD_CAN_SCHED(td, ts_cpu)) {
-		if (atomic_load_int(&LAMINAR_TDQ_CPU(ts_cpu)->ltdq_resistance)
-		    == 0 && laminar_numa_cost(td, ts_cpu) == 0)
+		struct laminar_tdq *_ts_tdq = LAMINAR_TDQ_CPU(ts_cpu);
+		if (atomic_load_int(&_ts_tdq->ltdq_resistance) == 0 &&
+		    atomic_load_int(&_ts_tdq->ltdq_resistance_power) == 0 &&
+		    laminar_numa_cost(td, ts_cpu) == 0)
 			return (ts_cpu);	/* fast path: no R, no NUMA */
 		best_cpu = ts_cpu;
 		best_cost = laminar_thread_cost(td, ts_cpu);
@@ -1470,7 +1480,8 @@ laminar_balance_cb(void *arg __unused)
 			hi->ltdq_streak = 0;
 			break;
 		}
-		evac = atomic_load_int(&hi->ltdq_resistance) > 0;
+		evac = atomic_load_int(&hi->ltdq_resistance) > 0 ||
+		    atomic_load_int(&hi->ltdq_resistance_power) > 0;
 		if (!evac) {
 			/* C2 debounce: imbalance must persist. */
 			hi->ltdq_streak++;
@@ -1505,6 +1516,149 @@ laminar_balance_start(void)
 	callout_reset(&laminar_balance_callout,
 	    imax(1, hz * laminar_balance_interval / 1000),
 	    laminar_balance_cb, NULL);
+}
+
+/*
+ * Phase G: closed-loop balanced controller (whitepaper §5).
+ *
+ * Measures system-wide load EWMA per control interval, compares to
+ * a setpoint (CTRL_HEADROOM) with a Schmitt trigger (CTRL_DEADBAND)
+ * and asymmetric patience (park = many over-provisioned cycles,
+ * unpark = one), and actuates by writing R_power on individual
+ * CPUs.  Asymmetry: park lazy (wrong-park is a latency hit),
+ * unpark eager (wrong-awake just wastes a little power).
+ *
+ * Per-domain park is the proper implementation; this phase-G ships
+ * the single-domain shape (parks one CPU at a time, treating the
+ * whole system as one power domain).  Per-cpu_group expansion is a
+ * follow-up but uses the same primitives, just keyed by
+ * cpu_group instead of "any CPU".
+ */
+static struct callout laminar_ctrl_callout;
+static int laminar_ctrl_interval = 1000;	/* ms between samples */
+static int laminar_ctrl_headroom = 75;		/* % of capacity setpoint */
+static int laminar_ctrl_deadband = 15;		/* % Schmitt deadband */
+static int laminar_ctrl_park_pat = 6;		/* over-provisioned cycles */
+static int laminar_ctrl_unpark_pat = 1;		/* under-provisioned cycles */
+static int laminar_ctrl_evac_r = 99;		/* R_power for parked CPUs */
+static int laminar_ctrl_enable = 1;		/* master switch */
+
+/* Observability + state (all single-controller for now). */
+static int laminar_ctrl_load_ewma;
+static int laminar_ctrl_park_streak;
+static int laminar_ctrl_unpark_streak;
+
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_enable, CTLFLAG_RW,
+    &laminar_ctrl_enable, 0,
+    "Laminar: closed-loop balanced controller enable (1=on, 0=off)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_interval, CTLFLAG_RW,
+    &laminar_ctrl_interval, 0,
+    "Laminar: controller sample interval in ms");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_headroom, CTLFLAG_RW,
+    &laminar_ctrl_headroom, 0,
+    "Laminar: controller setpoint as percent of total capacity");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_deadband, CTLFLAG_RW,
+    &laminar_ctrl_deadband, 0,
+    "Laminar: controller Schmitt deadband (percent)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_park_pat, CTLFLAG_RW,
+    &laminar_ctrl_park_pat, 0,
+    "Laminar: cycles below low threshold before parking a CPU");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_unpark_pat, CTLFLAG_RW,
+    &laminar_ctrl_unpark_pat, 0,
+    "Laminar: cycles above high threshold before unparking a CPU");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_evac_r, CTLFLAG_RW,
+    &laminar_ctrl_evac_r, 0,
+    "Laminar: R_power value applied to a parked CPU (evac strength)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_ewma, CTLFLAG_RD,
+    &laminar_ctrl_load_ewma, 0,
+    "Laminar: smoothed system load as percent of total capacity");
+
+static void
+laminar_ctrl_cb(void *arg __unused)
+{
+	struct laminar_tdq *tdq;
+	int cpu, total_load = 0;
+	int load_pct, upper, lower;
+	int n_parked = 0, n_total = 0;
+	int min_load = INT_MAX, min_cpu = -1;
+	int first_parked = -1;
+
+	if (!laminar_ctrl_enable)
+		goto reschedule;
+
+	CPU_FOREACH(cpu) {
+		tdq = LAMINAR_TDQ_CPU(cpu);
+		total_load += atomic_load_int(&tdq->ltdq_load);
+		n_total++;
+		if (atomic_load_int(&tdq->ltdq_resistance_power) > 0) {
+			n_parked++;
+			if (first_parked < 0)
+				first_parked = cpu;
+		} else if (atomic_load_int(&tdq->ltdq_load) < min_load) {
+			min_load = atomic_load_int(&tdq->ltdq_load);
+			min_cpu = cpu;
+		}
+	}
+	int n_unparked = n_total - n_parked;
+	if (n_unparked <= 0)
+		goto reschedule;
+
+	/*
+	 * Utilization metric: runnable threads per unparked CPU,
+	 * scaled to "100% = 1 thread/CPU".  ltdq_load is a thread
+	 * count, not a CPU-time fraction, so load_pct above 100 is
+	 * normal under heavy load.  Headroom = 75% means "the average
+	 * unparked CPU has <0.75 threads queued"; deadband 15 sets
+	 * unpark above 90% and park below 60%.
+	 */
+	load_pct = total_load * 100 / n_unparked;
+	/* EWMA smoothing (3:1 like the balancer's signal). */
+	laminar_ctrl_load_ewma = (3 * laminar_ctrl_load_ewma + load_pct) / 4;
+
+	upper = laminar_ctrl_headroom + laminar_ctrl_deadband;
+	lower = laminar_ctrl_headroom - laminar_ctrl_deadband;
+
+	if (laminar_ctrl_load_ewma > upper) {
+		/* Over-loaded -- unpark a CPU. */
+		laminar_ctrl_unpark_streak++;
+		laminar_ctrl_park_streak = 0;
+		if (laminar_ctrl_unpark_streak >= laminar_ctrl_unpark_pat &&
+		    first_parked >= 0) {
+			tdq = LAMINAR_TDQ_CPU(first_parked);
+			atomic_store_int(&tdq->ltdq_resistance_power, 0);
+			laminar_ctrl_unpark_streak = 0;
+		}
+	} else if (laminar_ctrl_load_ewma < lower) {
+		/* Under-loaded -- park a CPU (but keep at least 1 alive). */
+		laminar_ctrl_park_streak++;
+		laminar_ctrl_unpark_streak = 0;
+		if (laminar_ctrl_park_streak >= laminar_ctrl_park_pat &&
+		    min_cpu >= 0 && n_parked < n_total - 1) {
+			tdq = LAMINAR_TDQ_CPU(min_cpu);
+			atomic_store_int(&tdq->ltdq_resistance_power,
+			    laminar_ctrl_evac_r);
+			laminar_ctrl_park_streak = 0;
+		}
+	} else {
+		/* In deadband -- decay streaks. */
+		laminar_ctrl_park_streak = 0;
+		laminar_ctrl_unpark_streak = 0;
+	}
+
+reschedule:
+	callout_reset(&laminar_ctrl_callout,
+	    imax(1, hz * laminar_ctrl_interval / 1000),
+	    laminar_ctrl_cb, NULL);
+}
+
+static void
+laminar_ctrl_start(void)
+{
+
+	callout_init(&laminar_ctrl_callout, 1);
+	callout_reset(&laminar_ctrl_callout,
+	    imax(1, hz * laminar_ctrl_interval / 1000),
+	    laminar_ctrl_cb, NULL);
 }
 #endif /* SMP */
 
@@ -2466,6 +2620,7 @@ sched_laminar_setup(void)
 	LAMINAR_TDQ_UNLOCK(tdq);
 #ifdef SMP
 	laminar_balance_start();
+	laminar_ctrl_start();
 #endif
 }
 
