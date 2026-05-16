@@ -136,6 +136,23 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
 #define	LAMINAR_EWMA_OLD	3
 #define	LAMINAR_EWMA_NEW	1
 #define	LAMINAR_EWMA_DEN	(LAMINAR_EWMA_OLD + LAMINAR_EWMA_NEW)
+
+/*
+ * IPC affinity tunables (whitepaper §6).
+ *   CONF_MIN: confidence threshold at which the dom_waker slot is
+ *     trusted as the thread's IPC home.
+ *   CONF_MAX: saturation cap so a long-running pairing doesn't
+ *     overflow the 16-bit counter or take forever to forget.
+ *   slack: how much extra placement cost we will pay on the home
+ *     CPU vs the global minimum to honor IPC affinity.  Larger =
+ *     more IPC locality, less load balance; 0 = strict balance.
+ */
+#define	LAMINAR_IPC_CONF_MIN	3
+#define	LAMINAR_IPC_CONF_MAX	16
+/* Default; SYSCTL_INT registration sits next to the other balancer
+ * tunables further down where the sysctl_ctx is.  Definition is here
+ * so pickcpu (earlier in the file) can reference it. */
+static int laminar_ipc_slack = 2;
 static const uint32_t laminar_nice_weight[40] = {
 	/* -20 */ 88761, 71755, 56483, 46273, 36291,
 	/* -15 */ 29154, 23254, 18705, 14949, 11916,
@@ -186,8 +203,17 @@ struct td_sched {
 	uint16_t	ts_flags;	/* TSF_*. */
 	uint8_t		ts_class;	/* RT / TIMESHARE / IDLE. */
 	uint8_t		ts_class_pri;	/* Priority within RT/IDLE class. */
-	/* IPC affinity (whitepaper §6). */
-	struct thread	*ts_dom_waker;
+	/*
+	 * IPC affinity (whitepaper §6).  Boyer-Moore single-slot
+	 * majority tracker over wakeup edges, but recorded as the
+	 * waker's CPU rather than the waker's thread pointer -- the
+	 * pointer is unsafe (waker can exit) and the home decision
+	 * pickcpu actually needs is a CPU/domain, not an identity.
+	 * Most communicating partners stay on one CPU between
+	 * migrations, so the CPU is an adequate proxy for identity.
+	 * ts_dom_waker_cpu = -1 when slot is empty.
+	 */
+	int16_t		ts_dom_waker_cpu;
 	uint16_t	ts_dom_waker_conf;
 	/* NUMA (whitepaper §8). */
 	uint16_t	ts_home_node_conf;
@@ -776,6 +802,8 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 {
 	struct td_sched *ts;
 	int self, ts_cpu, best_cpu, best_cost, cpu, cost;
+	int min_cost = INT_MAX, min_cpu = -1;
+	int home_cpu, home_cost;
 
 	(void)flags;
 
@@ -786,6 +814,36 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 	ts_cpu = ts->ts_cpu;
 	if (!THREAD_CAN_MIGRATE(td))
 		return (ts_cpu);
+
+	/*
+	 * IPC affinity (whitepaper §6).  If we have a confident IPC
+	 * home and its cost is within ipc_slack of the global min,
+	 * honor it.  Computing global min here is one CPU_FOREACH
+	 * pass; cheap, and skipped entirely when conf < CONF_MIN.
+	 */
+	if (ts->ts_dom_waker_conf >= LAMINAR_IPC_CONF_MIN) {
+		home_cpu = ts->ts_dom_waker_cpu;
+		if (home_cpu >= 0 && home_cpu <= mp_maxid &&
+		    THREAD_CAN_SCHED(td, home_cpu)) {
+			home_cost = laminar_placement_cost(
+			    LAMINAR_TDQ_CPU(home_cpu));
+			CPU_FOREACH(cpu) {
+				cost = laminar_placement_cost(
+				    LAMINAR_TDQ_CPU(cpu));
+				if (cost < min_cost) {
+					min_cost = cost;
+					min_cpu = cpu;
+				}
+			}
+			if (home_cost <= min_cost + laminar_ipc_slack)
+				return (home_cpu);
+			/* Home too expensive; fall through.  Reuse the
+			 * already-computed min as the scan seed. */
+			best_cpu = min_cpu;
+			best_cost = min_cost;
+			goto done_scan;
+		}
+	}
 
 	if (THREAD_CAN_SCHED(td, ts_cpu)) {
 		if (atomic_load_int(&LAMINAR_TDQ_CPU(ts_cpu)->ltdq_resistance)
@@ -812,6 +870,7 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 			best_cpu = cpu;
 		}
 	}
+done_scan:
 	return (best_cpu);
 }
 
@@ -931,6 +990,16 @@ SYSCTL_INT(_kern_sched, OID_AUTO, cooldown_base, CTLFLAG_RW,
 SYSCTL_INT(_kern_sched, OID_AUTO, drain_max, CTLFLAG_RW,
     &laminar_drain_max, 0,
     "Laminar: max migrations per balance pass (safety cap)");
+
+/*
+ * IPC affinity (whitepaper §6).  Variable definition is up top so
+ * pickcpu (defined earlier) can reference it; only the sysctl knob
+ * registration lives here, next to the other tunables.
+ */
+SYSCTL_INT(_kern_sched, OID_AUTO, ipc_slack, CTLFLAG_RW,
+    &laminar_ipc_slack, 0,
+    "Laminar: IPC home stickiness vs balance (extra cost units "
+    "tolerated to honor dom_waker home CPU; 0 disables IPC pull)");
 
 /*
  * Acquire two tdq locks in address order to avoid deadlock with any
@@ -1399,6 +1468,7 @@ sched_laminar_fork_thread(struct thread *td, struct thread *child)
 	ts->ts_cpu = tsc->ts_cpu;
 	ts->ts_class = tsc->ts_class;
 	ts->ts_home_node = -1;
+	ts->ts_dom_waker_cpu = -1;	/* no IPC home yet */
 }
 
 /*
@@ -1827,6 +1897,38 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, lag_cap, CTLFLAG_RW,
     &laminar_lag_cap, 0,
     "Laminar: max vruntime units a waker may sit below the per-CPU floor");
 
+/*
+ * Record one wakeup edge for IPC affinity inference (whitepaper §6).
+ * Boyer-Moore single-slot majority over the waker's CPU.  Skipped
+ * for self-wakes, idle-thread wakes, and when the waker has no
+ * sensible CPU snapshot.
+ */
+static __inline void
+laminar_ipc_record_edge(struct thread *td)
+{
+	struct td_sched *ts, *wts;
+	struct thread *waker;
+	int waker_cpu;
+
+	waker = curthread;
+	if (waker == td || waker == NULL || TD_IS_IDLETHREAD(waker))
+		return;
+	wts = td_get_sched(waker);
+	waker_cpu = wts->ts_cpu;
+	if (waker_cpu < 0 || waker_cpu > mp_maxid)
+		return;
+	ts = td_get_sched(td);
+	if (ts->ts_dom_waker_cpu == (int16_t)waker_cpu) {
+		if (ts->ts_dom_waker_conf < LAMINAR_IPC_CONF_MAX)
+			ts->ts_dom_waker_conf++;
+	} else if (ts->ts_dom_waker_conf > 0) {
+		ts->ts_dom_waker_conf--;
+	} else {
+		ts->ts_dom_waker_cpu = (int16_t)waker_cpu;
+		ts->ts_dom_waker_conf = 1;
+	}
+}
+
 static void
 sched_laminar_wakeup(struct thread *td, int srqflags)
 {
@@ -1835,6 +1937,7 @@ sched_laminar_wakeup(struct thread *td, int srqflags)
 	uint64_t floor, cap;
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
+	laminar_ipc_record_edge(td);
 	/*
 	 * Bounded-lag rebase (whitepaper §7).  Pull the waker's
 	 * vruntime up to within laminar_lag_cap of the target CPU's
@@ -2005,7 +2108,7 @@ sched_laminar_init(void)
 	ts0->ts_flags = 0;
 	ts0->ts_class = 0;		/* refined in a later phase */
 	ts0->ts_class_pri = 0;
-	ts0->ts_dom_waker = NULL;
+	ts0->ts_dom_waker_cpu = -1;
 	ts0->ts_dom_waker_conf = 0;
 	ts0->ts_home_node_conf = 0;
 	ts0->ts_home_node = -1;
