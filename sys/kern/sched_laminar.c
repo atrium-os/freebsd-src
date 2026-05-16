@@ -82,6 +82,31 @@
  */
 #define	LAMINAR_TS_CAP		2048
 
+/*
+ * Hierarchical SoA layer.  The flat vruntime[] array is partitioned
+ * into fixed-size shards; each shard caches its current min.  The
+ * picker scans the shard-min array (small) to find the winning
+ * shard, then scans within just that shard.  Total pick work is
+ *   K + n/K  ops where K = ceil(ts_n / SHARD_SIZE).
+ * Reduces O(n) to O(sqrt(n)) at the high end without changing the
+ * picker's behavior for small n (with SHARD_SIZE=64 the per-pick
+ * overhead at n=8 is one extra shard-min compare).
+ *
+ * Inserts maintain shard_min in O(1).  Removes are O(1) in the
+ * common case (the removed entry was not its shard's min); when the
+ * min is invalidated, the affected shard is rescanned at cost
+ * O(SHARD_SIZE).
+ *
+ * Choosing SHARD_SIZE: smaller = better headroom (less work per
+ * shard scan) but more shards to scan.  Sqrt of the design's
+ * targeted high-end n (~few hundred to low thousands) puts the
+ * optimum near 32-64; 64 also matches an aarch64 cache line.
+ */
+#define	LAMINAR_SHARD_SIZE	64
+#define	LAMINAR_NSHARDS		(LAMINAR_TS_CAP / LAMINAR_SHARD_SIZE)
+_Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
+    "LAMINAR_TS_CAP must be a multiple of LAMINAR_SHARD_SIZE");
+
 static MALLOC_DEFINE(M_LAMINAR, "laminar", "Laminar scheduler data");
 
 /* Per-scheduler use of generic td_flags bits (mirrors ULE / 4BSD). */
@@ -145,9 +170,11 @@ struct laminar_tdq {
 	struct runq	ltdq_runq;	/* (t) Active runq for all classes. */
 	uint32_t	ltdq_ts_n;	/* (t) Timeshare SoA slot count. */
 	uint32_t	ltdq_ts_cap;	/* (c) Timeshare SoA capacity. */
-	uint64_t	*ltdq_vruntime;	/* (t) Hot, SIMD-scannable (A.4). */
-	struct thread	**ltdq_slot;	/* (t) Cold, by winner index (A.4). */
-	uint64_t	ltdq_vtime;	/* (t) Virtual time floor (A.4). */
+	uint64_t	*ltdq_vruntime;	/* (t) Hot, scanned within winning shard. */
+	struct thread	**ltdq_slot;	/* (t) Cold, by winner index. */
+	uint64_t	ltdq_vtime;	/* (t) Virtual time floor (A.5). */
+	/* Hierarchical layer: per-shard cached min over ltdq_vruntime. */
+	uint64_t	ltdq_shard_min[LAMINAR_NSHARDS]; /* (t) per-shard min. */
 
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
@@ -233,6 +260,8 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	tdq->ltdq_slot = malloc(tdq->ltdq_ts_cap *
 	    sizeof(*tdq->ltdq_slot), M_LAMINAR, M_WAITOK | M_ZERO);
 	tdq->ltdq_vtime = 0;
+	for (int s = 0; s < LAMINAR_NSHARDS; s++)
+		tdq->ltdq_shard_min[s] = UINT64_MAX;
 	snprintf(tdq->ltdq_name, sizeof(tdq->ltdq_name),
 	    "sched lock %d", id);
 	mtx_init(LAMINAR_TDQ_LOCKPTR(tdq), tdq->ltdq_name, "sched lock",
@@ -240,38 +269,80 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 }
 
 /*
- * Scalar reference implementation of the min-vruntime scan.  An
- * AVX2/NEON-vectorized version can land later under arch ifdefs
- * without touching callers.
+ * Recompute the cached min for one shard from its current contents.
+ * Cost: O(SHARD_SIZE).  Called when a remove invalidates the cached
+ * min (the removed entry's value equalled it).
  */
-static __inline uint32_t
-laminar_min_index(const uint64_t *v, uint32_t n)
+static void
+laminar_shard_recompute(struct laminar_tdq *tdq, uint32_t s)
 {
 	uint64_t best;
-	uint32_t i, idx;
+	uint32_t lo, hi, i;
 
-	KASSERT(n != 0, ("laminar_min_index: empty array"));
-	best = v[0];
-	idx = 0;
-	for (i = 1; i < n; i++) {
-		if (v[i] < best) {
-			best = v[i];
-			idx = i;
-		}
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	lo = s * LAMINAR_SHARD_SIZE;
+	hi = lo + LAMINAR_SHARD_SIZE;
+	if (hi > tdq->ltdq_ts_n)
+		hi = tdq->ltdq_ts_n;
+	if (lo >= hi) {
+		tdq->ltdq_shard_min[s] = UINT64_MAX;
+		return;
 	}
-	return (idx);
+	best = tdq->ltdq_vruntime[lo];
+	for (i = lo + 1; i < hi; i++) {
+		if (tdq->ltdq_vruntime[i] < best)
+			best = tdq->ltdq_vruntime[i];
+	}
+	tdq->ltdq_shard_min[s] = best;
 }
 
 /*
- * Append td to the timeshare SoA arrays at index ts_n; grow the
- * arrays if we hit the cap.  Stores ts_slot in td_sched so that
- * remove is O(1).
+ * Hierarchical min-vruntime pick: scan per-shard cached mins to
+ * find the winning shard, then linear-scan inside just that shard.
+ * Total cost K + n/K where K = ceil(ts_n / SHARD_SIZE).
+ */
+static __inline uint32_t
+laminar_min_index(const struct laminar_tdq *tdq)
+{
+	uint64_t shard_best, slot_best;
+	uint32_t s, nshards, win_shard, win_slot, lo, hi, i;
+
+	KASSERT(tdq->ltdq_ts_n != 0, ("laminar_min_index: empty"));
+
+	nshards = (tdq->ltdq_ts_n + LAMINAR_SHARD_SIZE - 1) /
+	    LAMINAR_SHARD_SIZE;
+	shard_best = tdq->ltdq_shard_min[0];
+	win_shard = 0;
+	for (s = 1; s < nshards; s++) {
+		if (tdq->ltdq_shard_min[s] < shard_best) {
+			shard_best = tdq->ltdq_shard_min[s];
+			win_shard = s;
+		}
+	}
+	lo = win_shard * LAMINAR_SHARD_SIZE;
+	hi = lo + LAMINAR_SHARD_SIZE;
+	if (hi > tdq->ltdq_ts_n)
+		hi = tdq->ltdq_ts_n;
+	slot_best = tdq->ltdq_vruntime[lo];
+	win_slot = lo;
+	for (i = lo + 1; i < hi; i++) {
+		if (tdq->ltdq_vruntime[i] < slot_best) {
+			slot_best = tdq->ltdq_vruntime[i];
+			win_slot = i;
+		}
+	}
+	return (win_slot);
+}
+
+/*
+ * Append td to the timeshare SoA arrays at index ts_n.  Maintains
+ * the cached shard min in O(1).
  */
 static void
 laminar_slot_insert(struct laminar_tdq *tdq, struct thread *td)
 {
 	struct td_sched *ts;
-	uint32_t i;
+	uint32_t i, s;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	if (__predict_false(tdq->ltdq_ts_n == tdq->ltdq_ts_cap))
@@ -283,16 +354,26 @@ laminar_slot_insert(struct laminar_tdq *tdq, struct thread *td)
 	tdq->ltdq_slot[i] = td;
 	ts->ts_slot = i;
 	ts->ts_flags |= TSF_INSOA;
+
+	s = i / LAMINAR_SHARD_SIZE;
+	if ((i % LAMINAR_SHARD_SIZE) == 0)
+		tdq->ltdq_shard_min[s] = ts->ts_vruntime;
+	else if (ts->ts_vruntime < tdq->ltdq_shard_min[s])
+		tdq->ltdq_shard_min[s] = ts->ts_vruntime;
 }
 
 /*
- * O(1) tail-swap remove from the timeshare SoA arrays.
+ * O(1) tail-swap remove from the timeshare SoA arrays.  Shard mins
+ * stay correct without a rescan in the common case (removed entry
+ * was not its shard's min); when invalidated, the affected shard
+ * is rescanned (O(SHARD_SIZE)).
  */
 static void
 laminar_slot_remove(struct laminar_tdq *tdq, struct thread *td)
 {
 	struct td_sched *ts;
-	uint32_t i, last;
+	uint64_t removed_v, moved_v;
+	uint32_t i, last, si, slast;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	ts = td_get_sched(td);
@@ -300,11 +381,41 @@ laminar_slot_remove(struct laminar_tdq *tdq, struct thread *td)
 	i = ts->ts_slot;
 	MPASS(i < tdq->ltdq_ts_n);
 	MPASS(tdq->ltdq_slot[i] == td);
+
+	removed_v = tdq->ltdq_vruntime[i];
 	last = --tdq->ltdq_ts_n;
+	si = i / LAMINAR_SHARD_SIZE;
+	slast = last / LAMINAR_SHARD_SIZE;
+	moved_v = (i != last) ? tdq->ltdq_vruntime[last] : 0;
+
 	if (i != last) {
-		tdq->ltdq_vruntime[i] = tdq->ltdq_vruntime[last];
+		tdq->ltdq_vruntime[i] = moved_v;
 		tdq->ltdq_slot[i] = tdq->ltdq_slot[last];
 		td_get_sched(tdq->ltdq_slot[i])->ts_slot = i;
+	}
+
+	if (si == slast) {
+		/*
+		 * Same-shard remove: shard si lost the entry at i (which
+		 * was removed_v).  If i != last, an entry that was in the
+		 * same shard at `last' moved into slot i (still in shard
+		 * si, but no net change to shard membership beyond losing
+		 * removed_v).  Either way, we only have to rescan if the
+		 * removed value was the cached min.
+		 */
+		if (removed_v == tdq->ltdq_shard_min[si])
+			laminar_shard_recompute(tdq, si);
+	} else {
+		/*
+		 * Cross-shard remove: shard si replaced removed_v with
+		 * moved_v; shard slast lost the entry at `last' (moved_v).
+		 */
+		if (removed_v == tdq->ltdq_shard_min[si])
+			laminar_shard_recompute(tdq, si);
+		else if (moved_v < tdq->ltdq_shard_min[si])
+			tdq->ltdq_shard_min[si] = moved_v;
+		if (moved_v == tdq->ltdq_shard_min[slast])
+			laminar_shard_recompute(tdq, slast);
 	}
 	ts->ts_flags &= ~TSF_INSOA;
 }
@@ -409,8 +520,7 @@ tdq_choose(struct laminar_tdq *tdq)
 	if (rt != NULL && rt->td_priority < PRI_MIN_TIMESHARE)
 		return (rt);
 	if (tdq->ltdq_ts_n != 0) {
-		uint32_t i = laminar_min_index(tdq->ltdq_vruntime,
-		    tdq->ltdq_ts_n);
+		uint32_t i = laminar_min_index(tdq);
 		/*
 		 * Advance the per-CPU vruntime floor to the winner's
 		 * vruntime.  Lockless readers (sched_laminar_wakeup's
