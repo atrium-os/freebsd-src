@@ -304,26 +304,31 @@ tdq_choose(struct laminar_tdq *tdq)
 
 #ifdef SMP
 /*
- * Pick a target CPU for the thread.  A.3e bring-up policy: ALWAYS
- * return the current CPU.  The full ts_cpu-honoring path
- * (commented out below) is the planned policy but exposes a
- * cross-CPU recursion bug -- sched_laminar.c:355
- * "mtx_lock_spin: recursed on non-recursive mutex sched lock 0"
- * triggered from softclock_call_cc -> sched_laminar_add via a
- * callout-driven wakeup.  Root-cause analysis identified the
- * exact source line and mtx instance via kgdb, but pinning down
- * which outer context already holds the target tdq lock requires
- * a focused live-breakpoint session with the kgdb workflow.
- * Defer until the next session can attach gdb at the entry to
- * sched_laminar_setcpu and walk the lock owner field.
+ * Pick a target CPU for the thread.  Diagnostic build: honor ts_cpu
+ * when smp is up, the thread can migrate, and its cpuset allows the
+ * target.  Falls back to curcpu otherwise.
  */
 static int
 sched_laminar_pickcpu(struct thread *td, int flags)
 {
+	struct td_sched *ts;
+	int self, target;
 
-	(void)td;
 	(void)flags;
-	return (PCPU_GET(cpuid));
+
+	self = PCPU_GET(cpuid);
+	if (smp_started == 0)
+		return (self);
+	if (!THREAD_CAN_MIGRATE(td))
+		return (td_get_sched(td)->ts_cpu);
+
+	ts = td_get_sched(td);
+	target = ts->ts_cpu;
+	if (target == self)
+		return (self);
+	if (!THREAD_CAN_SCHED(td, target))
+		return (self);
+	return (target);
 }
 
 /*
@@ -349,6 +354,30 @@ sched_laminar_setcpu(struct thread *td, int cpu, int flags)
 	mtx = thread_lock_block(td);
 	if ((flags & SRQ_HOLD) == 0)
 		mtx_unlock_spin(mtx);
+	/*
+	 * Diagnostic: before we attempt to acquire the target tdq's
+	 * spin mutex, detect the recursion case (curthread already owns
+	 * it) and panic with caller-side context.  Without this the bare
+	 * mtx_lock_spin assertion only tells us which lock recursed, not
+	 * which outer context already held it.
+	 */
+	{
+		struct mtx *tdq_mtx = LAMINAR_TDQ_LOCKPTR(tdq);
+		uintptr_t owner = atomic_load_acq_ptr(&tdq_mtx->mtx_lock);
+		uintptr_t self = (uintptr_t)curthread;
+
+		if ((owner & ~(uintptr_t)MTX_FLAGMASK) == self) {
+			panic("laminar setcpu cross-CPU recursion: "
+			    "target cpu=%d tdq=%p mtx=%p owner=%#lx self=%#lx "
+			    "td=%p td_lock=%p td_tid=%d "
+			    "curtdq=%p curtdq_lock=%p flags=%#x",
+			    cpu, tdq, tdq_mtx, (u_long)owner, (u_long)self,
+			    td, td->td_lock, td->td_tid,
+			    LAMINAR_TDQ_SELF(),
+			    LAMINAR_TDQ_LOCKPTR(LAMINAR_TDQ_SELF()),
+			    flags);
+		}
+	}
 	LAMINAR_TDQ_LOCK(tdq);
 	thread_lock_unblock(td, LAMINAR_TDQ_LOCKPTR(tdq));
 	spinlock_exit();
@@ -973,12 +1002,13 @@ sched_laminar_preempt(struct thread *td)
 	thread_lock(td);
 	if (td->td_critnest > 1) {
 		td->td_owepreempt = 1;
-	} else {
-		flags = SW_INVOL | SW_PREEMPT;
-		flags |= TD_IS_IDLETHREAD(td) ? SWT_REMOTEWAKEIDLE :
-		    SWT_REMOTEPREEMPT;
-		mi_switch(flags);
+		thread_unlock(td);
+		return;
 	}
+	flags = SW_INVOL | SW_PREEMPT;
+	flags |= TD_IS_IDLETHREAD(td) ? SWT_REMOTEWAKEIDLE :
+	    SWT_REMOTEPREEMPT;
+	mi_switch(flags);	/* drops thread_lock */
 }
 
 static void
