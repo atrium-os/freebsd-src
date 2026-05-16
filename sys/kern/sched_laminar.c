@@ -119,6 +119,23 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
  * get picked more often, in correct proportion.
  */
 #define	LAMINAR_NICE_0_WEIGHT	1024U
+
+/*
+ * RLC balancer scale + smoother constants.
+ *   CAP_BASE is the canonical capacity unit.  A CPU at full
+ *   capacity has ltdq_capacity = CAP_BASE; a half-capacity E-core
+ *   would be CAP_BASE/2.  Scaled cost = (load + R) * CAP_BASE /
+ *   capacity, so a half-capacity CPU's effective cost doubles
+ *   (placement attracts proportionally less load).
+ *
+ *   EWMA weighting: new = (EWMA_OLD * prev + EWMA_NEW * sample) /
+ *   (EWMA_OLD + EWMA_NEW).  3:1 is the simulator's converged
+ *   smoothing for the post-scale signal.
+ */
+#define	LAMINAR_CAP_BASE	100
+#define	LAMINAR_EWMA_OLD	3
+#define	LAMINAR_EWMA_NEW	1
+#define	LAMINAR_EWMA_DEN	(LAMINAR_EWMA_OLD + LAMINAR_EWMA_NEW)
 static const uint32_t laminar_nice_weight[40] = {
 	/* -20 */ 88761, 71755, 56483, 46273, 36291,
 	/* -15 */ 29154, 23254, 18705, 14949, 11916,
@@ -244,6 +261,29 @@ struct laminar_tdq {
 	 */
 	int		ltdq_resistance;	/* (ts) additive placement R. */
 
+	/*
+	 * RLC balancer filter state (phase C, DESIGN.md §1).  All terms
+	 * are unconditional -- they are inert on homogeneous /
+	 * single-leaf systems (capacity ratio = 1, leaf covers all CPUs,
+	 * EWMA settles to raw cost), and active on heterogeneous / NUMA.
+	 *
+	 *   ltdq_capacity: per-CPU compute capacity, default
+	 *     LAMINAR_CAP_BASE.  Half-capacity P/E core would be 50.
+	 *     Settable via sysctl kern.sched.laminar.cpu.N.capacity.
+	 *   ltdq_signal_ewma: smoothed (scaled) placement cost.  Used
+	 *     for rank decisions; raw transferable count gates the
+	 *     migrate (rank/gate decouple).
+	 *   ltdq_streak: C2 debounce counter; donor must persist this
+	 *     many cycles before action.  Evac (R > 0) skips.
+	 *   ltdq_last_xfer: ticks @ last successful migration FROM this
+	 *     CPU.  Adaptive-L cooldown gates subsequent migrations
+	 *     off the same donor.
+	 */
+	int		ltdq_capacity;		/* (ts) per-CPU capacity. */
+	int		ltdq_signal_ewma;	/* (t) smoothed scaled cost. */
+	int		ltdq_streak;		/* (t) C2 debounce counter. */
+	int		ltdq_last_xfer;		/* (t) ticks @ last migration. */
+
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
 	int		ltdq_sysload;	/* (ts) Non-ITHD load. */
@@ -313,6 +353,7 @@ sched_laminar_unimpl(const char *fn)
 /* Forward declarations for the periodic balancer (defined below). */
 static int tdq_add_internal(struct laminar_tdq *, struct thread *, int);
 static void sched_laminar_rem(struct thread *);
+static int laminar_transferable(struct laminar_tdq *);
 
 /*
  * Initialize a per-CPU runqueue.  Called once per CPU at boot.
@@ -333,6 +374,10 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	    sizeof(*tdq->ltdq_slot), M_LAMINAR, M_WAITOK | M_ZERO);
 	tdq->ltdq_vtime = 0;
 	tdq->ltdq_resistance = 0;
+	tdq->ltdq_capacity = LAMINAR_CAP_BASE;
+	tdq->ltdq_signal_ewma = 0;
+	tdq->ltdq_streak = 0;
+	tdq->ltdq_last_xfer = 0;
 	for (int s = 0; s < LAMINAR_NSHARDS; s++)
 		tdq->ltdq_shard_min[s] = UINT64_MAX;
 	snprintf(tdq->ltdq_name, sizeof(tdq->ltdq_name),
@@ -554,6 +599,14 @@ laminar_sysctl_register(void *arg __unused)
 		    "resistance", CTLFLAG_RW, &tdq->ltdq_resistance, 0,
 		    "Power-aware placement R (added to load for pickcpu "
 		    "and balance ranking)");
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "capacity", CTLFLAG_RW, &tdq->ltdq_capacity, 0,
+		    "Per-CPU compute capacity (LAMINAR_CAP_BASE = full; "
+		    "lower for E-cores / capped cores).  Scales placement "
+		    "cost: (load + R) * CAP_BASE / capacity.");
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "signal_ewma", CTLFLAG_RD, &tdq->ltdq_signal_ewma, 0,
+		    "Current smoothed scaled placement signal (read-only).");
 	}
 }
 SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
@@ -646,15 +699,66 @@ tdq_choose(struct laminar_tdq *tdq)
 
 #ifdef SMP
 /*
- * Effective placement cost = current load + power-aware resistance R.
- * Lockless read; staleness is bounded and harmless at pickcpu cadence.
+ * Raw (unscaled) cost: load + R.  Used for absolute decisions like
+ * "are we balanced?" and as the gate / decouple input -- raw count
+ * of transferable work is the right unit for "is there anything
+ * actually to move", independent of capacity ratios.
+ */
+static __inline int
+laminar_raw_cost(const struct laminar_tdq *tdq)
+{
+
+	return (atomic_load_int(&tdq->ltdq_load) +
+	    atomic_load_int(&tdq->ltdq_resistance));
+}
+
+/*
+ * Scaled placement cost: (load + R) * CAP_BASE / capacity.  Half-
+ * capacity CPU's effective cost doubles, so placement attracts
+ * proportionally less work.  Inert on homogeneous (capacity ratio
+ * is 1 across all CPUs).
+ */
+static __inline int
+laminar_scaled_cost(const struct laminar_tdq *tdq)
+{
+	int cap;
+
+	cap = atomic_load_int(&tdq->ltdq_capacity);
+	if (cap <= 0)
+		cap = LAMINAR_CAP_BASE;
+	return (laminar_raw_cost(tdq) * LAMINAR_CAP_BASE / cap);
+}
+
+/*
+ * EWMA-smoothed scaled cost.  The simulator's converged smoothing
+ * removes single-tick spikes after the capacity divide injects
+ * granularity.  On homogeneous the scaled signal equals the raw
+ * signal and the EWMA is a no-op latency.
+ */
+static __inline int
+laminar_signal(struct laminar_tdq *tdq)
+{
+	int sample, prev, ema;
+
+	sample = laminar_scaled_cost(tdq);
+	prev = atomic_load_int(&tdq->ltdq_signal_ewma);
+	ema = (LAMINAR_EWMA_OLD * prev + LAMINAR_EWMA_NEW * sample) /
+	    LAMINAR_EWMA_DEN;
+	atomic_store_int(&tdq->ltdq_signal_ewma, ema);
+	return (ema);
+}
+
+/*
+ * pickcpu uses the raw cost (not the smoothed signal) because it is
+ * called at wakeup latency-critical paths -- one wakeup doesn't see
+ * enough samples for smoothing to matter, and the smoothing window
+ * lives in the balancer's periodic scan instead.
  */
 static __inline int
 laminar_placement_cost(const struct laminar_tdq *tdq)
 {
 
-	return (atomic_load_int(&tdq->ltdq_load) +
-	    atomic_load_int(&tdq->ltdq_resistance));
+	return (laminar_scaled_cost(tdq));
 }
 
 /*
@@ -799,6 +903,18 @@ tdq_notify(struct laminar_tdq *tdq, int lowpri)
 static struct callout laminar_balance_callout;
 static int laminar_balance_interval = 100;	/* ms */
 static int laminar_balance_threshold = 2;	/* migrate when high - low >= this */
+/*
+ * RLC filter tunables (DESIGN.md §1).  Defaults match the simulator's
+ * converged operating point.
+ *   debounce: consecutive imbalanced cycles required before action.
+ *   cooldown_base: ticks between successive migrations off the same
+ *     donor at minimum-actionable imbalance; shrinks as gap grows.
+ *   drain_max: safety cap on per-callout migrations (prevents a
+ *     runaway from monopolizing the callout thread).
+ */
+static int laminar_debounce = 2;
+static int laminar_cooldown_base = 16;
+static int laminar_drain_max = 32;
 
 SYSCTL_INT(_kern_sched, OID_AUTO, balance_interval, CTLFLAG_RW,
     &laminar_balance_interval, 0,
@@ -806,6 +922,15 @@ SYSCTL_INT(_kern_sched, OID_AUTO, balance_interval, CTLFLAG_RW,
 SYSCTL_INT(_kern_sched, OID_AUTO, balance_threshold, CTLFLAG_RW,
     &laminar_balance_threshold, 0,
     "Laminar: load difference required to trigger a migration");
+SYSCTL_INT(_kern_sched, OID_AUTO, debounce, CTLFLAG_RW,
+    &laminar_debounce, 0,
+    "Laminar: C2 debounce cycles (donor must be hi for this many)");
+SYSCTL_INT(_kern_sched, OID_AUTO, cooldown_base, CTLFLAG_RW,
+    &laminar_cooldown_base, 0,
+    "Laminar: per-donor cooldown base ticks; shrinks as imbalance grows");
+SYSCTL_INT(_kern_sched, OID_AUTO, drain_max, CTLFLAG_RW,
+    &laminar_drain_max, 0,
+    "Laminar: max migrations per balance pass (safety cap)");
 
 /*
  * Acquire two tdq locks in address order to avoid deadlock with any
@@ -862,16 +987,16 @@ laminar_balance_pair(struct laminar_tdq *high, struct laminar_tdq *low)
 
 	laminar_tdq_lock_pair(high, low);
 	/*
-	 * Compare using (load + R) so a high-R donor is treated as
-	 * over-loaded (drains) and a high-R acceptor is treated as
-	 * already-loaded (refuses).
+	 * Rank with smoothed scaled signal; gate with raw transferable
+	 * count (rank/gate decouple, DESIGN.md §1).  Without the
+	 * decouple, low-capacity / smoothed-up CPUs can rank as donors
+	 * even when they have no migratable work, and we waste cycles.
 	 */
-	high_cost = high->ltdq_load + high->ltdq_resistance;
-	low_cost = low->ltdq_load + low->ltdq_resistance;
+	high_cost = laminar_scaled_cost(high);
+	low_cost = laminar_scaled_cost(low);
 	if (high_cost < low_cost + laminar_balance_threshold)
 		goto out;
-	/* Sanity: don't migrate if source has no actual queued work. */
-	if (high->ltdq_load <= 1)
+	if (laminar_transferable(high) < 1)
 		goto out;
 	dst_cpu = LAMINAR_TDQ_ID(low);
 	td = laminar_steal_timeshare(high, dst_cpu);
@@ -901,8 +1026,41 @@ out:
  * Walk all CPUs to find the most- and least-loaded tdq.  If the gap
  * is wide enough, move one thread.  Reschedule the callout afterwards.
  */
+/*
+ * Count transferable (migratable, on-runq, timeshare) threads on a
+ * tdq.  The "gate" half of the rank/gate decouple: a CPU may rank
+ * as "hi" by smoothed scaled cost but have nothing actually
+ * stealable -- in that case the migrate is a no-op and we should
+ * not waste a cycle on it.
+ */
+static int
+laminar_transferable(struct laminar_tdq *tdq)
+{
+	int n = 0;
+	uint32_t i;
+
+	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	for (i = 0; i < tdq->ltdq_ts_n; i++) {
+		if (THREAD_CAN_MIGRATE(tdq->ltdq_slot[i]))
+			n++;
+	}
+	return (n);
+}
+
+/*
+ * Find current hi/lo using the SMOOTHED scaled signal for rank
+ * decisions (rank/gate decouple).  Updates each CPU's EWMA as a
+ * side effect; the simulator's "smoothed" path requires that the
+ * signal be sampled on every pass even when no migration happens.
+ *
+ * Topology-R: on homogeneous single-leaf systems this is a no-op;
+ * on NUMA, prefer a low-cost CPU in the same cpu_group leaf as
+ * the donor.  The leaf preference goes into lo selection only --
+ * hi is whichever CPU has the highest cost globally.
+ */
 static void
-laminar_balance_cb(void *arg __unused)
+laminar_find_hi_lo(struct laminar_tdq **hip, int *hi_costp,
+    struct laminar_tdq **lop, int *lo_costp)
 {
 	struct laminar_tdq *hi = NULL, *lo = NULL, *tdq;
 	int hi_cost = -1, lo_cost = INT_MAX;
@@ -910,19 +1068,99 @@ laminar_balance_cb(void *arg __unused)
 
 	CPU_FOREACH(cpu) {
 		tdq = LAMINAR_TDQ_CPU(cpu);
-		cost = laminar_placement_cost(tdq);
-		if (cost > hi_cost) {
-			hi_cost = cost;
-			hi = tdq;
-		}
-		if (cost < lo_cost) {
-			lo_cost = cost;
-			lo = tdq;
+		cost = laminar_signal(tdq);	/* updates EWMA */
+		if (cost > hi_cost) { hi_cost = cost; hi = tdq; }
+	}
+	if (hi != NULL && hi->ltdq_cg != NULL) {
+		/*
+		 * Topology-R pass: prefer same-leaf-group acceptor.
+		 * The first pass restricts the lo search to hi's cpu
+		 * group leaf; if nothing useful is found there, fall
+		 * through to a global pass.
+		 */
+		CPU_FOREACH(cpu) {
+			tdq = LAMINAR_TDQ_CPU(cpu);
+			if (tdq == hi || tdq->ltdq_cg != hi->ltdq_cg)
+				continue;
+			cost = atomic_load_int(&tdq->ltdq_signal_ewma);
+			if (cost < lo_cost) { lo_cost = cost; lo = tdq; }
 		}
 	}
-	if (hi != NULL && lo != NULL && hi != lo &&
-	    hi_cost >= lo_cost + laminar_balance_threshold)
-		(void)laminar_balance_pair(hi, lo);
+	if (lo == NULL) {
+		CPU_FOREACH(cpu) {
+			tdq = LAMINAR_TDQ_CPU(cpu);
+			if (tdq == hi)
+				continue;
+			cost = atomic_load_int(&tdq->ltdq_signal_ewma);
+			if (cost < lo_cost) { lo_cost = cost; lo = tdq; }
+		}
+	}
+	*hip = hi; *hi_costp = hi_cost;
+	*lop = lo; *lo_costp = lo_cost;
+}
+
+/*
+ * Adaptive-L cooldown: at minimum-actionable imbalance, wait
+ * cooldown_base ticks before another migration off the same donor.
+ * Bigger gap -> shorter cooldown.  At gap = threshold we get full
+ * base; at gap = 4 * threshold we get ~base/4; never below 1.
+ */
+static __inline int
+laminar_cooldown_ticks(int gap)
+{
+	int divisor;
+
+	divisor = imax(1, gap / imax(1, laminar_balance_threshold));
+	return (imax(1, laminar_cooldown_base / divisor));
+}
+
+/*
+ * RLC balancer.  Drain loop: keep re-picking hi/lo and migrating
+ * one thread until the system is balanced, the donor cools down,
+ * or we hit drain_max.  C2 debounce gates entry; evac (R > 0 on
+ * the donor) skips debounce and drains the donor toward empty in
+ * a single pass.  Mirrors DESIGN.md §1 plus §2's evac shape.
+ */
+static void
+laminar_balance_cb(void *arg __unused)
+{
+	struct laminar_tdq *hi, *lo;
+	int hi_cost, lo_cost, gap;
+	int migrations = 0;
+	int now = ticks;
+	bool evac;
+
+	for (;;) {
+		laminar_find_hi_lo(&hi, &hi_cost, &lo, &lo_cost);
+		if (hi == NULL || lo == NULL || hi == lo)
+			break;
+		gap = hi_cost - lo_cost;
+		if (gap < laminar_balance_threshold) {
+			/* Balanced -- reset hi's streak. */
+			hi->ltdq_streak = 0;
+			break;
+		}
+		evac = atomic_load_int(&hi->ltdq_resistance) > 0;
+		if (!evac) {
+			/* C2 debounce: imbalance must persist. */
+			hi->ltdq_streak++;
+			if (hi->ltdq_streak < laminar_debounce)
+				break;
+			/* Adaptive-L cooldown: rate-limit per donor. */
+			if (now - hi->ltdq_last_xfer <
+			    laminar_cooldown_ticks(gap))
+				break;
+		}
+		if (!laminar_balance_pair(hi, lo))
+			break;
+		hi->ltdq_streak = 0;
+		hi->ltdq_last_xfer = now;
+		if (++migrations >= laminar_drain_max)
+			break;
+		/* If non-evac, single migration per cycle (per DESIGN.md). */
+		if (!evac)
+			break;
+	}
 
 	callout_reset(&laminar_balance_callout,
 	    imax(1, hz * laminar_balance_interval / 1000),
