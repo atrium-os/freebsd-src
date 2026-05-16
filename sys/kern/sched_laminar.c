@@ -175,6 +175,21 @@ static int laminar_ipc_slack = 2;
  * weighted 50:50 split CPU 50:50 regardless of how many threads
  * each runs.
  */
+/*
+ * Phase F: NUMA placement bias.  R_numa(td, c) = laminar_numa_alpha
+ * when CPU c is in a memory domain other than the thread's inferred
+ * home domain; 0 when same-domain.  Inferred home = the domain of
+ * the CPU on which the thread most recently ran (whitepaper §8's
+ * "recent-CPU bias" fallback; the spec notes this is inadequate for
+ * the full NUMA story and the proper signal is a VM-side page
+ * residency tracker, which is a separate larger project).
+ *
+ * On homogeneous single-domain systems (our dev VM, most laptops,
+ * single-socket boxes) every pc_domain is 0 and R_numa is
+ * unconditionally 0 -- the code path is inert and zero-cost.
+ */
+static int laminar_numa_alpha = 1;	/* extra cost per cross-domain hop */
+
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
 	int		lpr_id;		/* prison.pr_id, -1 = free */
@@ -870,6 +885,41 @@ tdq_choose(struct laminar_tdq *tdq)
 
 #ifdef SMP
 /*
+ * Memory domain of CPU `cpu'.  Single accessor so we can swap it
+ * cheaply (e.g. to honor cpuset memory-domain policy later).  On
+ * single-domain systems this is always 0.
+ */
+static __inline int
+laminar_cpu_domain(int cpu)
+{
+
+	return (pcpu_find(cpu)->pc_domain);
+}
+
+/*
+ * R_numa: extra placement cost added when CPU `cpu' is in a memory
+ * domain other than the thread's inferred home.  Inert when the
+ * thread has no home recorded (ts_home_node < 0) or when alpha is
+ * 0 (sysctl off).  No domain-distance matrix yet -- treats all
+ * cross-domain hops as the same cost, which matches the spec's
+ * recent-CPU-bias fallback.
+ */
+static __inline int
+laminar_numa_cost(struct thread *td, int cpu)
+{
+	int home;
+
+	if (laminar_numa_alpha == 0)
+		return (0);
+	home = td_get_sched(td)->ts_home_node;
+	if (home < 0)
+		return (0);
+	if (home == laminar_cpu_domain(cpu))
+		return (0);
+	return (laminar_numa_alpha);
+}
+
+/*
  * Raw (unscaled) cost: load + R.  Used for absolute decisions like
  * "are we balanced?" and as the gate / decouple input -- raw count
  * of transferable work is the right unit for "is there anything
@@ -933,6 +983,21 @@ laminar_placement_cost(const struct laminar_tdq *tdq)
 }
 
 /*
+ * Thread-aware placement cost: per-CPU scaled cost + R_numa for
+ * this thread on this CPU.  Used by pickcpu and by the balancer's
+ * acceptor scoring when we are moving a known thread.  On
+ * single-domain systems the NUMA term is 0 and this is identical
+ * to laminar_placement_cost.
+ */
+static __inline int
+laminar_thread_cost(struct thread *td, int cpu)
+{
+
+	return (laminar_scaled_cost(LAMINAR_TDQ_CPU(cpu)) +
+	    laminar_numa_cost(td, cpu));
+}
+
+/*
  * Pick a target CPU for the thread.  Phase B: honor ts_cpu by
  * default (preserves the phase A behavior + lets the periodic
  * balancer handle long-term spread), and only shop around when
@@ -970,11 +1035,9 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 		home_cpu = ts->ts_dom_waker_cpu;
 		if (home_cpu >= 0 && home_cpu <= mp_maxid &&
 		    THREAD_CAN_SCHED(td, home_cpu)) {
-			home_cost = laminar_placement_cost(
-			    LAMINAR_TDQ_CPU(home_cpu));
+			home_cost = laminar_thread_cost(td, home_cpu);
 			CPU_FOREACH(cpu) {
-				cost = laminar_placement_cost(
-				    LAMINAR_TDQ_CPU(cpu));
+				cost = laminar_thread_cost(td, cpu);
 				if (cost < min_cost) {
 					min_cost = cost;
 					min_cpu = cpu;
@@ -992,13 +1055,13 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 
 	if (THREAD_CAN_SCHED(td, ts_cpu)) {
 		if (atomic_load_int(&LAMINAR_TDQ_CPU(ts_cpu)->ltdq_resistance)
-		    == 0)
-			return (ts_cpu);	/* fast path, no R pressure */
+		    == 0 && laminar_numa_cost(td, ts_cpu) == 0)
+			return (ts_cpu);	/* fast path: no R, no NUMA */
 		best_cpu = ts_cpu;
-		best_cost = laminar_placement_cost(LAMINAR_TDQ_CPU(ts_cpu));
+		best_cost = laminar_thread_cost(td, ts_cpu);
 	} else {
 		best_cpu = self;
-		best_cost = laminar_placement_cost(LAMINAR_TDQ_CPU(self));
+		best_cost = laminar_thread_cost(td, self);
 	}
 	/*
 	 * Strictly less-than means equal-cost CPUs lose to the seeded
@@ -1009,7 +1072,7 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 			continue;
 		if (!THREAD_CAN_SCHED(td, cpu))
 			continue;
-		cost = laminar_placement_cost(LAMINAR_TDQ_CPU(cpu));
+		cost = laminar_thread_cost(td, cpu);
 		if (cost < best_cost) {
 			best_cost = cost;
 			best_cpu = cpu;
@@ -1145,6 +1208,11 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ipc_slack, CTLFLAG_RW,
     &laminar_ipc_slack, 0,
     "Laminar: IPC home stickiness vs balance (extra cost units "
     "tolerated to honor dom_waker home CPU; 0 disables IPC pull)");
+SYSCTL_INT(_kern_sched, OID_AUTO, numa_alpha, CTLFLAG_RW,
+    &laminar_numa_alpha, 0,
+    "Laminar: NUMA cross-domain placement penalty in cost units; "
+    "0 disables NUMA-aware placement; inert on single-domain "
+    "systems regardless of value.");
 
 /*
  * Phase E: jail-table sysctl.  A single dump/set sysctl rather than
@@ -2068,6 +2136,14 @@ sched_laminar_clock(struct thread *td, int cnt)
 	 */
 	ts->ts_vruntime += (uint64_t)cnt * ts->ts_eff_weight;
 	tdq->ltdq_switchcnt = tdq->ltdq_switchcnt + 1;
+	/*
+	 * Phase F: refresh inferred NUMA home to the current CPU's
+	 * domain.  Recent-CPU bias -- the thread has just consumed
+	 * cache and memory traffic here so this is its current
+	 * locality.  Inadequate vs a real page-residency signal but
+	 * captures common case (long-running threads stay home).
+	 */
+	ts->ts_home_node = (int16_t)laminar_cpu_domain(PCPU_GET(cpuid));
 }
 
 static void
