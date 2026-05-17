@@ -21,7 +21,7 @@ T=5
 # Single pair, no background.
 out=$(mktemp -t bi.XXXXXX)
 "$PINGPONG" "$T" > "$out" 2>&1
-rt=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^rt_mean_us=/) { sub("rt_mean_us=","",$i); printf "%.2f",$i; exit } }' "$out")
+rt=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^rt_mean_us=/) { sub("rt_mean_us=","",$i); print $i; exit } }' "$out")
 n=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^round_trips=/) { sub("round_trips=","",$i); print $i; exit } }' "$out")
 printf "%-12s pairs=1   bg_spinners=0 T=%ds round_trips=%-10s rt_mean_us=%s\n" \
     "$SCHED" "$T" "$n" "$rt"
@@ -39,13 +39,53 @@ sum_rt=0; sum_n=0
 for o in $outs; do
     rt=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^rt_mean_us=/) { sub("rt_mean_us=","",$i); print $i; exit } }' "$o")
     n=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^round_trips=/) { sub("round_trips=","",$i); print $i; exit } }' "$o")
-    sum_rt=$(echo "$sum_rt $rt" | awk '{ printf "%.2f", $1+$2 }')
+    if [ "$rt" = "stalled" ]; then
+        sum_rt="stalled"
+    elif [ "$sum_rt" != "stalled" ]; then
+        sum_rt=$(echo "$sum_rt $rt" | awk '{ printf "%.2f", $1+$2 }')
+    fi
     sum_n=$((sum_n + n))
     rm -f "$o"
 done
-mean_rt=$(echo "$sum_rt" | awk '{ printf "%.2f", $1/4 }')
+if [ "$sum_rt" = "stalled" ]; then
+    mean_rt="stalled (one or more pairs got <10 round-trips in T seconds)"
+else
+    mean_rt=$(echo "$sum_rt" | awk '{ printf "%.2f", $1/4 }')
+fi
 printf "%-12s pairs=4   bg_spinners=0 T=%ds round_trips=%-10s rt_mean_us=%s (per-pair mean)\n" \
     "$SCHED" "$T" "$sum_n" "$mean_rt"
+
+# ipc_slack sweep: 4 pairs, no background; vary slack and watch
+# whether pairs spread (low slack) vs co-locate (high slack).  Only
+# meaningful under Laminar (ULE has no equivalent knob, will skip).
+if sysctl kern.sched.ipc_slack >/dev/null 2>&1; then
+    orig_slack=$(sysctl -n kern.sched.ipc_slack)
+    for slack in 0 1 2 4 8; do
+        sysctl kern.sched.ipc_slack=$slack >/dev/null
+        outs=""
+        for i in 1 2 3 4; do
+            o=$(mktemp -t bi.XXXXXX)
+            outs="$outs $o"
+            "$PINGPONG" "$T" > "$o" 2>&1 &
+        done
+        wait
+        sum_rt=0; sum_n=0; any_stall=0
+        for o in $outs; do
+            rt=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^rt_mean_us=/) { sub("rt_mean_us=","",$i); print $i; exit } }' "$o")
+            n=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^round_trips=/) { sub("round_trips=","",$i); print $i; exit } }' "$o")
+            if [ "$rt" = "stalled" ]; then any_stall=1; else
+                sum_rt=$(echo "$sum_rt $rt" | awk '{ printf "%.2f", $1+$2 }')
+            fi
+            sum_n=$((sum_n + n))
+            rm -f "$o"
+        done
+        if [ "$any_stall" = "1" ]; then mean_rt="stalled";
+        else mean_rt=$(echo "$sum_rt" | awk '{ printf "%.2f", $1/4 }'); fi
+        printf "%-12s slack=%-2d pairs=4 bg=0 T=%ds round_trips=%-10s rt_mean_us=%s\n" \
+            "$SCHED" "$slack" "$T" "$sum_n" "$mean_rt"
+    done
+    sysctl kern.sched.ipc_slack=$orig_slack >/dev/null
+fi
 
 # 4 pairs + 4 background spinners -- contention.
 outs=""
@@ -60,10 +100,18 @@ sum_rt=0; sum_n=0
 for o in $outs; do
     rt=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^rt_mean_us=/) { sub("rt_mean_us=","",$i); print $i; exit } }' "$o")
     n=$(awk '{ for(i=1;i<=NF;i++) if($i ~ /^round_trips=/) { sub("round_trips=","",$i); print $i; exit } }' "$o")
-    sum_rt=$(echo "$sum_rt $rt" | awk '{ printf "%.2f", $1+$2 }')
+    if [ "$rt" = "stalled" ]; then
+        sum_rt="stalled"
+    elif [ "$sum_rt" != "stalled" ]; then
+        sum_rt=$(echo "$sum_rt $rt" | awk '{ printf "%.2f", $1+$2 }')
+    fi
     sum_n=$((sum_n + n))
     rm -f "$o"
 done
-mean_rt=$(echo "$sum_rt" | awk '{ printf "%.2f", $1/4 }')
+if [ "$sum_rt" = "stalled" ]; then
+    mean_rt="stalled (one or more pairs got <10 round-trips in T seconds)"
+else
+    mean_rt=$(echo "$sum_rt" | awk '{ printf "%.2f", $1/4 }')
+fi
 printf "%-12s pairs=4   bg_spinners=4 T=%ds round_trips=%-10s rt_mean_us=%s\n" \
     "$SCHED" "$T" "$sum_n" "$mean_rt"
