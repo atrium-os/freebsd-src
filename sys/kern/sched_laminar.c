@@ -1550,11 +1550,25 @@ laminar_balance_cb(void *arg __unused)
 		}
 		evac = atomic_load_int(&hi->ltdq_resistance) > 0 ||
 		    atomic_load_int(&hi->ltdq_resistance_power) > 0;
+		/*
+		 * Adaptive aggression: when gap is small (near threshold)
+		 * keep the original debounce + 1-per-cycle protection,
+		 * which guards against ping-pong on noisy edges.  When
+		 * gap >= 2 * threshold the signal is unambiguous, so:
+		 *   - skip the debounce streak
+		 *   - allow up to (gap / threshold) migrations this cycle
+		 * Cooldown is already gap-adaptive (cooldown_ticks).
+		 * Evac path is unchanged.
+		 */
+		int gap_mult = gap / imax(1, laminar_balance_threshold);
+		bool big_gap = gap_mult >= 2;
 		if (!evac) {
-			/* C2 debounce: imbalance must persist. */
-			hi->ltdq_streak++;
-			if (hi->ltdq_streak < laminar_debounce)
-				break;
+			if (!big_gap) {
+				/* C2 debounce: imbalance must persist. */
+				hi->ltdq_streak++;
+				if (hi->ltdq_streak < laminar_debounce)
+					break;
+			}
 			/* Adaptive-L cooldown: rate-limit per donor. */
 			if (now - hi->ltdq_last_xfer <
 			    laminar_cooldown_ticks(gap))
@@ -1566,8 +1580,11 @@ laminar_balance_cb(void *arg __unused)
 		hi->ltdq_last_xfer = now;
 		if (++migrations >= laminar_drain_max)
 			break;
-		/* If non-evac, single migration per cycle (per DESIGN.md). */
-		if (!evac)
+		/*
+		 * Non-evac: one migration per cycle by default; up to
+		 * gap_mult per cycle when the gap is unambiguous.
+		 */
+		if (!evac && migrations >= gap_mult)
 			break;
 	}
 
