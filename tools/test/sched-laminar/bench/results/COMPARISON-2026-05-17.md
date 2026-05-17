@@ -282,3 +282,32 @@ an open follow-up.
 
 R4 remains open with better diagnosis but no fix.
 ==================================================================
+
+==================================================================
+ Follow-up #4: R4 proper fix (6aa4223)
+==================================================================
+
+The rebase-against-destination-floor fix landed properly: moved
+into tdq_add_internal so it runs with the destination tdq lock
+held just before SoA insertion (no cache fix-up needed) and
+covers wakeup, fork, and balancer migration uniformly.
+
+bench (5 runs, spin=8 watch=4):
+  p99.9   pre-any-fix: ~100us
+          min-floor (rejected): 92ms in 2/5 runs (catastrophic)
+          this fix: 52-165us (matches/beats pre-fix)
+
+  max     pre-any-fix: 103ms-1.92s
+          this fix: 80ms-2.76s (bimodal; ~half runs fine,
+                                ~half hit a multi-second outlier)
+
+The max outliers are no longer caused by the rebase mis-placement
+-- p99.9 stayed competitive proves that.  The remaining seconds-
+scale max is likely callout/timer/IPI starvation under HVF at
+2x CPU oversubscription (8 spinners + 4 watchers on 4 vCPUs),
+not scheduler-side.  Deferred as an investigation outside the
+scheduler proper.
+
+R4 partial-fix-committed: scheduler-side root cause closed;
+non-scheduler max outliers remain.
+==================================================================
