@@ -356,3 +356,43 @@ DTrace or kernel tracing to identify the actual wait path
 (scheduler-side?  callout?  IPI?  HVF vCPU stall?) before
 committing to a fix shape.
 ==================================================================
+
+==================================================================
+ Follow-up #6: R4 is Laminar-specific (ULE comparison)
+==================================================================
+
+Pulled the ULE baseline from earlier in the session for the same
+spin=8 watch=4 bench:
+
+  ULE      p50=7.1us  p90=11us  p99=36us  p99.9=584us  max=45ms
+  Laminar  p50=7-8us  p90=10us  p99=20-40us  p99.9=50us-186ms
+                                              max=80ms-2.76s
+
+ULE has the same median/p99 (small wins both ways) but ULE's max
+is bounded at ~45ms; Laminar's varies 80ms-2.76s.  So R4 is NOT
+a workload/VM/HVF issue -- it's Laminar-specific.
+
+Root cause is algorithmic:
+
+  ULE uses interactivity heuristics: a sleeper that wakes gets
+  a priority boost.  In Laminar's bench scenario the watcher
+  would preempt a spinner via priority-driven dispatch.
+
+  Laminar uses vruntime fairness with the bounded-lag rebase as
+  the ONLY sleeper-favoring mechanism.  After the rebase, a
+  waker's vruntime is at floor-cap; if local incumbents are at
+  floor, the waker is favored.  But if the waker migrated to a
+  CPU with much-lower floor (because pickcpu found it lighter)
+  AND its vruntime arrives much higher than the local floor,
+  the picker prefers locals slice after slice.
+
+This is a class-design choice -- fair-share vs interactivity
+heuristic.  A proper fix would add an interactivity-priority
+signal (e.g., a transient "sleeper boost" priority overlay,
+ULE-style) -- a much larger change than tweaking the rebase.
+
+R4 stays open as a known algorithmic limitation of the fair-share
+class; the bounded-lag rebase moved to tdq_add_internal (commit
+6aa4223) is the right architectural change but cannot fully close
+the gap without explicit interactivity handling.
+==================================================================
