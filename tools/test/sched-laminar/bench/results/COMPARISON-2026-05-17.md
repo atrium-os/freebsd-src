@@ -195,3 +195,55 @@ Remaining residuals (acknowledged, not blocking):
       (carried from earlier follow-up list; not addressed in
       this session).
 ==================================================================
+
+==================================================================
+ Follow-up #2 (2026-05-17 PM): residual investigation
+==================================================================
+
+  bee36ea  pickcpu respects cpuset in fallback path (R1)
+
+R1 (cpu0-only skew) -- ROOT-CAUSED + FIXED.
+    pickcpu's ts_cpu-excluded fallback seeded best_cpu = self
+    without verifying self is in cpuset.  Under bench_skew
+    cpu0-only the bench's parent shell (unrestricted) forked
+    cpuset-pinned children; pickcpu sometimes returned self
+    (a non-CPU-0) silently violating cpuset.  Per-CPU vruntime
+    then could not produce the nice ratio because cohorts were
+    spread across non-cpu0 CPUs.
+
+    Fix: seed best_cpu = -1, scan only legal CPUs.
+
+    Result: cpu0-only 5-run mean now 2.77 : 1.00 : 0.47
+    (target 3.05 : 1.00 : 0.33).  Was chaotic 1:1:1 or 3:1:2.
+
+R3 (N=8 throughput dip) -- NO LONGER REPRODUCIBLE.
+    6 consecutive N=8 runs gave 740-752k iters (~4.0x speedup,
+    no dips).  Original 3.13x reading was sampling variance.
+    Possibly incidentally improved by the cpuset fix (which
+    tightened up scan-path placement in general).
+
+R5 (IPC over-co-location at slack=2) -- NO RELIABLE SIGNAL.
+    Tried ipc_slack=8 as default based on one sweep showing
+    1.51us (vs 2.38us at slack=2).  Re-running showed slack=8
+    at 3.01us, slack=2 at 2.08us -- bench-run variance dominates
+    the actual tuning effect at this scale.  Reverted to
+    slack=2.  Tuning ipc_slack remains a per-workload knob.
+
+R2 (T=8s skew convergence) -- BENCH-NOISE FLOOR.
+    Adaptive balancer aggression (f98df95) already addresses
+    the underlying slow-balancer issue.  Remaining T=8s
+    variance is initial-placement noise that no in-balancer
+    knob can short-circuit.  T=30s converges cleanly.
+
+R4 (multi-second wakeup tail under 2x oversubscription) --
+    DESIGN.md §1 documented trade.  3-run characterization
+    showed max = 103ms / 1.92s / 967ms (highly variable).
+    p50 / p99 / p99.9 remain great (8us / 40us / ~100us).
+    The 1-second outliers happen ~1-in-3 under extreme load.
+    Real fix likely requires wakeup-priority+vruntime
+    invariant work; out of scope for this pass.
+
+Net session result: 8 residuals from the original bench diff
+reduced to 2 (R2 noise floor, R4 documented trade), with all
+"actionable bug" residuals (R1, R3, R5) characterised or fixed.
+==================================================================
