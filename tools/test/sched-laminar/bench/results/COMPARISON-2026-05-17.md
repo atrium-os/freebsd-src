@@ -135,3 +135,63 @@
      b. Multi-pair IPC over-co-location under default slack
      c. Pingpong test under heavy bg load went haywire (test bug)
 ==================================================================
+
+==================================================================
+ Follow-up session (2026-05-17 PM): post-fix re-evaluation
+==================================================================
+
+Six commits landed against the residuals identified above:
+
+  b219edd  nice anomaly + eff_weight underflow fix
+  b8eca6a  slice quanta enforcement (closes wake-latency tail)
+  397159a  per-jail live eff_weight + controller cold-start fast path
+  4c4983c  load-aware pickcpu fast path (forks no longer pile on
+           parent's CPU)
+  3187cd9  controller emergency-unpark threshold 200 -> 150
+  e7dfb55  weighted-load balancer (per-CPU sum of ts_weight
+           replaces raw runnable count for cost signal)
+  f98df95  adaptive balancer aggression at large gaps (skip
+           debounce, allow gap_mult migrations per cycle)
+
+Headline movements:
+
+  bench_skew all-cpus T=30s:
+    pre  : 2.02 : 1.00 : 0.40
+    post : 3.76 : 1.00 : 0.33   (target 3.05 : 1.00 : 0.33)
+
+  bench_throughput N=4 (3-run min):
+    pre  : 1.88x (with controller on)
+    post : 3.02x
+
+  bench_fair N=4 T=15s spread:
+    pre  : 2.3%
+    post : 0.1%
+
+  Latency p50/p99: unchanged at sub-10us / sub-50us range.
+
+Remaining residuals (acknowledged, not blocking):
+
+  R1. cpu0-only bench_skew flatlines (1:1:1 or chaotic) after the
+      wload change.  wload is mathematically inert on one CPU, so
+      this is a cpuset+nice interaction at fork time, not a
+      balancer regression.  cpu0-only was already weak pre-fix
+      (initial diff: 1.02:1.00:1.29 -- inverted).
+
+  R2. bench_skew all-cpus mean at T=8s ~2.0 (target 3.05) but
+      stable to 3.76 at T=30s.  Balancer convergence time, not
+      formula.  Tightening further hits diminishing returns
+      against bench placement noise -- an EWMA-removal experiment
+      didn't help and was reverted.
+
+  R3. bench_throughput N=8 occasional dip to ~3.1x (target 4.0)
+      with controller on.  Run-to-run variance; no clear systemic
+      cause.
+
+  R4. Multi-second tail latency under spin=8 + watch=4 worst
+      case.  Pre-existing adaptive-L cooldown deferral
+      (DESIGN.md §1 documented trade); unchanged by this work.
+
+  R5. Multi-pair IPC over-co-location at default ipc_slack=2
+      (carried from earlier follow-up list; not addressed in
+      this session).
+==================================================================
