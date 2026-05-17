@@ -1138,8 +1138,14 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 		best_cpu = ts_cpu;
 		best_cost = laminar_thread_cost(td, ts_cpu);
 	} else {
-		best_cpu = self;
-		best_cost = laminar_thread_cost(td, self);
+		/*
+		 * ts_cpu is excluded by cpuset.  Don't seed with self --
+		 * self may also be excluded, and the strict-less-than
+		 * scan below would then keep self and violate cpuset.
+		 * Force the scan to choose only among legal CPUs.
+		 */
+		best_cpu = -1;
+		best_cost = INT_MAX;
 	}
 	/*
 	 * Strictly less-than means equal-cost CPUs lose to the seeded
@@ -1157,6 +1163,13 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 		}
 	}
 done_scan:
+	/*
+	 * Defensive: scan ran with best_cpu=-1 seed (ts_cpu excluded
+	 * by cpuset) and found nothing legal.  Shouldn't happen for a
+	 * runnable thread but fall back to self to avoid returning -1.
+	 */
+	if (best_cpu < 0)
+		best_cpu = self;
 	return (best_cpu);
 }
 
