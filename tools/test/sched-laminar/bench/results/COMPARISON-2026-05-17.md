@@ -247,3 +247,38 @@ Net session result: 8 residuals from the original bench diff
 reduced to 2 (R2 noise floor, R4 documented trade), with all
 "actionable bug" residuals (R1, R3, R5) characterised or fixed.
 ==================================================================
+
+==================================================================
+ Follow-up #3 (2026-05-17 PM): R4 root-cause and rejected fix
+==================================================================
+
+R4 dug into.  Hypothesis: the wakeup-time bounded-lag rebase
+(sched_laminar_wakeup) reads ts_cpu's vtime floor and clamps
+ts_vruntime to floor - lag_cap.  But sched_laminar_add's pickcpu
+may then migrate the waker to a DIFFERENT CPU.  On the chosen
+CPU the waker's vruntime can land far above the local floor,
+making the SoA picker prefer local spinners slice after slice.
+
+Experimental fix: rebase against MIN floor across all CPUs.
+Verdict: REJECTED.  Trade was not net positive:
+
+  Pre-fix (5 runs):  max  103ms / 1.92s / 967ms
+                     p99.9  102us / 552us / 102us
+  With fix (5 runs): max  184ms / 181ms / 870ms / 94ms / 85ms
+                     p99.9  92ms / 953us / 62us / 92ms / 109us
+
+The max did drop from ~1-2s typical to ~200ms typical -- the
+hypothesis was right -- but p99.9 regressed catastrophically
+(92ms in 2 of 5 runs vs ~100us pre-fix).  The min-floor rebase
+puts the waker so far below the destination floor that the
+waker monopolises that CPU until its vruntime catches up,
+starving other recently-woken threads on the same CPU.
+
+The proper fix would re-rebase against the chosen CPU's floor
+AFTER pickcpu + setcpu, which requires updating the SoA cache
+(the picker reads ltdq_vruntime[] slots, not ts->ts_vruntime
+directly).  Bigger change than this pass can absorb; left as
+an open follow-up.
+
+R4 remains open with better diagnosis but no fix.
+==================================================================
