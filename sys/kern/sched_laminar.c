@@ -499,6 +499,12 @@ struct laminar_tdq {
 
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
+	uint64_t	ltdq_wload;	/* (ts) Sum of ts_weight of runnable
+					 *      threads.  Replaces ltdq_load as
+					 *      the balancer's load signal so
+					 *      nice-weighted work spreads
+					 *      proportionally to weight, not
+					 *      thread count. */
 	int		ltdq_sysload;	/* (ts) Non-ITHD load. */
 	int		ltdq_transferable; /* (ts) Migration-eligible count. */
 	int		ltdq_id;	/* (c) CPU id. */
@@ -829,6 +835,10 @@ laminar_sysctl_register(void *arg __unused)
 		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
 		    "load", CTLFLAG_RD, &tdq->ltdq_load, 0,
 		    "Current runnable count on this CPU (RD; debug).");
+		SYSCTL_ADD_U64(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "wload", CTLFLAG_RD, &tdq->ltdq_wload, 0,
+		    "Sum of ts_weight of runnable threads (RD; debug).  "
+		    "Divide by 1024 for nice-0-equivalent load.");
 	}
 }
 SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
@@ -846,6 +856,7 @@ tdq_load_add(struct laminar_tdq *tdq, struct thread *td)
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	tdq->ltdq_load++;
+	tdq->ltdq_wload += td_get_sched(td)->ts_weight;
 	if ((td->td_flags & TDF_NOLOAD) == 0)
 		tdq->ltdq_sysload++;
 }
@@ -853,11 +864,17 @@ tdq_load_add(struct laminar_tdq *tdq, struct thread *td)
 static __inline void
 tdq_load_rem(struct laminar_tdq *tdq, struct thread *td)
 {
+	uint32_t w;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	KASSERT(tdq->ltdq_load > 0,
 	    ("tdq_load_rem: load underflow on cpu %d", tdq->ltdq_id));
 	tdq->ltdq_load--;
+	w = td_get_sched(td)->ts_weight;
+	if (tdq->ltdq_wload >= w)
+		tdq->ltdq_wload -= w;
+	else
+		tdq->ltdq_wload = 0;
 	if ((td->td_flags & TDF_NOLOAD) == 0)
 		tdq->ltdq_sysload--;
 }
@@ -964,8 +981,21 @@ laminar_numa_cost(struct thread *td, int cpu)
 static __inline int
 laminar_raw_cost(const struct laminar_tdq *tdq)
 {
+	uint64_t wload;
+	int weighted;
 
-	return (atomic_load_int(&tdq->ltdq_load) +
+	/*
+	 * Weighted cost: use the sum of ts_weight on this CPU (normalised
+	 * to nice-0 = 1 unit) instead of a raw runnable count.  Two
+	 * nice-0 threads on CPU A and one nice=-5 thread on CPU B are
+	 * comparably loaded (~2 units each); the count-based view treated
+	 * B as 50% lighter.  R and R_power stay in count units (caller
+	 * semantics: "R=1 = one nice-0 thread of resistance"), no scaling
+	 * needed.
+	 */
+	wload = atomic_load_64(__DECONST(uint64_t *, &tdq->ltdq_wload));
+	weighted = (int)(wload / LAMINAR_NICE_0_WEIGHT);
+	return (weighted +
 	    atomic_load_int(&tdq->ltdq_resistance) +
 	    atomic_load_int(&tdq->ltdq_resistance_power));
 }
@@ -1872,8 +1902,28 @@ sched_laminar_nice(struct proc *p, int nice)
 	 * store is published, the vruntime accumulator is untouched.
 	 */
 	FOREACH_THREAD_IN_PROC(p, td) {
+		uint32_t old;
+
 		thread_lock(td);
+		old = td_get_sched(td)->ts_weight;
 		laminar_set_weight_for_thread(td, w);
+		/*
+		 * If this thread is on a runqueue or running, fix the
+		 * owning tdq's weighted load by the delta.  thread_lock
+		 * is the tdq lock for runnable threads -- same critical
+		 * section as tdq_load_add/rem.
+		 */
+		if (old != w && (TD_ON_RUNQ(td) || TD_IS_RUNNING(td))) {
+			struct laminar_tdq *tdq =
+			    LAMINAR_TDQ_CPU(td_get_sched(td)->ts_cpu);
+
+			if (w > old)
+				tdq->ltdq_wload += (w - old);
+			else if (tdq->ltdq_wload >= (old - w))
+				tdq->ltdq_wload -= (old - w);
+			else
+				tdq->ltdq_wload = 0;
+		}
 		thread_unlock(td);
 	}
 }
