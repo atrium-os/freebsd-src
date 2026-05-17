@@ -1561,10 +1561,22 @@ laminar_balance_start(void)
  * cpu_group instead of "any CPU".
  */
 static struct callout laminar_ctrl_callout;
-static int laminar_ctrl_interval = 1000;	/* ms between samples */
+static int laminar_ctrl_interval = 100;	/* ms between samples */
+/*
+ * Emergency-unpark threshold: a load_pct sample above this
+ * unparks a CPU immediately, bypassing the EWMA + patience.
+ * Catches the cold-start case where the system was idle (most
+ * CPUs parked) and a burst arrives -- with the normal 1Hz
+ * sample + EWMA smoothing, parked-CPU unpark could lag the
+ * burst by seconds and starve interactive work (sshd banner
+ * timeouts during heavy bench were the symptom that surfaced
+ * this).  Default 200 = "average unparked CPU has 2+ runnable
+ * threads queued" -- that is overload by any measure.
+ */
+static int laminar_ctrl_emergency = 200;
 static int laminar_ctrl_headroom = 75;		/* % of capacity setpoint */
 static int laminar_ctrl_deadband = 15;		/* % Schmitt deadband */
-static int laminar_ctrl_park_pat = 6;		/* over-provisioned cycles */
+static int laminar_ctrl_park_pat = 30;		/* over-provisioned cycles (3s at 100ms interval) */
 static int laminar_ctrl_unpark_pat = 1;		/* under-provisioned cycles */
 static int laminar_ctrl_evac_r = 99;		/* R_power for parked CPUs */
 static int laminar_ctrl_enable = 1;		/* master switch */
@@ -1598,6 +1610,10 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_evac_r, CTLFLAG_RW,
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_ewma, CTLFLAG_RD,
     &laminar_ctrl_load_ewma, 0,
     "Laminar: smoothed system load as percent of total capacity");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_emergency, CTLFLAG_RW,
+    &laminar_ctrl_emergency, 0,
+    "Laminar: raw load_pct that triggers immediate unpark "
+    "(bypasses EWMA + patience for cold-start bursts)");
 
 static void
 laminar_ctrl_cb(void *arg __unused)
@@ -1640,6 +1656,28 @@ laminar_ctrl_cb(void *arg __unused)
 	load_pct = total_load * 100 / n_unparked;
 	/* EWMA smoothing (3:1 like the balancer's signal). */
 	laminar_ctrl_load_ewma = (3 * laminar_ctrl_load_ewma + load_pct) / 4;
+
+	/*
+	 * Emergency unpark: a raw load_pct way above setpoint means
+	 * a burst arrived against the parked set.  Unpark ALL parked
+	 * CPUs immediately, bypassing EWMA + patience.  Without this
+	 * a cold-start burst (system was idle, controller had parked
+	 * most CPUs, then a load arrives) starves interactive work
+	 * for whole multiples of ctrl_interval until the smoother
+	 * caught up -- sshd banner timeouts during heavy benchmarks
+	 * surfaced this.
+	 */
+	if (laminar_ctrl_emergency > 0 &&
+	    load_pct > laminar_ctrl_emergency && n_parked > 0) {
+		CPU_FOREACH(cpu) {
+			tdq = LAMINAR_TDQ_CPU(cpu);
+			if (atomic_load_int(&tdq->ltdq_resistance_power) > 0)
+				atomic_store_int(&tdq->ltdq_resistance_power, 0);
+		}
+		laminar_ctrl_unpark_streak = 0;
+		laminar_ctrl_park_streak = 0;
+		goto reschedule;
+	}
 
 	upper = laminar_ctrl_headroom + laminar_ctrl_deadband;
 	lower = laminar_ctrl_headroom - laminar_ctrl_deadband;
@@ -2314,7 +2352,21 @@ sched_laminar_clock(struct thread *td, int cnt)
 	 * rate.  Nice-derived re-weighting lands later, at which point
 	 * this expression keeps its shape (one multiply, no divide).
 	 */
-	ts->ts_vruntime += (uint64_t)cnt * ts->ts_eff_weight;
+	/*
+	 * Recompute eff_weight live rather than using the cached
+	 * ts->ts_eff_weight from fork/renice time.  The cache went
+	 * stale whenever jail_nthreads changed (other threads joined
+	 * or left the same prison), which broke phase E's per-jail
+	 * proportional share: nice -5 group that forked first got
+	 * weighted against an older jail_n than nice +5 group that
+	 * forked later, flattening the cross-group ratio in
+	 * bench_skew.  The live recomputation is one extra read +
+	 * multiply + divide per clock tick per running thread (~5ns),
+	 * negligible at stathz frequencies.  ts_eff_weight is kept
+	 * around as an observability hint, not load-bearing.
+	 */
+	ts->ts_vruntime += (uint64_t)cnt * laminar_compute_eff_weight(
+	    ts->ts_weight, laminar_prison_of(td));
 	tdq->ltdq_switchcnt = tdq->ltdq_switchcnt + 1;
 	/*
 	 * Phase F: refresh inferred NUMA home to the current CPU's
