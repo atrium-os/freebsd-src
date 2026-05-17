@@ -1,7 +1,16 @@
 /*
  * spin: fork N children, each spins for `duration' seconds (wall),
- * parent collects per-child user+system CPU via wait4()/rusage and
- * prints summary statistics.  Used by fair.sh / skew.sh / bursty.sh.
+ * each child reports its iteration count (work done) back via a
+ * dedicated pipe.  Parent collects them and prints summary stats.
+ *
+ * Iteration count is used instead of rusage CPU time because
+ * FreeBSD's tick-based CPU accounting over-attributes under
+ * scheduling contention (whichever process is running at the
+ * 10ms tick boundary gets the whole tick credited), which inflates
+ * "total CPU" beyond the physical core-seconds available.
+ * Iteration count is the actual work done -- ground-truth.
+ *
+ * For comparison, the rusage CPU time is still printed but marked.
  *
  * usage: spin <n_children> <duration_seconds> [nice]
  */
@@ -35,22 +44,20 @@ now_sec(void)
 	return ((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
 }
 
-static void
+static unsigned long long
 child_spin(double duration)
 {
 	double deadline;
 	volatile unsigned long acc = 0;
+	unsigned long long iters = 0;
 
 	deadline = now_sec() + duration;
 	while (now_sec() < deadline) {
-		/*
-		 * Tight loop with a small back-check; volatile prevents
-		 * the optimizer from collapsing.
-		 */
 		for (int i = 0; i < 100000; i++)
 			acc += i;
+		iters++;
 	}
-	_exit(0);
+	return (iters);
 }
 
 int
@@ -59,6 +66,8 @@ main(int argc, char **argv)
 	int n, i, nicev = 0;
 	double duration;
 	pid_t *kids;
+	int *fds;
+	unsigned long long *iters;
 	double *cpu;
 	int status;
 	struct rusage ru;
@@ -77,19 +86,27 @@ main(int argc, char **argv)
 		errx(1, "bad args");
 
 	kids = calloc(n, sizeof(*kids));
+	fds = calloc(n * 2, sizeof(*fds));
+	iters = calloc(n, sizeof(*iters));
 	cpu = calloc(n, sizeof(*cpu));
-	if (kids == NULL || cpu == NULL)
+	if (!kids || !fds || !iters || !cpu)
 		err(1, "calloc");
 
 	for (i = 0; i < n; i++) {
+		if (pipe(&fds[i * 2]) < 0)
+			err(1, "pipe");
 		pid_t p = fork();
 		if (p < 0)
 			err(1, "fork");
 		if (p == 0) {
+			close(fds[i * 2]);	/* read end */
 			if (nicev != 0)
 				(void)nice(nicev);
-			child_spin(duration);
+			unsigned long long it = child_spin(duration);
+			(void)write(fds[i * 2 + 1], &it, sizeof(it));
+			_exit(0);
 		}
+		close(fds[i * 2 + 1]);		/* parent doesn't write */
 		kids[i] = p;
 	}
 
@@ -97,34 +114,41 @@ main(int argc, char **argv)
 		pid_t p = wait4(-1, &status, 0, &ru);
 		if (p < 0)
 			err(1, "wait4");
-		/* Find which slot. */
+		int slot = -1;
 		for (int j = 0; j < n; j++) {
-			if (kids[j] == p) {
-				cpu[j] = tv_to_sec(&ru.ru_utime) +
-				    tv_to_sec(&ru.ru_stime);
-				break;
-			}
+			if (kids[j] == p) { slot = j; break; }
 		}
+		if (slot < 0)
+			continue;
+		cpu[slot] = tv_to_sec(&ru.ru_utime) + tv_to_sec(&ru.ru_stime);
+		(void)read(fds[slot * 2], &iters[slot], sizeof(iters[slot]));
+		close(fds[slot * 2]);
 	}
 
-	/* Stats. */
-	double sum = 0, sq = 0, mn = cpu[0], mx = cpu[0];
+	/* Stats on iterations (the true work metric). */
+	double sum_it = 0, sq_it = 0;
+	unsigned long long mn = iters[0], mx = iters[0];
+	double sum_cpu = 0;
 	for (i = 0; i < n; i++) {
-		sum += cpu[i];
-		sq += cpu[i] * cpu[i];
-		if (cpu[i] < mn) mn = cpu[i];
-		if (cpu[i] > mx) mx = cpu[i];
+		sum_it += iters[i];
+		sq_it += (double)iters[i] * iters[i];
+		if (iters[i] < mn) mn = iters[i];
+		if (iters[i] > mx) mx = iters[i];
+		sum_cpu += cpu[i];
 	}
-	double mean = sum / n;
-	double var = sq / n - mean * mean;
-	double sd = var > 0 ? sqrt(var) : 0;
+	double mean_it = sum_it / n;
+	double var_it = sq_it / n - mean_it * mean_it;
+	double sd_it = var_it > 0 ? sqrt(var_it) : 0;
 
 	printf("n=%d duration=%.2fs nice=%d\n", n, duration, nicev);
-	printf("per-child cpu:\n");
+	printf("per-child iters:\n");
 	for (i = 0; i < n; i++)
-		printf("  child %d: %.3fs\n", i, cpu[i]);
-	printf("summary: min=%.3f max=%.3f mean=%.3f sd=%.3f spread=%.3f (%.1f%%)\n",
-	    mn, mx, mean, sd, mx - mn,
-	    mean > 0 ? 100.0 * (mx - mn) / mean : 0.0);
+		printf("  child %d: iters=%llu  cpu=%.3fs (tick-biased)\n",
+		    i, iters[i], cpu[i]);
+	printf("summary: min=%llu max=%llu mean=%.0f sd=%.0f spread=%llu (%.1f%% of mean)\n",
+	    mn, mx, mean_it, sd_it, mx - mn,
+	    mean_it > 0 ? 100.0 * (double)(mx - mn) / mean_it : 0.0);
+	printf("aggregate: total_iters=%.0f total_cpu_s=%.2f (tick-biased; use iters)\n",
+	    sum_it, sum_cpu);
 	return (0);
 }
