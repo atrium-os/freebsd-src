@@ -571,6 +571,7 @@ sched_laminar_unimpl(const char *fn)
 
 /* Forward declarations for the periodic balancer (defined below). */
 static int tdq_add_internal(struct laminar_tdq *, struct thread *, int);
+extern u_long laminar_lag_cap;
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
 
@@ -1817,6 +1818,35 @@ tdq_add_internal(struct laminar_tdq *tdq, struct thread *td, int flags)
 	KASSERT((td->td_flags & TDF_INMEM) != 0,
 	    ("tdq_add_internal: thread swapped out"));
 
+	/*
+	 * Bounded-lag rebase relative to THIS tdq's vruntime floor
+	 * (whitepaper §7).  We are about to insert td into this CPU's
+	 * SoA picker, so its vruntime must be competitive locally.
+	 *
+	 * Previously rebase lived in sched_laminar_wakeup using the
+	 * waker's ts_cpu floor, but sched_laminar_add's pickcpu can
+	 * migrate the waker to a different CPU with a much higher
+	 * floor -- leaving the waker stranded above the new floor and
+	 * starved slice after slice (multi-second wake-latency tails
+	 * under 2x oversubscription, R4).
+	 *
+	 * Running here covers fork, wakeup, and balancer migration
+	 * uniformly: every cross-CPU enqueue lands with vruntime
+	 * within lag_cap of the destination floor, so the SoA picker
+	 * treats the arriver fairly against local incumbents.
+	 *
+	 * Only applies to timeshare threads -- realtime/idle classes
+	 * don't use vruntime.
+	 */
+	if (laminar_is_timeshare(td)) {
+		struct td_sched *ts = td_get_sched(td);
+		uint64_t floor = atomic_load_64(&tdq->ltdq_vtime);
+		uint64_t cap = laminar_lag_cap;
+
+		if (floor > cap && ts->ts_vruntime < floor - cap)
+			ts->ts_vruntime = floor - cap;
+	}
+
 	lowpri = tdq->ltdq_lowpri;
 	if (td->td_priority < lowpri)
 		tdq->ltdq_lowpri = td->td_priority;
@@ -2537,7 +2567,7 @@ sched_laminar_relinquish(struct thread *td)
  * and starve every other timeshare thread on the CPU until its
  * accumulator caught up.  Tunable for measurement.
  */
-static u_long laminar_lag_cap = 1000000;
+u_long laminar_lag_cap = 1000000;
 SYSCTL_DECL(_kern_sched);
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lag_cap, CTLFLAG_RW,
     &laminar_lag_cap, 0,
@@ -2578,32 +2608,18 @@ laminar_ipc_record_edge(struct thread *td)
 static void
 sched_laminar_wakeup(struct thread *td, int srqflags)
 {
-	struct td_sched *ts;
-	struct laminar_tdq *tdq;
-	uint64_t floor, cap;
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	laminar_ipc_record_edge(td);
 	/*
-	 * Bounded-lag rebase (whitepaper §7).  Pull the waker's
-	 * vruntime up to within laminar_lag_cap of the target CPU's
-	 * current vruntime floor.  The read of ltdq_vtime is
-	 * intentionally lockless -- it is a (ts) field, updated under
-	 * the tdq lock and stored as a single 64-bit atomic, and the
-	 * cap absorbs any staleness.
-	 */
-	ts = td_get_sched(td);
-	if (laminar_is_timeshare(td)) {
-		tdq = LAMINAR_TDQ_CPU(ts->ts_cpu);
-		floor = atomic_load_64(&tdq->ltdq_vtime);
-		cap = laminar_lag_cap;
-		if (floor > cap && ts->ts_vruntime < floor - cap)
-			ts->ts_vruntime = floor - cap;
-	}
-	/*
 	 * Let sched_laminar_add's pickcpu pick the target CPU.  ts_cpu is
 	 * preserved from the thread's last run, which gives natural soft
-	 * affinity until a real cost-minimizing pickcpu lands.
+	 * affinity until a real cost-minimizing pickcpu lands.  The
+	 * bounded-lag vruntime rebase (whitepaper §7) happens inside
+	 * tdq_add_internal against the chosen destination CPU's floor --
+	 * doing it here against ts_cpu's floor would leave the waker
+	 * stranded above the destination floor if pickcpu migrated it
+	 * (cause of R4 multi-second wake-latency tails).
 	 */
 	sched_laminar_add(td, srqflags);
 }
