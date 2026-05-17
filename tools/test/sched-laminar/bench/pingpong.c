@@ -82,6 +82,12 @@ main(int argc, char **argv)
 	close(c2p[0]);
 	(void)waitpid(child, NULL, 0);
 
+	if (n_round_trips < 10) {
+		/* Pair was starved; rt_us would be misleading. */
+		printf("round_trips=%llu elapsed=%.3fs rt_mean_us=stalled\n",
+		    (unsigned long long)n_round_trips, elapsed);
+		return (0);
+	}
 	double rt_us = elapsed * 1e6 / (double)n_round_trips;
 	printf("round_trips=%llu elapsed=%.3fs rt_mean_us=%.2f\n",
 	    (unsigned long long)n_round_trips, elapsed, rt_us);

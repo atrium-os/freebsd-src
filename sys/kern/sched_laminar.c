@@ -351,13 +351,28 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
  * Compute eff_weight including the optional jail term (phase E).
  * Centralised so the formula has exactly one definition.
  *
- *   eff_weight = NICE_0_WEIGHT^2 * jail_nthreads
+ *   eff_weight = NICE_0_WEIGHT^3 * jail_nthreads
  *              / (ts_weight       * jail_weight)
  *
- * When the thread's prison has no laminar slot (or the slot is
- * the defaults), jail_weight = NICE_0_WEIGHT and jail_nthreads
- * is treated as 1 -- both cancel and we recover the nice-only
- * formula from phase A/D.
+ * The K = NICE_0_WEIGHT^3 numerator was chosen so that:
+ *
+ *   (a) nice 0 thread + default jail (jail_w = NICE_0_WEIGHT,
+ *       jail_n = 1) -> eff_weight = NICE_0_WEIGHT (= 1024),
+ *       recovering the phase A/D nice-only formula.
+ *
+ *   (b) nice -5 thread (ts_weight = 3121) + default jail ->
+ *       eff_weight = 1024^3 / (3121 * 1024) = 1024^2 / 3121 = 335,
+ *       NOT zero.  The earlier K = NICE_0_WEIGHT^2 caused the
+ *       jail_weight default of 1024 to cancel one factor of 1024
+ *       in the numerator, leaving 1024 / 3121 = 0 in integer
+ *       division.  That made nice -5 threads' vruntime stop
+ *       accumulating, so they monopolised the picker (lowest
+ *       vruntime wins, and theirs never grew) -- bench_skew
+ *       caught the resulting CPU-share inversion.
+ *
+ *   (c) overflow-safe: numerator <= 2^30 * 2^14 (jail_n max ~10k)
+ *       = 2^44, fits in u64.  result <= 2^27, vruntime over years
+ *       of running fits.
  */
 static __inline uint64_t
 laminar_compute_eff_weight(uint32_t ts_weight, struct prison *pr)
@@ -375,7 +390,7 @@ laminar_compute_eff_weight(uint32_t ts_weight, struct prison *pr)
 			jail_n = 1;
 	}
 	return (((uint64_t)LAMINAR_NICE_0_WEIGHT *
-	    LAMINAR_NICE_0_WEIGHT * jail_n) /
+	    LAMINAR_NICE_0_WEIGHT * LAMINAR_NICE_0_WEIGHT * jail_n) /
 	    ((uint64_t)ts_weight * jail_w));
 }
 
@@ -1797,7 +1812,7 @@ sched_laminar_nice(struct proc *p, int nice)
 	 */
 	FOREACH_THREAD_IN_PROC(p, td) {
 		thread_lock(td);
-		laminar_set_weight(td_get_sched(td), w);
+		laminar_set_weight_for_thread(td, w);
 		thread_unlock(td);
 	}
 }
