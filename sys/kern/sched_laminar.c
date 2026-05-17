@@ -826,6 +826,9 @@ laminar_sysctl_register(void *arg __unused)
 		    &tdq->ltdq_resistance_power, 0,
 		    "Closed-loop controller's R_power for this CPU (RD; "
 		    "nonzero = parked by controller).");
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "load", CTLFLAG_RD, &tdq->ltdq_load, 0,
+		    "Current runnable count on this CPU (RD; debug).");
 	}
 }
 SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
@@ -1089,10 +1092,19 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 
 	if (THREAD_CAN_SCHED(td, ts_cpu)) {
 		struct laminar_tdq *_ts_tdq = LAMINAR_TDQ_CPU(ts_cpu);
-		if (atomic_load_int(&_ts_tdq->ltdq_resistance) == 0 &&
+		/*
+		 * Fast path: ts_cpu is idle (load == 0), unparked, and
+		 * NUMA-local.  Skipping the global scan here matters most
+		 * for forks/wakeups onto an idle parent; with load > 0
+		 * we must scan, otherwise N children of one parent pile
+		 * onto a single CPU and the balancer takes seconds to
+		 * spread them (DESIGN.md §1 trade).
+		 */
+		if (atomic_load_int(&_ts_tdq->ltdq_load) == 0 &&
+		    atomic_load_int(&_ts_tdq->ltdq_resistance) == 0 &&
 		    atomic_load_int(&_ts_tdq->ltdq_resistance_power) == 0 &&
 		    laminar_numa_cost(td, ts_cpu) == 0)
-			return (ts_cpu);	/* fast path: no R, no NUMA */
+			return (ts_cpu);	/* fast path: idle, no R, no NUMA */
 		best_cpu = ts_cpu;
 		best_cost = laminar_thread_cost(td, ts_cpu);
 	} else {
