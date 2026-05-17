@@ -1585,7 +1585,7 @@ static int laminar_ctrl_interval = 100;	/* ms between samples */
  * this).  Default 200 = "average unparked CPU has 2+ runnable
  * threads queued" -- that is overload by any measure.
  */
-static int laminar_ctrl_emergency = 200;
+static int laminar_ctrl_emergency = 150;
 static int laminar_ctrl_headroom = 75;		/* % of capacity setpoint */
 static int laminar_ctrl_deadband = 15;		/* % Schmitt deadband */
 static int laminar_ctrl_park_pat = 30;		/* over-provisioned cycles (3s at 100ms interval) */
