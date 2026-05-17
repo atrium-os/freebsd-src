@@ -311,3 +311,48 @@ scheduler proper.
 R4 partial-fix-committed: scheduler-side root cause closed;
 non-scheduler max outliers remain.
 ==================================================================
+
+==================================================================
+ Follow-up #5: bimodal max investigation
+==================================================================
+
+Tried to root-cause the bimodal max latency (some runs ~100ms,
+others 1-2s) seen with the asymmetric clamp (commit 6aa4223).
+
+Hypothesis: with asymmetric (UP-only) rebase, a waker whose
+vruntime was high (had been running on a heavier CPU) would land
+on a lighter CPU and sit far above the local floor.  Without a
+DOWN clamp it could wait many slices for its vruntime to catch
+down.
+
+Experiment: add symmetric DOWN clamp (vruntime > floor + cap *
+mult pulled to floor + cap * mult).  Knob lag_cap_down_mult to
+tune trade.
+
+Results (5 latency + 3 throughput runs at mult=1, with the
+DOWN clamp skipped on SRQ_YIELDING to avoid balancer ping-pong):
+
+  Asymmetric (6aa4223):
+    max: 80ms / 2.7s / 2.0s / 2.8s / 184ms  -- 3/5 hit 2s
+    p99.9: 165us / 65us / 120us / 77us / 52us
+    N=4 throughput: ~3.0x (high variance)
+
+  Symmetric DOWN (mult=1, skip on yielding):
+    max: 182ms / 790ms / 968ms / 209ms / 1278ms -- 1/5 hits 1s+
+    p99.9: 62us / 70us / 489us / 1117us / 186544us
+    N=4 throughput: ~3.0x (same variance)
+
+Verdict: marginally better max worst-case (no 2.7s outlier; worst
+1.28s instead) but new p99.9 spikes (186ms in one run vs ~165us
+ceiling pre).  Bench variance is too large to call this decisive,
+and the trade isn't strictly positive.
+
+REVERTED.  The bimodal max remains an open issue; the symmetric
+clamp idea is correct in principle but the magnitude of benefit
+on this 4-CPU box is within bench noise.
+
+Future investigation: characterise the multi-second tail with
+DTrace or kernel tracing to identify the actual wait path
+(scheduler-side?  callout?  IPI?  HVF vCPU stall?) before
+committing to a fix shape.
+==================================================================
