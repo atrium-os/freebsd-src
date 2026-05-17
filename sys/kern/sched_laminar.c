@@ -337,6 +337,17 @@ struct td_sched {
 	 */
 	int16_t		ts_dom_waker_cpu;
 	uint16_t	ts_dom_waker_conf;
+	/*
+	 * Slice quantum (sched_clock follow-up).  Ticks accumulated
+	 * since this thread was last switched in.  When it hits
+	 * sched_slice (in stathz ticks), sched_laminar_clock sets
+	 * TDF_SLICEEND so the thread voluntarily yields at the next
+	 * AST -- without this, two CPU-bound threads at the same
+	 * priority share-class never preempt each other (no priority
+	 * IPI fires for same-class), and a freshly-woken thread can
+	 * be enqueued behind a long-running spinner indefinitely.
+	 */
+	uint32_t	ts_slice_used;
 	/* NUMA (whitepaper §8). */
 	uint16_t	ts_home_node_conf;
 	int16_t		ts_home_node;	/* -1 = unset. */
@@ -2313,6 +2324,23 @@ sched_laminar_clock(struct thread *td, int cnt)
 	 * captures common case (long-running threads stay home).
 	 */
 	ts->ts_home_node = (int16_t)laminar_cpu_domain(PCPU_GET(cpuid));
+	/*
+	 * Slice quantum: if curthread has used its slice, set
+	 * TDF_SLICEEND so it voluntarily yields at the next AST.
+	 * Without this two same-class CPU-bound threads never
+	 * preempt each other (no priority-IPI fires for same class)
+	 * and a freshly-woken thread enqueued on this CPU starves
+	 * until the running thread blocks or exits.  Idle threads
+	 * are exempt -- they yield naturally.
+	 */
+	if (!TD_IS_IDLETHREAD(td)) {
+		ts->ts_slice_used += cnt;
+		if (ts->ts_slice_used >= (uint32_t)sched_slice) {
+			ts->ts_slice_used = 0;
+			td->td_flags |= TDF_SLICEEND;
+			ast_sched_locked(td, TDA_SCHED);
+		}
+	}
 }
 
 static void
