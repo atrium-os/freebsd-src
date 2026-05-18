@@ -396,3 +396,44 @@ class; the bounded-lag rebase moved to tdq_add_internal (commit
 6aa4223) is the right architectural change but cannot fully close
 the gap without explicit interactivity handling.
 ==================================================================
+
+==================================================================
+ Follow-up #7: interactivity priority-boost attempt (rejected)
+==================================================================
+
+Tried a minimal ULE-style interactivity boost: in
+sched_laminar_wakeup, drop td_priority by 1 before sched_laminar_add
+so tdq_notify fires the preempt IPI on cross-CPU enqueue.  Idea:
+waker preempts incumbent, sched_choose picks min-vruntime (the
+just-rebased waker), waker runs immediately.
+
+Bench results were inverted:
+   max  pre  : 80ms-2.76s
+        post : 1504ms / 2411ms / 375ms / 2970ms / 2404ms
+              -- 4/5 hit 1.5-3s
+   p99.9 post: 99us / 75us / 63us / 99us / 439us  (no change)
+   N=4 throughput post: 4.38x (vs ~3.0x pre) -- big improvement!
+
+The boost successfully causes wakers to preempt -> faster CPU
+fill, better throughput.  But the resulting IPI + context-switch
+storm (4 watchers each waking every 10us and preempting whatever
+is running) creates a churn pattern where some watcher
+occasionally gets badly stuck for ~2 seconds.
+
+Two takeaways:
+  1. The basic mechanism (boost-based preempt) does help
+     scheduling locality -- throughput jumped 30%+.
+  2. Unconditional boost on every wake creates pathological
+     churn under heavy wake rates.
+
+A proper interactivity heuristic needs: rate-limited boost
+(e.g., only boost wakers that slept > N usec), boost decay,
+and possibly a separate priority track that doesn't pollute
+ltdq_lowpri across calls.  That is substantially larger than
+this session can absorb cleanly.
+
+REVERTED.  R4 remains a documented algorithmic-class gap.
+
+Session total: 16 commits, R1-R3 + R5 fully closed, R2 + R4
+characterised with concrete future-fix shapes documented.
+==================================================================
