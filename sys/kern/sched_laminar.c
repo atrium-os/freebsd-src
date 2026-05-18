@@ -365,6 +365,11 @@ struct td_sched {
 	 * be enqueued behind a long-running spinner indefinitely.
 	 */
 	uint32_t	ts_slice_used;
+	sbintime_t	ts_wake_ts;	/* timestamp (sbintime) at last
+					 * enqueue via the wakeup/add path;
+					 * 0 if not pending pick.  Used to
+					 * measure wake-to-on-cpu delay for
+					 * R4 instrumentation. */
 	/* NUMA (whitepaper §8). */
 	uint16_t	ts_home_node_conf;
 	int16_t		ts_home_node;	/* -1 = unset. */
@@ -593,6 +598,9 @@ sched_laminar_unimpl(const char *fn)
 static int tdq_add_internal(struct laminar_tdq *, struct thread *, int);
 extern u_long laminar_lag_cap;
 extern u_long laminar_preempt_cooldown;
+extern u_long laminar_wake_pick_max_us;
+extern u_long laminar_wake_pick_long_count;
+#define	LAMINAR_WAKE_LONG_US	100000ULL
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
 
@@ -1891,9 +1899,45 @@ tdq_add_internal(struct laminar_tdq *tdq, struct thread *td, int flags)
 		struct td_sched *ts = td_get_sched(td);
 		uint64_t floor = atomic_load_64(&tdq->ltdq_vtime);
 		uint64_t cap = laminar_lag_cap;
+		uint64_t lo = (floor > cap) ? (floor - cap) : 0;
 
-		if (floor > cap && ts->ts_vruntime < floor - cap)
-			ts->ts_vruntime = floor - cap;
+		/*
+		 * Symmetric bounded-lag clamp.  The original was UP-only
+		 * gated on (floor > cap), which never fired in benches
+		 * shorter than ~10s @ hz=100 (floor < cap = 1M).  That
+		 * left wakers with inherited-from-parent vruntime FAR
+		 * above the local floor; the SoA picker then preferred
+		 * incumbents at floor for seconds, observed as R4
+		 * multi-second wake-pick max (1.3-3s).
+		 *
+		 * For balancer migrations (SRQ_YIELDING) we keep the
+		 * old UP-only behaviour -- the migrant's vruntime
+		 * represents accumulated work on the source CPU and
+		 * should be preserved, not clamped down to local floor.
+		 * Otherwise balancer ping-pong: migrate, clamp down,
+		 * earn "credit" locally, balancer migrates again on
+		 * next cycle, clamp again, etc.
+		 *
+		 * For wakeups / forks (non-YIELDING) clamp DOWN as well:
+		 * the arriver is fresh and should be competitive locally.
+		 */
+		if (ts->ts_vruntime < lo) {
+			ts->ts_vruntime = lo;
+		} else if ((flags & SRQ_YIELDING) == 0 &&
+		    ts->ts_vruntime > floor) {
+			/*
+			 * Clamp DOWN to floor (not floor+cap).  Waker
+			 * is competitive locally and the picker (pure
+			 * min-vruntime) will pick it on the next
+			 * sched_choose.  floor+cap = floor+1M was way
+			 * too lenient -- waker stayed above local floor
+			 * by up to cap/eff_weight = 10s of incumbent
+			 * vruntime advancement before picker switched.
+			 * SRQ_YIELDING (balancer migration) skipped to
+			 * preserve cross-CPU fairness accounting.
+			 */
+			ts->ts_vruntime = floor;
+		}
 	}
 
 	lowpri = tdq->ltdq_lowpri;
@@ -2558,6 +2602,22 @@ sched_laminar_choose(void)
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	td = tdq_choose(tdq);
 	if (td != NULL) {
+		struct td_sched *ts = td_get_sched(td);
+
+		/* R4 instrumentation: wake_ts -> on_cpu delay. */
+		if (ts->ts_wake_ts != 0) {
+			sbintime_t now = sbinuptime();
+			sbintime_t delta = now - ts->ts_wake_ts;
+			/* sbintime: seconds<<32 | fraction.  *1e6>>32 = us. */
+			uint64_t delay_us = (uint64_t)
+			    (((uint64_t)delta * 1000000ULL) >> 32);
+
+			if (delay_us > laminar_wake_pick_max_us)
+				laminar_wake_pick_max_us = delay_us;
+			if (delay_us > LAMINAR_WAKE_LONG_US)
+				laminar_wake_pick_long_count++;
+			ts->ts_wake_ts = 0;
+		}
 		/*
 		 * Pull off the runq; do NOT decrement load.  Load tracks
 		 * threads associated with this CPU (running + on runq).
@@ -2685,6 +2745,15 @@ sched_laminar_relinquish(struct thread *td)
  */
 u_long laminar_lag_cap = 1000000;
 /*
+ * R4 instrumentation: max observed wake-to-on-cpu delay (us) and a
+ * counter of "long wake" events (delay > 100ms).  Reset via the
+ * sysctl with a write of 0.  Lets us tell "scheduler-side wait" from
+ * "wake path / HVF stall" -- if scheduler max stays small but
+ * userspace wakelat reports seconds, the wait is outside the picker.
+ */
+u_long laminar_wake_pick_max_us = 0;
+u_long laminar_wake_pick_long_count = 0;
+/*
  * Per-CPU cooldown (in ticks) between cost-based preempt IPIs.
  * Caps the IPI rate so wakers don't storm a busy CPU.  The trade
  * is wake-tail-latency vs preempt-IPI churn -- lower = tighter
@@ -2696,6 +2765,12 @@ SYSCTL_DECL(_kern_sched);
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lag_cap, CTLFLAG_RW,
     &laminar_lag_cap, 0,
     "Laminar: max vruntime units a waker may sit below the per-CPU floor");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_max_us, CTLFLAG_RW,
+    &laminar_wake_pick_max_us, 0,
+    "Laminar: max wake-to-on-cpu delay (us) since reset.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
+    &laminar_wake_pick_long_count, 0,
+    "Laminar: count of wake-to-on-cpu delays exceeding 100ms.  Write 0 to reset.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
     &laminar_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
@@ -2739,6 +2814,8 @@ sched_laminar_wakeup(struct thread *td, int srqflags)
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	laminar_ipc_record_edge(td);
+	/* R4 instrumentation: stamp the wake moment. */
+	td_get_sched(td)->ts_wake_ts = sbinuptime();
 	/*
 	 * Let sched_laminar_add's pickcpu pick the target CPU.  ts_cpu is
 	 * preserved from the thread's last run, which gives natural soft
