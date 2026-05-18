@@ -476,3 +476,39 @@ Concrete RLC-shaped directions for R4:
 Pick by which mechanism best preserves "one cost function, RLC
 closed loop" as the elevator pitch.
 ==================================================================
+
+==================================================================
+ Follow-up #8: cost-based wake preempt (4cb40ed) -- RLC-shaped
+==================================================================
+
+Implemented R4 mechanism within the RLC theme:
+  - Decision: vruntime comparison (waker.v <= dst floor).
+    Pure cost-function, no priority overlay.
+  - Rate-limit: per-CPU cooldown (default 2 ticks = 20ms),
+    same shape as the balancer's per-donor cooldown.
+  - Guard: skip when dst is idle (avoids fork-time IPI storm
+    that the unguarded version produced -- N=4 throughput
+    dropped 3.0 -> 2.1 without the guard).
+  - Knob: kern.sched.preempt_cooldown sysctl.  Available for
+    the controller to tune dynamically based on wake latency
+    in a future pass.
+
+Bench at spin=8 watch=4 (8 runs):
+  N=4 throughput: 3.97x (restored vs unguarded 2.1x)
+  Latency max: 16ms - 2.99s (bimodal, similar to pre)
+  p99.9: mostly 49-100us, occasional ~1ms
+
+The mechanism fires correctly but doesn't move the multi-
+second max -- which means the worst-case root cause is
+outside the scheduler-side wakeup-wait path I thought.
+Likely candidates: callout/timer dispatch delay, IPI
+delivery delay under HVF vCPU contention, or wakelat tool
+measurement artefact.  Investigation of those is outside
+this pass's scope.
+
+Architectural contribution: Laminar now has an RLC-native
+preempt hook (cost-decided, cooldown-rate-limited) that the
+controller can later tune.  Avoids ULE-style interactivity
+priority overlay -- preempt emerges from the cost function
+itself.
+==================================================================
