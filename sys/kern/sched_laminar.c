@@ -600,6 +600,14 @@ extern u_long laminar_lag_cap;
 extern u_long laminar_preempt_cooldown;
 extern u_long laminar_wake_pick_max_us;
 extern u_long laminar_wake_pick_long_count;
+extern u_long laminar_choose_calls;
+extern u_long laminar_slice_ends;
+extern u_long laminar_wake_picks;
+extern u_long laminar_cp_ipi;
+extern u_long laminar_cp_skip_v;
+extern u_long laminar_cp_skip_cool;
+extern u_long laminar_cp_skip_idle;
+extern u_long laminar_cp_skip_owe;
 #define	LAMINAR_WAKE_LONG_US	100000ULL
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
@@ -1277,14 +1285,31 @@ sched_laminar_setcpu(struct thread *td, int cpu, int flags)
  * from ULE's tdq_notify (without the idle-aware optimization).
  */
 static void
-tdq_notify(struct laminar_tdq *tdq, int lowpri)
+tdq_notify(struct laminar_tdq *tdq, int oldpri)
 {
-	int cpu;
+	int cpu, newpri;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	if (tdq->ltdq_owepreempt)
 		return;
-	if (tdq->ltdq_lowpri >= lowpri)	/* new one not higher priority */
+	/*
+	 * Mirror ULE's sched_shouldpreempt: oldpri is the pre-add
+	 * lowest priority on tdq (i.e., the running thread's pri);
+	 * newpri is the post-add lowest (typically the newly-added
+	 * thread's, if it lowered the bar).  Preempt when newpri is
+	 * strictly more important than oldpri, or when oldpri is
+	 * idle.
+	 *
+	 * Previously this used td->td_priority for `oldpri` (passed
+	 * by sched_laminar_add), which always equalled newpri after
+	 * the add and so returned early in every timeshare-vs-
+	 * timeshare case AND in the idle-CPU case (oldpri=224,
+	 * newpri=76, 76 >= 76 -> no IPI).  That blocked wakers from
+	 * preempting incumbents or even waking idle CPUs, observed
+	 * as R4 multi-second wake-tail with cp_skip_idle=5523 hits.
+	 */
+	newpri = tdq->ltdq_lowpri;
+	if (newpri >= oldpri && oldpri < PRI_MIN_IDLE)
 		return;
 	atomic_thread_fence_seq_cst();
 	cpu = LAMINAR_TDQ_ID(tdq);
@@ -1491,9 +1516,12 @@ laminar_balance_pair(struct laminar_tdq *high, struct laminar_tdq *low)
 	sched_laminar_rem(td);
 	td->td_lock = LAMINAR_TDQ_LOCKPTR(low);
 	td_get_sched(td)->ts_cpu = dst_cpu;
-	(void)tdq_add_internal(low, td, SRQ_YIELDING);
-	if (dst_cpu != PCPU_GET(cpuid))
-		tdq_notify(low, td->td_priority);
+	{
+		int old_lowpri = tdq_add_internal(low, td, SRQ_YIELDING);
+
+		if (dst_cpu != PCPU_GET(cpuid))
+			tdq_notify(low, old_lowpri);
+	}
 	moved = true;
 out:
 	LAMINAR_TDQ_UNLOCK(high);
@@ -2370,8 +2398,12 @@ sched_laminar_sswitch(struct thread *td, int flags)
 			tdq_load_rem(tdq, td);
 			LAMINAR_TDQ_UNLOCK(tdq);
 			LAMINAR_TDQ_LOCK(tdn);
-			(void)tdq_add_internal(tdn, td, srqflag);
-			tdq_notify(tdn, td->td_priority);
+			{
+				int old_lowpri = tdq_add_internal(tdn,
+				    td, srqflag);
+
+				tdq_notify(tdn, old_lowpri);
+			}
 			LAMINAR_TDQ_UNLOCK(tdn);
 			LAMINAR_TDQ_LOCK(tdq);
 			mtx = LAMINAR_TDQ_LOCKPTR(tdn);
@@ -2525,36 +2557,35 @@ sched_laminar_add(struct thread *td, int flags)
 		 */
 		bool sent_cost_ipi = false;
 		if (laminar_is_timeshare(td) &&
-		    (flags & SRQ_YIELDING) == 0 &&
-		    tdq->ltdq_curthread != NULL &&
-		    !TD_IS_IDLETHREAD(tdq->ltdq_curthread)) {
-			/*
-			 * Only preempt when dst is actually running a
-			 * non-idle thread.  An idle dst will pick our
-			 * waker naturally via tdq_notify's regular path
-			 * (or via the next dispatch); IPI'ing an idle CPU
-			 * would just thrash placement for fresh-fork
-			 * spreads (each child fork would otherwise fire
-			 * a cost-preempt IPI to its freshly-picked CPU
-			 * and N=4 throughput would tank).
-			 */
-			uint64_t floor = atomic_load_64(&tdq->ltdq_vtime);
-			uint64_t v = td_get_sched(td)->ts_vruntime;
-			int now = ticks;
+		    (flags & SRQ_YIELDING) == 0) {
+			if (tdq->ltdq_curthread == NULL ||
+			    TD_IS_IDLETHREAD(tdq->ltdq_curthread)) {
+				laminar_cp_skip_idle++;
+			} else {
+				uint64_t floor =
+				    atomic_load_64(&tdq->ltdq_vtime);
+				uint64_t v = td_get_sched(td)->ts_vruntime;
+				int now = ticks;
 
-			if (v <= floor &&
-			    now - tdq->ltdq_last_preempt >=
-			    (int)laminar_preempt_cooldown &&
-			    !tdq->ltdq_owepreempt) {
-				tdq->ltdq_last_preempt = now;
-				tdq->ltdq_owepreempt = 1;
-				atomic_thread_fence_seq_cst();
-				ipi_cpu(cpu, IPI_PREEMPT);
-				sent_cost_ipi = true;
+				if (v > floor) {
+					laminar_cp_skip_v++;
+				} else if (now - tdq->ltdq_last_preempt <
+				    (int)laminar_preempt_cooldown) {
+					laminar_cp_skip_cool++;
+				} else if (tdq->ltdq_owepreempt) {
+					laminar_cp_skip_owe++;
+				} else {
+					tdq->ltdq_last_preempt = now;
+					tdq->ltdq_owepreempt = 1;
+					atomic_thread_fence_seq_cst();
+					ipi_cpu(cpu, IPI_PREEMPT);
+					laminar_cp_ipi++;
+					sent_cost_ipi = true;
+				}
 			}
 		}
 		if (!sent_cost_ipi)
-			tdq_notify(tdq, td->td_priority);
+			tdq_notify(tdq, lowpri);
 	} else if ((flags & SRQ_YIELDING) == 0)
 		sched_laminar_setpreempt(td->td_priority);
 #else
@@ -2600,6 +2631,7 @@ sched_laminar_choose(void)
 
 	tdq = LAMINAR_TDQ_SELF();
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	laminar_choose_calls++;
 	td = tdq_choose(tdq);
 	if (td != NULL) {
 		struct td_sched *ts = td_get_sched(td);
@@ -2612,6 +2644,7 @@ sched_laminar_choose(void)
 			uint64_t delay_us = (uint64_t)
 			    (((uint64_t)delta * 1000000ULL) >> 32);
 
+			laminar_wake_picks++;
 			if (delay_us > laminar_wake_pick_max_us)
 				laminar_wake_pick_max_us = delay_us;
 			if (delay_us > LAMINAR_WAKE_LONG_US)
@@ -2689,6 +2722,7 @@ sched_laminar_clock(struct thread *td, int cnt)
 			ts->ts_slice_used = 0;
 			td->td_flags |= TDF_SLICEEND;
 			ast_sched_locked(td, TDA_SCHED);
+			laminar_slice_ends++;
 		}
 	}
 }
@@ -2753,6 +2787,16 @@ u_long laminar_lag_cap = 1000000;
  */
 u_long laminar_wake_pick_max_us = 0;
 u_long laminar_wake_pick_long_count = 0;
+/* Picker chain instrumentation for R4 root-cause. */
+u_long laminar_choose_calls = 0;	/* sched_choose invocations */
+u_long laminar_slice_ends = 0;		/* TDF_SLICEEND fired */
+u_long laminar_wake_picks = 0;		/* wakes that became on-cpu */
+u_long laminar_cp_ipi = 0;		/* cost-preempt IPIs sent */
+u_long laminar_cp_skip_v = 0;		/* skipped: v > floor */
+u_long laminar_cp_skip_cool = 0;	/* skipped: cooldown not expired */
+u_long laminar_cp_skip_idle = 0;	/* skipped: dst idle */
+u_long laminar_cp_skip_owe = 0;		/* skipped: owepreempt already set */
+u_long laminar_wake_pick_long_threshold = LAMINAR_WAKE_LONG_US;
 /*
  * Per-CPU cooldown (in ticks) between cost-based preempt IPIs.
  * Caps the IPI rate so wakers don't storm a busy CPU.  The trade
@@ -2771,6 +2815,25 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_max_us, CTLFLAG_RW,
 SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
     &laminar_wake_pick_long_count, 0,
     "Laminar: count of wake-to-on-cpu delays exceeding 100ms.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, choose_calls, CTLFLAG_RW,
+    &laminar_choose_calls, 0,
+    "Laminar: sched_choose invocations since reset.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, slice_ends, CTLFLAG_RW,
+    &laminar_slice_ends, 0,
+    "Laminar: TDF_SLICEEND firings since reset.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_picks, CTLFLAG_RW,
+    &laminar_wake_picks, 0,
+    "Laminar: wakes that became on-cpu since reset.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_ipi, CTLFLAG_RW,
+    &laminar_cp_ipi, 0, "Laminar: cost-preempt IPIs sent.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_v, CTLFLAG_RW,
+    &laminar_cp_skip_v, 0, "Laminar: cost-preempt skipped (v > floor).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_cool, CTLFLAG_RW,
+    &laminar_cp_skip_cool, 0, "Laminar: cost-preempt skipped (cooldown).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_idle, CTLFLAG_RW,
+    &laminar_cp_skip_idle, 0, "Laminar: cost-preempt skipped (dst idle).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_owe, CTLFLAG_RW,
+    &laminar_cp_skip_owe, 0, "Laminar: cost-preempt skipped (owe set).");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
     &laminar_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
