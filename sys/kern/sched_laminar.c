@@ -521,6 +521,9 @@ struct laminar_tdq {
 	int		ltdq_last_preempt;	/* (t) ticks @ last wake-preempt
 						 *      IPI; cooldown for the
 						 *      cost-based preempt path. */
+	int		ltdq_last_local_preempt; /* (t) ticks @ last same-CPU
+						 *      AST fire; cooldown for
+						 *      local cost-preempt. */
 
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
@@ -2509,15 +2512,83 @@ sched_laminar_userret_slowpath(struct thread *td)
  * APs only execute work that is spawned on them.  This is enough to
  * reach multiuser.
  */
+/*
+ * Same-CPU cost-preempt cooldown (R4 fix).  Caps the rate at which
+ * a local wake can force the running thread to yield via AST.  Too
+ * low = picker thrash + IPI/switch storm (an earlier unguarded
+ * attempt cut p50 throughput hard); too high = wake-tail latency
+ * approaches a full sched_slice.  Default 1 tick @ hz=100 = 10ms,
+ * roughly bounding tail at slice/8.
+ */
+u_long laminar_local_preempt_cooldown = 1;
+u_long laminar_local_preempt_fires = 0;
+u_long laminar_clock_calls = 0;
+u_long laminar_clock_idle_calls = 0;
+u_long laminar_clock_ts_sum = 0;
+u_long laminar_local_preempt_skip_cool = 0;
+u_long laminar_local_preempt_skip_v = 0;
+
 static void
 sched_laminar_setpreempt(int pri)
 {
 	struct thread *ctd;
+	struct laminar_tdq *tdq;
 
 	ctd = curthread;
 	THREAD_LOCK_ASSERT(ctd, MA_OWNED);
-	if (pri < ctd->td_priority)
+	if (pri < ctd->td_priority) {
 		ast_sched_locked(ctd, TDA_SCHED);
+		return;
+	}
+	/*
+	 * Cost-based local preempt (R4 follow-up, RLC theme).  The
+	 * priority check above doesn't fire for timeshare-vs-timeshare
+	 * (equal priority) wakes -- the waker waits up to a full slice
+	 * (~94ms) for the incumbent to give up the CPU.  Mirror the
+	 * cross-CPU cost-preempt logic locally: if the local runq has
+	 * a thread (the just-added waker, typically) with lower
+	 * vruntime than ctd, the picker would prefer it; fire the AST
+	 * so ctd yields.  Rate-limited by ltdq_last_local_preempt to
+	 * cap the switch storm.
+	 *
+	 * Identified via instrumentation showing 99.99% of wakes take
+	 * this same-CPU path (cp_ipi + notify_ipi = 4 out of 2.6M
+	 * wakes).  All previous cross-CPU R4 fixes were addressing
+	 * the wrong path.
+	 */
+	if (!laminar_is_timeshare(ctd))
+		return;
+	tdq = LAMINAR_TDQ_SELF();
+	{
+		int now = ticks;
+
+		if (now - tdq->ltdq_last_local_preempt <
+		    (int)laminar_local_preempt_cooldown) {
+			laminar_local_preempt_skip_cool++;
+			return;
+		}
+	}
+	{
+		uint64_t cv = td_get_sched(ctd)->ts_vruntime;
+		uint32_t s, nshards;
+		bool found_lower = false;
+
+		nshards = (tdq->ltdq_ts_n + LAMINAR_SHARD_SIZE - 1) /
+		    LAMINAR_SHARD_SIZE;
+		for (s = 0; s < nshards; s++) {
+			if (tdq->ltdq_shard_min[s] < cv) {
+				found_lower = true;
+				break;
+			}
+		}
+		if (!found_lower) {
+			laminar_local_preempt_skip_v++;
+			return;
+		}
+	}
+	tdq->ltdq_last_local_preempt = ticks;
+	laminar_local_preempt_fires++;
+	ast_sched_locked(ctd, TDA_SCHED);
 }
 
 static void
@@ -2723,8 +2794,12 @@ sched_laminar_clock(struct thread *td, int cnt)
 	 * until the running thread blocks or exits.  Idle threads
 	 * are exempt -- they yield naturally.
 	 */
-	if (!TD_IS_IDLETHREAD(td)) {
+	laminar_clock_calls++;
+	if (TD_IS_IDLETHREAD(td)) {
+		laminar_clock_idle_calls++;
+	} else {
 		ts->ts_slice_used += cnt;
+		laminar_clock_ts_sum += cnt;
 		if (ts->ts_slice_used >= (uint32_t)sched_slice) {
 			ts->ts_slice_used = 0;
 			td->td_flags |= TDF_SLICEEND;
@@ -2847,6 +2922,25 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_ipi, CTLFLAG_RW,
     &laminar_notify_ipi, 0, "Laminar: tdq_notify IPIs sent.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_skip, CTLFLAG_RW,
     &laminar_notify_skip, 0, "Laminar: tdq_notify decisions no-IPI.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_cooldown, CTLFLAG_RW,
+    &laminar_local_preempt_cooldown, 0,
+    "Laminar: per-CPU ticks between same-CPU cost-based AST fires "
+    "(R4 fix; rate-limit to avoid local picker thrash).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_fires, CTLFLAG_RW,
+    &laminar_local_preempt_fires, 0,
+    "Laminar: same-CPU cost-preempt AST fires.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_skip_cool, CTLFLAG_RW,
+    &laminar_local_preempt_skip_cool, 0,
+    "Laminar: same-CPU cost-preempt skipped (cooldown).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_skip_v, CTLFLAG_RW,
+    &laminar_local_preempt_skip_v, 0,
+    "Laminar: same-CPU cost-preempt skipped (no lower-vruntime found).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, clock_calls, CTLFLAG_RW,
+    &laminar_clock_calls, 0, "Laminar: sched_clock entries.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, clock_idle_calls, CTLFLAG_RW,
+    &laminar_clock_idle_calls, 0, "Laminar: sched_clock entries for idle.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, clock_ts_sum, CTLFLAG_RW,
+    &laminar_clock_ts_sum, 0, "Laminar: sum of cnt across non-idle clock.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
     &laminar_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
