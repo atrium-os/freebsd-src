@@ -331,6 +331,11 @@ struct td_sched {
 	uint64_t	ts_eff_weight;	/* Precomputed jail_nthreads /
 					 * (weight * jail_weight). */
 	uint32_t	ts_weight;	/* Nice-derived per-thread weight. */
+	uint32_t	ts_wload_contrib;	/* Weight currently summed into
+						 * owning tdq's wload; used for
+						 * symmetric add/rem so nice
+						 * changes don't drift wload
+						 * out of sync with ts_weight. */
 	uint32_t	ts_slot;	/* Index in tdq SoA arrays. */
 	/* Placement / migration. */
 	int		ts_cpu;		/* Current or last CPU. */
@@ -871,9 +876,21 @@ static __inline void
 tdq_load_add(struct laminar_tdq *tdq, struct thread *td)
 {
 
+	struct td_sched *ts;
+
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	tdq->ltdq_load++;
-	tdq->ltdq_wload += td_get_sched(td)->ts_weight;
+	ts = td_get_sched(td);
+	/*
+	 * Symmetric wload accounting: contribute ts_weight, remember the
+	 * exact value contributed so rem subtracts the same amount.  If
+	 * ts_weight changes (nice()) while td is on a tdq, sched_laminar_nice
+	 * fixes wload AND ts_wload_contrib under the tdq lock.  Without
+	 * the contrib record, an add at weight X followed by nice + rem
+	 * at weight Y would underflow wload to 0 and lose accounting.
+	 */
+	ts->ts_wload_contrib = ts->ts_weight;
+	tdq->ltdq_wload += ts->ts_wload_contrib;
 	if ((td->td_flags & TDF_NOLOAD) == 0)
 		tdq->ltdq_sysload++;
 }
@@ -881,13 +898,16 @@ tdq_load_add(struct laminar_tdq *tdq, struct thread *td)
 static __inline void
 tdq_load_rem(struct laminar_tdq *tdq, struct thread *td)
 {
+	struct td_sched *ts;
 	uint32_t w;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	KASSERT(tdq->ltdq_load > 0,
 	    ("tdq_load_rem: load underflow on cpu %d", tdq->ltdq_id));
 	tdq->ltdq_load--;
-	w = td_get_sched(td)->ts_weight;
+	ts = td_get_sched(td);
+	w = ts->ts_wload_contrib;
+	ts->ts_wload_contrib = 0;
 	if (tdq->ltdq_wload >= w)
 		tdq->ltdq_wload -= w;
 	else
@@ -2005,13 +2025,28 @@ sched_laminar_nice(struct proc *p, int nice)
 		if (old != w && (TD_ON_RUNQ(td) || TD_IS_RUNNING(td))) {
 			struct laminar_tdq *tdq =
 			    LAMINAR_TDQ_CPU(td_get_sched(td)->ts_cpu);
+			struct td_sched *ts = td_get_sched(td);
+			uint32_t contrib = ts->ts_wload_contrib;
 
-			if (w > old)
-				tdq->ltdq_wload += (w - old);
-			else if (tdq->ltdq_wload >= (old - w))
-				tdq->ltdq_wload -= (old - w);
-			else
-				tdq->ltdq_wload = 0;
+			/*
+			 * Adjust by (new_weight - contrib), not (w - old),
+			 * because ts_wload_contrib is what's actually summed
+			 * into tdq->ltdq_wload (may differ from ts_weight
+			 * if the thread wasn't on a tdq when contrib last
+			 * synced).  Keep ts_wload_contrib in lockstep with
+			 * the new weight so subsequent rem subtracts the
+			 * right amount.
+			 */
+			if (w > contrib) {
+				tdq->ltdq_wload += (w - contrib);
+			} else if (w < contrib) {
+				uint32_t diff = contrib - w;
+				if (tdq->ltdq_wload >= diff)
+					tdq->ltdq_wload -= diff;
+				else
+					tdq->ltdq_wload = 0;
+			}
+			ts->ts_wload_contrib = w;
 		}
 		thread_unlock(td);
 	}
