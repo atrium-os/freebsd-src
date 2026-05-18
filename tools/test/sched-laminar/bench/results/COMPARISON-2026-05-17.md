@@ -437,3 +437,42 @@ REVERTED.  R4 remains a documented algorithmic-class gap.
 Session total: 16 commits, R1-R3 + R5 fully closed, R2 + R4
 characterised with concrete future-fix shapes documented.
 ==================================================================
+
+==================================================================
+ Design principle for R4 follow-up (user direction)
+==================================================================
+
+R4 must stay within the RLC theme.  Laminar's value proposition
+is "single cost function, controlled by R, tuned by a closed-loop
+controller."  ULE-style interactivity heuristics (priority-boost
+overlay, sleeper score, etc.) work mechanically -- the rejected
+boost experiment got +30% N=4 throughput -- but they fragment
+the unified cost-function story and make Laminar look like ULE
+with extra steps.
+
+The interactivity-boost class of fix is acceptable for downstream
+GUI / desktop variants that explicitly opt in, but the upstream
+default must keep RLC at the centre.
+
+Concrete RLC-shaped directions for R4:
+
+  (a) Make laminar_lag_cap dynamic.  The controller already
+      tunes R_power for park/unpark; it can also tune lag_cap
+      based on observed max wake latency vs throughput trade.
+      High max -> raise cap (favor sleepers more).  Throughput
+      degradation -> lower cap.  Single signal, single knob,
+      stays in RLC framework.
+
+  (b) Express "waker needs to preempt" as a transient R bump on
+      the destination CPU's incumbent.  RLC-native: incumbent's
+      effective cost rises briefly, picker (still pure vruntime)
+      sees waker as cheaper.  Bounded by R semantics, not new
+      priority machinery.
+
+  (c) Capture wake-latency as a controller input signal alongside
+      load_pct.  Build the same Schmitt-trigger + EWMA + patience
+      shape that ctrl_emergency already uses for parking.
+
+Pick by which mechanism best preserves "one cost function, RLC
+closed loop" as the elevator pitch.
+==================================================================
