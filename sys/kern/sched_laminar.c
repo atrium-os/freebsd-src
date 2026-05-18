@@ -608,6 +608,8 @@ extern u_long laminar_cp_skip_v;
 extern u_long laminar_cp_skip_cool;
 extern u_long laminar_cp_skip_idle;
 extern u_long laminar_cp_skip_owe;
+extern u_long laminar_notify_ipi;
+extern u_long laminar_notify_skip;
 #define	LAMINAR_WAKE_LONG_US	100000ULL
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
@@ -1309,14 +1311,19 @@ tdq_notify(struct laminar_tdq *tdq, int oldpri)
 	 * as R4 multi-second wake-tail with cp_skip_idle=5523 hits.
 	 */
 	newpri = tdq->ltdq_lowpri;
-	if (newpri >= oldpri && oldpri < PRI_MIN_IDLE)
+	if (newpri >= oldpri && oldpri < PRI_MIN_IDLE) {
+		laminar_notify_skip++;
 		return;
+	}
 	atomic_thread_fence_seq_cst();
 	cpu = LAMINAR_TDQ_ID(tdq);
-	if (cpu == PCPU_GET(cpuid))
+	if (cpu == PCPU_GET(cpuid)) {
+		laminar_notify_skip++;
 		return;			/* same CPU; no IPI needed */
+	}
 	tdq->ltdq_owepreempt = 1;
 	ipi_cpu(cpu, IPI_PREEMPT);
+	laminar_notify_ipi++;
 }
 
 /*
@@ -2796,6 +2803,8 @@ u_long laminar_cp_skip_v = 0;		/* skipped: v > floor */
 u_long laminar_cp_skip_cool = 0;	/* skipped: cooldown not expired */
 u_long laminar_cp_skip_idle = 0;	/* skipped: dst idle */
 u_long laminar_cp_skip_owe = 0;		/* skipped: owepreempt already set */
+u_long laminar_notify_ipi = 0;		/* tdq_notify IPIs sent */
+u_long laminar_notify_skip = 0;		/* tdq_notify decided no IPI */
 u_long laminar_wake_pick_long_threshold = LAMINAR_WAKE_LONG_US;
 /*
  * Per-CPU cooldown (in ticks) between cost-based preempt IPIs.
@@ -2834,6 +2843,10 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_idle, CTLFLAG_RW,
     &laminar_cp_skip_idle, 0, "Laminar: cost-preempt skipped (dst idle).");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_owe, CTLFLAG_RW,
     &laminar_cp_skip_owe, 0, "Laminar: cost-preempt skipped (owe set).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_ipi, CTLFLAG_RW,
+    &laminar_notify_ipi, 0, "Laminar: tdq_notify IPIs sent.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_skip, CTLFLAG_RW,
+    &laminar_notify_skip, 0, "Laminar: tdq_notify decisions no-IPI.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
     &laminar_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
