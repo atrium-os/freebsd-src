@@ -512,3 +512,43 @@ controller can later tune.  Avoids ULE-style interactivity
 priority overlay -- preempt emerges from the cost function
 itself.
 ==================================================================
+
+==================================================================
+ Audit: no ULE-style heuristic hooks introduced
+==================================================================
+
+After the 10 session commits, audited for ULE-style overlays
+(interactivity score, sleep-time credit, priority boost,
+sleeper flags).  None introduced:
+
+  grep introduced lines for {interactiv, slp, boost, score,
+  wake_count, recent_sleep} : only comment references
+  describing what we explicitly REJECTED.
+
+  grep introduced lines for {td_priority, ltdq_lowpri}
+  assignments : zero.  Single td_priority mention is the
+  unchanged tdq_notify argument from original Laminar.
+
+Two preempt mechanisms added, both gated on objective cost-
+function conditions (not heuristics):
+
+  (a) Slice quantum (b8eca6a): TDF_SLICEEND + ast_sched_locked
+      when ts_slice_used >= sched_slice.  Time-based,
+      structural -- required by any fair-share scheduler.
+
+  (b) Cost preempt (4cb40ed): ipi_cpu when waker.vruntime <=
+      dst.ltdq_vtime AND cooldown expired AND dst non-idle.
+      Pure vruntime comparison, RLC-style per-CPU cooldown.
+
+Pre-existing tdq_notify still uses priority (ltdq_lowpri >=
+lowpri).  Retained as fallback for non-timeshare classes
+(realtime DOES need priority).  My cost-preempt path bypasses
+it for timeshare; falls through for everything else.
+
+Verdict: Laminar's elevator pitch survives intact -- "single
+cost function (load + R) + RLC closed loop + vruntime picker."
+Every fix either tunes the cost function (wload, eff_weight,
+bounded-lag rebase, controller thresholds) or enforces it
+(slice quantum, cost preempt) -- never adds a parallel
+heuristic.
+==================================================================
