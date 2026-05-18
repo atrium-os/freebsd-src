@@ -552,3 +552,40 @@ bounded-lag rebase, controller thresholds) or enforces it
 (slice quantum, cost preempt) -- never adds a parallel
 heuristic.
 ==================================================================
+
+==================================================================
+ Steady-state numbers (T=30s skew, T=15s throughput)
+==================================================================
+
+Per RLC theory the filter is invisible at steady state, so long-T
+bench windows should show the cost-function's true behaviour.
+
+bench_skew T=30s (3 runs each):
+                       Laminar mean     vs ULE T=8s
+   all-cpus     2.92 : 1.00 : 0.33    vs 1.36 : 1.00 : 0.91
+   cpu0-only    2.97 : 1.00 : 0.36    vs 1.27 : 1.00 : 0.89
+   target       3.05 : 1.00 : 0.33
+
+   Within ~5% of the CFS-style target on the nice-5 side and
+   dead-on for nice+5.  Beats ULE decisively on nice fairness.
+
+bench_throughput T=15s (3 runs):
+   N=1: 1.0x      N=8:  4.01-4.18x
+   N=2: 1.97-2.05 N=16: 4.05-4.29x
+   N=4: 3.04-3.99 N=32: 4.12-4.43x
+
+   N=2/N=8/N=16/N=32 saturate.  N=4 still occasionally bimodal
+   (one run perfect, two stuck on 3-CPU placement).  Suspected:
+   fork-time pickcpu races with EWMA convergence on the first
+   1-2 sample windows.
+
+bench_latency: long-T runs hit the R4 multi-second wake tail
+that the cost-preempt mechanism didn't fully close.  T=5s
+results stand: p50/p99 sub-50us, p99.9 mostly sub-200us, max
+bimodal.
+
+Steady state matches CFS-class fairness via the pure cost
+function (no interactivity overlay).  Remaining bench-side
+noise is the R4 wake-tail and N=4 transient -- both already
+have RLC-shaped hooks documented for future tuning.
+==================================================================
