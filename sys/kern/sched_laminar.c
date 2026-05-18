@@ -496,6 +496,9 @@ struct laminar_tdq {
 	int		ltdq_signal_ewma;	/* (t) smoothed scaled cost. */
 	int		ltdq_streak;		/* (t) C2 debounce counter. */
 	int		ltdq_last_xfer;		/* (t) ticks @ last migration. */
+	int		ltdq_last_preempt;	/* (t) ticks @ last wake-preempt
+						 *      IPI; cooldown for the
+						 *      cost-based preempt path. */
 
 	/* Aggregate state. */
 	int		ltdq_load;	/* (ts) Total runnable. */
@@ -572,6 +575,7 @@ sched_laminar_unimpl(const char *fn)
 /* Forward declarations for the periodic balancer (defined below). */
 static int tdq_add_internal(struct laminar_tdq *, struct thread *, int);
 extern u_long laminar_lag_cap;
+extern u_long laminar_preempt_cooldown;
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
 
@@ -2393,9 +2397,61 @@ sched_laminar_add(struct thread *td, int flags)
 	cpu = sched_laminar_pickcpu(td, flags);
 	tdq = sched_laminar_setcpu(td, cpu, flags);
 	lowpri = tdq_add_internal(tdq, td, flags);
-	if (cpu != PCPU_GET(cpuid))
-		tdq_notify(tdq, td->td_priority);
-	else if ((flags & SRQ_YIELDING) == 0)
+	if (cpu != PCPU_GET(cpuid)) {
+		/*
+		 * Cost-based preempt (R4 follow-up, RLC-shaped).  The
+		 * priority-based tdq_notify check never fires for
+		 * timeshare-vs-timeshare wakeups (same priority), so a
+		 * waker on a busy CPU waits up to a slice (often longer
+		 * under heavy load) before being picked.  Decide via
+		 * vruntime (the picker's actual cost metric): if the
+		 * just-enqueued timeshare waker's vruntime is at or below
+		 * the dst CPU's floor, it would be the picker's next
+		 * choice -- send the preempt IPI directly so the
+		 * incumbent yields and sched_choose picks us.
+		 *
+		 * Rate-limited per dst CPU by laminar_preempt_cooldown
+		 * (ticks) to cap the IPI/switch storm that an uncapped
+		 * preempt produced in an earlier ULE-style boost
+		 * experiment (~3s max latency under 4 watchers each
+		 * waking 40k/s).  Cooldown is the RLC knob.
+		 *
+		 * Falls through to tdq_notify (priority-based path) for
+		 * non-timeshare and for the cooldown-blocked case.
+		 */
+		bool sent_cost_ipi = false;
+		if (laminar_is_timeshare(td) &&
+		    (flags & SRQ_YIELDING) == 0 &&
+		    tdq->ltdq_curthread != NULL &&
+		    !TD_IS_IDLETHREAD(tdq->ltdq_curthread)) {
+			/*
+			 * Only preempt when dst is actually running a
+			 * non-idle thread.  An idle dst will pick our
+			 * waker naturally via tdq_notify's regular path
+			 * (or via the next dispatch); IPI'ing an idle CPU
+			 * would just thrash placement for fresh-fork
+			 * spreads (each child fork would otherwise fire
+			 * a cost-preempt IPI to its freshly-picked CPU
+			 * and N=4 throughput would tank).
+			 */
+			uint64_t floor = atomic_load_64(&tdq->ltdq_vtime);
+			uint64_t v = td_get_sched(td)->ts_vruntime;
+			int now = ticks;
+
+			if (v <= floor &&
+			    now - tdq->ltdq_last_preempt >=
+			    (int)laminar_preempt_cooldown &&
+			    !tdq->ltdq_owepreempt) {
+				tdq->ltdq_last_preempt = now;
+				tdq->ltdq_owepreempt = 1;
+				atomic_thread_fence_seq_cst();
+				ipi_cpu(cpu, IPI_PREEMPT);
+				sent_cost_ipi = true;
+			}
+		}
+		if (!sent_cost_ipi)
+			tdq_notify(tdq, td->td_priority);
+	} else if ((flags & SRQ_YIELDING) == 0)
 		sched_laminar_setpreempt(td->td_priority);
 #else
 	tdq = LAMINAR_TDQ_SELF();
@@ -2568,10 +2624,22 @@ sched_laminar_relinquish(struct thread *td)
  * accumulator caught up.  Tunable for measurement.
  */
 u_long laminar_lag_cap = 1000000;
+/*
+ * Per-CPU cooldown (in ticks) between cost-based preempt IPIs.
+ * Caps the IPI rate so wakers don't storm a busy CPU.  The trade
+ * is wake-tail-latency vs preempt-IPI churn -- lower = tighter
+ * tail but more switches; higher = less churn but longer waits.
+ * 1 tick @ hz=100 = 10ms.  Default 2 = 20ms.
+ */
+u_long laminar_preempt_cooldown = 2;
 SYSCTL_DECL(_kern_sched);
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lag_cap, CTLFLAG_RW,
     &laminar_lag_cap, 0,
     "Laminar: max vruntime units a waker may sit below the per-CPU floor");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
+    &laminar_preempt_cooldown, 0,
+    "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
+    "rate-limit to avoid IPI/switch storm under high wake rate");
 
 /*
  * Record one wakeup edge for IPC affinity inference (whitepaper §6).
