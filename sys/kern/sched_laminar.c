@@ -498,6 +498,12 @@ struct laminar_tdq {
 	 */
 	int		ltdq_resistance;	/* (ts) user-set R via sysctl. */
 	int		ltdq_resistance_power;	/* (ts) controller-set R_power. */
+	int		ltdq_ctrl_preempt_band;	/* (ts) controller-set R band for
+						 *      preempt gates only;
+						 *      stacked on user R.
+						 *      Does NOT affect placement
+						 *      cost (raw_cost) or balancer
+						 *      evac heuristic. */
 
 	/*
 	 * RLC balancer filter state (phase C, DESIGN.md §1).  All terms
@@ -646,6 +652,7 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	tdq->ltdq_vtime = 0;
 	tdq->ltdq_resistance = 0;
 	tdq->ltdq_resistance_power = 0;
+	tdq->ltdq_ctrl_preempt_band = 0;
 	tdq->ltdq_capacity = LAMINAR_CAP_BASE;
 	tdq->ltdq_signal_ewma = 0;
 	tdq->ltdq_streak = 0;
@@ -901,6 +908,11 @@ laminar_sysctl_register(void *arg __unused)
 		    &tdq->ltdq_resistance_power, 0,
 		    "Closed-loop controller's R_power for this CPU (RD; "
 		    "nonzero = parked by controller).");
+		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "ctrl_preempt_band", CTLFLAG_RD,
+		    &tdq->ltdq_ctrl_preempt_band, 0,
+		    "Controller-set R tolerance band for preempt gates (RD; "
+		    "stacked on user R; affects preempt only, not placement).");
 		SYSCTL_ADD_INT(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
 		    "load", CTLFLAG_RD, &tdq->ltdq_load, 0,
 		    "Current runnable count on this CPU (RD; debug).");
@@ -1776,6 +1788,18 @@ static int laminar_ctrl_unpark_pat = 1;		/* under-provisioned cycles */
 static int laminar_ctrl_evac_r = 99;		/* R_power for parked CPUs */
 static int laminar_ctrl_enable = 1;		/* master switch */
 
+/*
+ * Controller-driven preempt tolerance band.  Raised when sustained
+ * load_pct exceeds the threshold to widen the cost-preempt gate
+ * (RLC: controller observes load, actuates R for preempt only).
+ * Result: desktop-responsive wake latency under saturation without
+ * a static slice_min special case or sleeper-credit overlay.
+ */
+static int laminar_ctrl_band_enable = 1;	/* auto-band on by default */
+static int laminar_ctrl_band_max = 4;		/* clamp band per CPU */
+static int laminar_ctrl_band_thresh = 100;	/* load_pct floor */
+static int laminar_ctrl_band_step = 25;		/* load_pct per band unit */
+
 /* Observability + state (all single-controller for now). */
 static int laminar_ctrl_load_ewma;
 static int laminar_ctrl_park_streak;
@@ -1802,6 +1826,18 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_unpark_pat, CTLFLAG_RW,
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_evac_r, CTLFLAG_RW,
     &laminar_ctrl_evac_r, 0,
     "Laminar: R_power value applied to a parked CPU (evac strength)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_enable, CTLFLAG_RWTUN,
+    &laminar_ctrl_band_enable, 0,
+    "Laminar: controller-driven preempt R-band on (1) / off (0)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_max, CTLFLAG_RWTUN,
+    &laminar_ctrl_band_max, 0,
+    "Laminar: max controller-set preempt R band per CPU");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_thresh, CTLFLAG_RWTUN,
+    &laminar_ctrl_band_thresh, 0,
+    "Laminar: load_pct at/below which controller R band is 0");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_step, CTLFLAG_RWTUN,
+    &laminar_ctrl_band_step, 0,
+    "Laminar: load_pct per +1 unit of controller preempt R band");
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_ewma, CTLFLAG_RD,
     &laminar_ctrl_load_ewma, 0,
     "Laminar: smoothed system load as percent of total capacity");
@@ -1902,6 +1938,37 @@ laminar_ctrl_cb(void *arg __unused)
 		/* In deadband -- decay streaks. */
 		laminar_ctrl_park_streak = 0;
 		laminar_ctrl_unpark_streak = 0;
+	}
+
+	/*
+	 * Controller-driven preempt R band.  load_pct is raw runnable
+	 * count per unparked CPU * 100.  Above the threshold, widen the
+	 * preempt cost-tolerance band proportionally.  Applied uniformly
+	 * to all unparked CPUs (parked CPUs keep band=0 -- they aren't
+	 * picking anything).  Step / threshold / max are tunable; default
+	 * thresh=100 (one runnable per CPU), step=25, max=4: band reaches
+	 * +1 at load_pct=125, +4 at load_pct>=200.
+	 */
+	if (laminar_ctrl_band_enable) {
+		int band_target = 0;
+		int load_for_band = laminar_ctrl_load_ewma;
+		if (load_for_band > laminar_ctrl_band_thresh &&
+		    laminar_ctrl_band_step > 0) {
+			band_target = (load_for_band - laminar_ctrl_band_thresh) /
+			    laminar_ctrl_band_step;
+			if (band_target > laminar_ctrl_band_max)
+				band_target = laminar_ctrl_band_max;
+			if (band_target < 0)
+				band_target = 0;
+		}
+		CPU_FOREACH(cpu) {
+			tdq = LAMINAR_TDQ_CPU(cpu);
+			if (atomic_load_int(&tdq->ltdq_resistance_power) > 0)
+				atomic_store_int(&tdq->ltdq_ctrl_preempt_band, 0);
+			else
+				atomic_store_int(&tdq->ltdq_ctrl_preempt_band,
+				    band_target);
+		}
 	}
 
 reschedule:
@@ -2606,8 +2673,9 @@ sched_laminar_setpreempt(int pri)
 		 * min within R slices below current's vruntime is "lower
 		 * enough" to preempt.  R=0 keeps strict fairness.
 		 */
-		uint64_t r_band = (uint64_t)atomic_load_int(
-		    &tdq->ltdq_resistance) *
+		uint64_t r_band = (uint64_t)(atomic_load_int(
+		    &tdq->ltdq_resistance) + atomic_load_int(
+		    &tdq->ltdq_ctrl_preempt_band)) *
 		    (uint64_t)sched_slice * LAMINAR_NICE_0_WEIGHT;
 		uint64_t cv_thresh = cv + r_band;
 		if (cv_thresh < cv)	/* overflow guard */
@@ -2694,8 +2762,10 @@ sched_laminar_add(struct thread *td, int flags)
 				 * case.  Unit: 1 stathz tick of nice-0
 				 * runtime = LAMINAR_NICE_0_WEIGHT^2.
 				 */
-				uint64_t r_band = (uint64_t)atomic_load_int(
-				    &tdq->ltdq_resistance) *
+				uint64_t r_band = (uint64_t)(atomic_load_int(
+				    &tdq->ltdq_resistance) +
+				    atomic_load_int(
+				    &tdq->ltdq_ctrl_preempt_band)) *
 				    (uint64_t)sched_slice *
 				    LAMINAR_NICE_0_WEIGHT;
 				int now = ticks;
