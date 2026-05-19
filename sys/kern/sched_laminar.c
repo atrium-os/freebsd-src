@@ -2601,11 +2601,22 @@ sched_laminar_setpreempt(int pri)
 		uint64_t cv = td_get_sched(ctd)->ts_vruntime;
 		uint32_t s, nshards;
 		bool found_lower = false;
+		/*
+		 * R-as-tolerance-band mirrors the cross-CPU gate: a shard
+		 * min within R slices below current's vruntime is "lower
+		 * enough" to preempt.  R=0 keeps strict fairness.
+		 */
+		uint64_t r_band = (uint64_t)atomic_load_int(
+		    &tdq->ltdq_resistance) *
+		    (uint64_t)sched_slice * LAMINAR_NICE_0_WEIGHT;
+		uint64_t cv_thresh = cv + r_band;
+		if (cv_thresh < cv)	/* overflow guard */
+			cv_thresh = UINT64_MAX;
 
 		nshards = (tdq->ltdq_ts_n + LAMINAR_SHARD_SIZE - 1) /
 		    LAMINAR_SHARD_SIZE;
 		for (s = 0; s < nshards; s++) {
-			if (tdq->ltdq_shard_min[s] < cv) {
+			if (tdq->ltdq_shard_min[s] < cv_thresh) {
 				found_lower = true;
 				break;
 			}
@@ -2672,9 +2683,24 @@ sched_laminar_add(struct thread *td, int flags)
 				uint64_t floor =
 				    atomic_load_64(&tdq->ltdq_vtime);
 				uint64_t v = td_get_sched(td)->ts_vruntime;
+				/*
+				 * R-as-tolerance-band: extend the strict
+				 * fairness gate by R slices' worth of
+				 * vruntime.  R=0 (default) keeps current
+				 * strict semantics; R>0 lets near-equal-cost
+				 * wakees preempt, shrinking the effective
+				 * slice quantum.  Controller can drive R on
+				 * load_pct -- RLC-shaped, no slice_min special
+				 * case.  Unit: 1 stathz tick of nice-0
+				 * runtime = LAMINAR_NICE_0_WEIGHT^2.
+				 */
+				uint64_t r_band = (uint64_t)atomic_load_int(
+				    &tdq->ltdq_resistance) *
+				    (uint64_t)sched_slice *
+				    LAMINAR_NICE_0_WEIGHT;
 				int now = ticks;
 
-				if (v > floor) {
+				if (v > floor + r_band) {
 					laminar_cp_skip_v++;
 				} else if (now - tdq->ltdq_last_preempt <
 				    (int)laminar_preempt_cooldown) {
