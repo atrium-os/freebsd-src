@@ -283,3 +283,78 @@ consistency (the remaining "next axis" -- needs either a more
 careful idle-time work-stealing implementation than the one tried
 and reverted in this session, or boot-time band seeding for the
 cold-start residual).
+
+---
+
+## Lead-compensator follow-up (2026-05-19, late)
+
+After the rest-stop above, a sharper RLC-shaped attempt at the
+residuals was specified at `docs/spec/atrium-scheduler-rlc-residuals.md`:
+one mechanism (`laminar_lead_term`), three application sites
+(2.1 `ctrl_load_ewma` -> band, 2.2 `signal_ewma` -> balancer,
+2.3 new `place_ewma` -> raw_cost).  The intent: replace every
+first-order EWMA in the controller with a lead-compensated filter,
+giving the L the framework was named for.
+
+Outcome -- one of three sites landed, two were tried and reverted:
+
+**Site 2.1 (commit b59225b)** -- LANDED.  Lead-compensate `load_pct`
+for the band output, remove the `f10fb112` emergency band-up special
+case.  Effect at the time of commit:
+  - p99.9 wake under spin=8 watch=4: 7097us -> 72us  (100x)
+  - skew: 2.49:1:0.31 -> 2.87:1:0.35 (closer to target)
+  - bench_fair N=4 T=15s: 61% -> 0.2% (settled near-perfect)
+  - p99.9 spin=4 watch=4 cold-start: ~5ms -> still ~5ms (residual)
+
+Subsequent multi-run benches showed run-to-run variance is high
+on bench_skew all-cpus path (1.75 / 2.65 / 2.69 in three runs).
+cpu0-only path is stable at 3.0+, so the variability is in the
+placement code, not in the per-CPU picker.  The L term hasn't
+made things worse, but hasn't closed that variance either.
+
+**Site 2.2 (signal_ewma -> balancer)** -- REVERTED.  Hypothesis:
+faster balancer reaction to load steps via lead-compensated
+signal.  Reality: balancer migrated nice<0 threads too often (the
+faster signal made high-weight threads visible as donors on every
+step), inverting skew to 1.71:1.00:0.14 and even 2.99:1.00:**4.20**
+on cpu0-only (nice +5 getting more work than nice 0).  Fails the
+skew gate, reverted.
+
+**Site 2.3 (place_ewma diversity)** -- REVERTED in two variants.
+Hypothesis: a fresh placement bumps a per-CPU "recently placed"
+signal that decays in ~55ms; the bump folds into `raw_cost` so the
+next sibling fork in a tight loop sees the just-placed CPU as
+slightly more expensive.  Variants tried:
+
+  - v1, bump=1024 (= 1 nice-0 weight unit, ~0.25 load-units
+    contribution): Caught IPC wakes as well as forks, regressed IPC
+    by 100x+.
+  - v2, bump=1024, fork-only (td_lastcpu==NOCPU): bench_fair N=4
+    multi-run jumped from 4/10 perfect to 8/10 perfect (real win),
+    but skew broke to 8.55:1.00:3.87 (fail gate).  Mixed-nice
+    fork-bursts had place_ewma accumulating to ~1 load-unit, same
+    order as the wload of a nice -5 thread; placement decisions
+    started routing on bump differences instead of weights.
+  - v3, bump=256, fork-only: bench_fair N=4 dropped to 1/10
+    perfect (lost the win), skew still 2.10:1.00:0.18 (still fail).
+    The sweet spot between "enough to break fork-race ties" and
+    "sub-dominant to nice weighting" was too narrow.
+
+Architectural finding: **lead compensation on a signal feeding an
+actuator output (Site 2.1, band) composes cleanly with the existing
+system.  Lead compensation on a signal feeding into the placement
+cost function (Site 2.2, balancer ranking; Site 2.3, per-CPU
+diversity) does NOT** -- the faster filter dynamics interact with
+the picker's weight-based logic in ways that subtly break
+nice-weighting.  The L term gave higher-bandwidth visibility into
+load transients, but in the cost path the picker then makes
+short-time-scale decisions on a signal that's noisier than the
+unfiltered weights it's meant to dominate.
+
+The Laminar-vs-ULE picture above stands as the post-2026-05-19
+final state.  The plan doc has been retained for the negative
+finding -- the lead-compensator framework is right for actuator-
+gating signals, wrong for placement-cost signals.  Closing the
+within-cohort fairness gap to ULE requires a different mechanism
+(idle-time work stealing, or migration-cost-aware balancer
+hysteresis -- both bigger pieces than fit in a follow-up session).

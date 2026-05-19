@@ -1,0 +1,50 @@
+==================================================================
+  Scheduler: Laminar
+  Uptime:     4:59PM  up 6 mins, 0 users, load averages: 0.05, 0.69, 0.50
+  Date:      Tue May 19 16:59:48 UTC 2026
+  Build:     FreeBSD 16.0-CURRENT #103: Tue May 19 16:40:03 UTC 2026     root@atriu...
+==================================================================
+
+--- bench_throughput ---
+Laminar      N=1   T=5 s total_iters=195276       vs-1-spinner=0.99  x spread=0.0%
+Laminar      N=2   T=5 s total_iters=400953       vs-1-spinner=2.04  x spread=0.1%
+Laminar      N=4   T=5 s total_iters=769606       vs-1-spinner=3.91  x spread=0.1%
+Laminar      N=8   T=5 s total_iters=782985       vs-1-spinner=3.97  x spread=5.7%
+Laminar      N=16  T=5 s total_iters=771847       vs-1-spinner=3.92  x spread=87.0%
+Laminar      N=32  T=5 s total_iters=804348       vs-1-spinner=4.08  x spread=57.9%
+
+--- bench_fair ---
+Laminar      N=4   T=5  s mean_iters=153532       spread=101.5% (lower=fairer)
+Laminar      N=4   T=15 s mean_iters=575608       spread=0.2% (lower=fairer)
+Laminar      N=8   T=5  s mean_iters=96904        spread=81.0% (lower=fairer)
+Laminar      N=8   T=15 s mean_iters=288959       spread=127.0% (lower=fairer)
+Laminar      N=16  T=5  s mean_iters=49098        spread=43.8% (lower=fairer)
+Laminar      N=16  T=15 s mean_iters=144868       spread=59.4% (lower=fairer)
+
+--- bench_skew ---
+Laminar      all-cpus     nice-5_iters=243755     0_iters=142322     +5_iters=20362      ratio=1.71:1.00:0.14 (target 3.05:1.00:0.33)
+Laminar      cpu0-only    nice-5_iters=76960      0_iters=25742      +5_iters=108034     ratio=2.99:1.00:4.20 (target 3.05:1.00:0.33)
+
+--- bench_burst ---
+Laminar      B=4 S=4 T=10s spinner_iters_mean=290492     spread=62.5% burst_wakes=1360 (136.0/s)
+
+--- bench_latency ---
+Laminar      spin=0 watch=1 T=5s p50=6.5 p90=9.0 p99=29.3 p99.9=84.7 max=7119.8
+Laminar      spin=0 watch=4 T=5s p50=12.6 p90=19.0 p99=31.2 p99.9=63.5 max=7476.7
+Laminar      spin=4 watch=1 T=5s p50=6.8 p90=9.3 p99=17.7 p99.9=51.5 max=1092.4
+Laminar      spin=4 watch=4 T=5s p50=8.9 p90=15.2 p99=34.7 p99.9=63.4 max=497.6
+Laminar      spin=8 watch=4 T=5s p50=7.2 p90=10.4 p99=22.4 p99.9=121.9 max=15541.8
+
+--- bench_ipc ---
+Laminar      pairs=1   bg_spinners=0 T=5s round_trips=3797026    rt_mean_us=1.32
+Laminar      pairs=4   bg_spinners=0 T=5s round_trips=12219868   rt_mean_us=1.64 (per-pair mean)
+Laminar      slack=0  pairs=4 bg=0 T=5s round_trips=10323401   rt_mean_us=1.94
+Laminar      slack=1  pairs=4 bg=0 T=5s round_trips=12162312   rt_mean_us=1.65
+Laminar      slack=2  pairs=4 bg=0 T=5s round_trips=12254393   rt_mean_us=1.63
+Laminar      slack=4  pairs=4 bg=0 T=5s round_trips=12197487   rt_mean_us=1.64
+Laminar      slack=8  pairs=4 bg=0 T=5s round_trips=12413903   rt_mean_us=1.61
+Laminar      pairs=4   bg_spinners=4 T=5s round_trips=8816817    rt_mean_us=2.42
+
+==================================================================
+  END  (Laminar)
+==================================================================
