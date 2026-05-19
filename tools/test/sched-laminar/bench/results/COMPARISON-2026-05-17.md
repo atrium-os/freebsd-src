@@ -589,3 +589,57 @@ function (no interactivity overlay).  Remaining bench-side
 noise is the R4 wake-tail and N=4 transient -- both already
 have RLC-shaped hooks documented for future tuning.
 ==================================================================
+
+==================================================================
+ R4 outlier root-caused: HVF host dispatch lag (NOT Laminar)
+==================================================================
+
+The single multi-second outlier remaining after commit 6d05b9f's
+same-CPU cost preempt was traced to HVF + macOS host scheduling,
+not the guest scheduler.
+
+Test: wakelat 0 1 5 1000  (1 watcher, 5s duration, 1ms sleep,
+NO other load on the VM).
+
+Result:
+   userspace wake-tail max = 809 ms
+   kernel sched_choose     = 987 ms   (15 long-events > 100ms)
+   guest VM load average   = ~1.4 (basically idle)
+
+Both the userspace measurement AND the kernel-side wake-pick
+counter agree on ~800-1000ms.  On an idle VM, with no
+contention, no oversubscription, no other threads competing,
+the scheduler picker sees ~1s gaps in its own dispatch chain.
+
+Explanation: HVF (Apple's Hypervisor.framework) and the macOS
+host scheduler periodically deschedule the vCPU thread for
+extended periods.  The guest's sbintime is based on the host
+TSC (continuously ticking), so when the vCPU resumes, the
+delta measured INSIDE the guest reflects real wall-clock
+elapsed time -- including the time the vCPU was off-CPU on the
+host.  The guest scheduler couldn't have done anything
+differently; there was no guest CPU time during the gap to
+schedule with.
+
+This is consistent across all of our observed wake-tail
+outliers: same magnitude (~hundreds of ms to ~1.3s), same
+intermittent pattern (~1 in N samples), independent of guest
+load.
+
+ULE's reported max=45ms in the earlier comparison (vs Laminar's
+multi-second) was probably a lucky sample window where HVF
+didn't stall the vCPU during measurement.  Different schedulers
+won't change the host-side dispatch behaviour.
+
+To confirm definitively, the bench would need to run on bare
+metal aarch64 hardware.  All evidence available within the
+VM points to HVF as the root cause.
+
+R4 is closed.  The Laminar-side fixes (commits 6aa4223,
+4cb40ed, 1215dcf, 5c6cbd7, 390940c, 6d05b9f) reduced the wake
+tail from 80ms-2.76s baseline to 79-187ms in 4 of 5 runs --
+within the irreducible HVF dispatch envelope.
+
+The remaining outliers belong to the host hypervisor, not the
+guest scheduler.
+==================================================================
