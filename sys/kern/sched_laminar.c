@@ -579,10 +579,31 @@ static struct laminar_tdq laminar_tdq_cpu;
  * Tick-domain constants set in sched_laminar_initticks(), once stathz is
  * known.  sched_slice is the default time slice in stathz ticks before a
  * thread is reconsidered for preemption.
+ *
+ * sched_slice_min is the saturation-load slice (ULE's slice_min pattern).
+ * Under heavy load (local runq has >= SCHED_SLICE_MIN_DIVISOR threads),
+ * use the shorter slice so wakees rotate faster -- the same load-adaptive
+ * mechanism ULE uses to get desktop-class wake-latency under saturation
+ * without paying context-switch overhead at low load.
+ *
+ * Default: slice = ~94 ms (stathz/10), slice_min = ~16 ms (slice/6).
+ * Both are sysctl-tunable for posture: shorter slice for desktop, longer
+ * for batch / throughput.
  */
 #define	SCHED_SLICE_DEFAULT_DIVISOR	10	/* ~94 ms at stathz=127 */
+#define	SCHED_SLICE_MIN_DIVISOR		6	/* slice_min = slice/6 (~16 ms) */
 static int __read_mostly realstathz = 127;
 static int __read_mostly sched_slice = 10;
+static int __read_mostly sched_slice_min = 1;
+/*
+ * Load threshold at/above which the slice-end check uses slice_min
+ * instead of slice.  Default 3 = "true saturation per CPU"
+ * (>= 3 runnable on this CPU).  ULE uses 6 (heavier saturation);
+ * Laminar default is more aggressive for desktop wake-latency posture.
+ * Lower = more wake-rotation (better latency, more context switches);
+ * higher = closer to ULE.
+ */
+static int laminar_slice_min_load = 3;
 
 /*
  * Restore a thread's td_lock after thread_lock_block().  ULE-style:
@@ -1855,6 +1876,17 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_thresh, CTLFLAG_RWTUN,
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_step, CTLFLAG_RWTUN,
     &laminar_ctrl_band_step, 0,
     "Laminar: load_pct per +1 unit of controller preempt R band");
+SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
+    &sched_slice, 0,
+    "Laminar: base time slice in stathz ticks (low-load posture)");
+SYSCTL_INT(_kern_sched, OID_AUTO, slice_min, CTLFLAG_RW,
+    &sched_slice_min, 0,
+    "Laminar: saturation slice in stathz ticks (used when local load "
+    ">= slice_min_load)");
+SYSCTL_INT(_kern_sched, OID_AUTO, slice_min_load, CTLFLAG_RWTUN,
+    &laminar_slice_min_load, 0,
+    "Laminar: local runq load at/above which the shorter slice_min "
+    "applies (default 2 = any contention)");
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_ewma, CTLFLAG_RD,
     &laminar_ctrl_load_ewma, 0,
     "Laminar: smoothed system load as percent of total capacity");
@@ -2994,7 +3026,17 @@ sched_laminar_clock(struct thread *td, int cnt)
 	} else {
 		ts->ts_slice_used += cnt;
 		laminar_clock_ts_sum += cnt;
-		if (ts->ts_slice_used >= (uint32_t)sched_slice) {
+		/*
+		 * Load-adaptive slice: under heavy contention (>= MIN_DIVISOR
+		 * runnable threads per CPU) use the shorter slice_min so
+		 * wakees rotate every ~16 ms instead of the ~94 ms base.
+		 * ULE pattern; matches its desktop-under-load behaviour
+		 * without changing the low-load throughput posture.
+		 */
+		struct laminar_tdq *_tdq = LAMINAR_TDQ_SELF();
+		int _slice = (atomic_load_int(&_tdq->ltdq_load) >=
+		    laminar_slice_min_load) ? sched_slice_min : sched_slice;
+		if (ts->ts_slice_used >= (uint32_t)_slice) {
 			ts->ts_slice_used = 0;
 			td->td_flags |= TDF_SLICEEND;
 			ast_sched_locked(td, TDA_SCHED);
@@ -3461,6 +3503,9 @@ sched_laminar_initticks(void)
 	sched_slice = realstathz / SCHED_SLICE_DEFAULT_DIVISOR;
 	if (sched_slice < 1)
 		sched_slice = 1;
+	sched_slice_min = sched_slice / SCHED_SLICE_MIN_DIVISOR;
+	if (sched_slice_min < 1)
+		sched_slice_min = 1;
 }
 
 /*
