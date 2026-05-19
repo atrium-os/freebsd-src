@@ -167,20 +167,26 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
  *   G(s) = ---------------
  *           1 + s * tau_p
  *
- * Discrete form maintains the existing LP plus one new state variable
- * (prev_input):
+ * Discrete form composes with whatever LP the caller already runs.
+ * The helper keeps one new state variable (prev_input) and returns
+ * just the lead term; callers add it to their own LP-filtered value:
  *
- *   delta  = x - state->prev_input
- *   ewma   = round_div(OLD * ewma + NEW * x, DEN)    -- standard LP
- *   output = ewma + (K_d * delta) / LEAD_DEN          -- + lead term
+ *   delta      = x - state->prev_input
+ *   lead_term  = (K_d * delta) / LEAD_DEN
  *   prev_input = x
+ *   output     = caller_lp + lead_term
+ *
+ * Keeping the helper LP-agnostic lets different sites pick their own
+ * pole (ctrl_load_ewma uses 3:1 for patient park/unpark; signal_ewma
+ * uses 1:1 for responsive balance ranking) without forcing a single
+ * shape on all of them.
  *
  * K_d / LEAD_DEN is the lead gain.  Default 4/8 = 0.5 ⇒ output is
- * pushed halfway from EWMA toward x on each step.  With K_d=0 the
- * filter is exactly the pre-existing EWMA.  K_d > LEAD_DEN causes
- * overshoot (under-damped); under-damping is fine for fast actuators
- * (band) but undesirable for slow ones (park/unpark hysteresis), so
- * each site picks its own K_d.
+ * pushed halfway toward x on each step in addition to the LP response.
+ * With K_d=0 the lead term is 0 and the output equals the LP exactly
+ * (back-compat).  K_d > LEAD_DEN causes overshoot (under-damped);
+ * under-damping is fine for fast actuators (band) but undesirable for
+ * slow ones (park/unpark hysteresis), so each site picks its own K_d.
  *
  * Settled-input behaviour is identical to the pure EWMA: delta = 0,
  * lead term = 0, output = ewma.  No new tuning is required to preserve
@@ -189,30 +195,34 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
 #define	LAMINAR_LEAD_DEN		8
 #define	LAMINAR_LEAD_KD_DEFAULT		4	/* 4/8 = 0.5 (no overshoot) */
 
+/*
+ * The state is just the previous input; the caller keeps its own LP
+ * (different sites use different pole values -- 1:1 for signal_ewma,
+ * 3:1 for ctrl_load_ewma -- and we want this helper to compose with
+ * any of them).  laminar_lead_term computes only the derivative
+ * contribution; callers add it to their existing LP-filtered value to
+ * get the full lead-compensated output.
+ */
 struct laminar_lead_state {
 	int	prev_input;	/* x[n-1] */
-	int	ewma;		/* low-pass component (existing EWMA shape) */
 };
 
 static __inline int
-laminar_lead_ewma_update(struct laminar_lead_state *s, int x, int kd)
+laminar_lead_term(struct laminar_lead_state *s, int x, int kd)
 {
 	int delta = x - s->prev_input;
 	int lead;
 
-	s->ewma = (LAMINAR_EWMA_OLD * s->ewma + LAMINAR_EWMA_NEW * x +
-	    LAMINAR_EWMA_DEN / 2) / LAMINAR_EWMA_DEN;
 	s->prev_input = x;
 	/*
-	 * Round-to-nearest on the lead term, handling negative delta.
-	 * The bias term is signed-correct so the rounding is symmetric.
+	 * Round-to-nearest, signed-correct for negative delta.
 	 */
 	lead = kd * delta;
 	if (lead >= 0)
 		lead = (lead + LAMINAR_LEAD_DEN / 2) / LAMINAR_LEAD_DEN;
 	else
 		lead = (lead - LAMINAR_LEAD_DEN / 2) / LAMINAR_LEAD_DEN;
-	return (s->ewma + lead);
+	return (lead);
 }
 
 /*
@@ -1902,6 +1912,16 @@ static int laminar_ctrl_band_max = 4;		/* clamp band per CPU */
 static int laminar_ctrl_band_thresh = 100;	/* load_pct floor */
 static int laminar_ctrl_band_step = 25;		/* load_pct per band unit */
 
+/*
+ * Lead-compensation state for the band signal (RLC L term).  The
+ * existing 3:1 LP on laminar_ctrl_load_ewma is the C; this adds the L.
+ * Park/unpark continue to read the bare ewma (patient signal) -- only
+ * the band reads (ewma + lead_term), so cold-start band-up is instant
+ * without changing park/unpark dynamics.
+ */
+static struct laminar_lead_state laminar_ctrl_load_lead;
+static int laminar_ctrl_load_lead_kd = LAMINAR_LEAD_KD_DEFAULT;
+
 /* Observability + state (all single-controller for now). */
 static int laminar_ctrl_load_ewma;
 static int laminar_ctrl_park_streak;
@@ -1951,6 +1971,11 @@ SYSCTL_INT(_kern_sched, OID_AUTO, slice_min_load, CTLFLAG_RWTUN,
     &laminar_slice_min_load, 0,
     "Laminar: local runq load at/above which the shorter slice_min "
     "applies (default 2 = any contention)");
+SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_lead_kd, CTLFLAG_RWTUN,
+    &laminar_ctrl_load_lead_kd, 0,
+    "Laminar: lead-compensation K_d (0..LAMINAR_LEAD_DEN, default 4) "
+    "applied to load_pct for the band path.  0 = pure LP (back-compat), "
+    "LEAD_DEN = fully proportional (no smoothing), >LEAD_DEN = overshoot");
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_load_ewma, CTLFLAG_RD,
     &laminar_ctrl_load_ewma, 0,
     "Laminar: smoothed system load as percent of total capacity");
@@ -2000,6 +2025,14 @@ laminar_ctrl_cb(void *arg __unused)
 	load_pct = total_load * 100 / n_unparked;
 	/* EWMA smoothing (3:1 like the balancer's signal). */
 	laminar_ctrl_load_ewma = (3 * laminar_ctrl_load_ewma + load_pct) / 4;
+	/*
+	 * Lead term (the L in RLC) on the same load_pct input.  Park/unpark
+	 * keep reading the bare ewma (patient); the band reads
+	 * load_lead_compensated for fast transient response.
+	 */
+	int load_lead_offset = laminar_lead_term(&laminar_ctrl_load_lead,
+	    load_pct, laminar_ctrl_load_lead_kd);
+	int load_lead_compensated = laminar_ctrl_load_ewma + load_lead_offset;
 
 	/*
 	 * Emergency unpark: a raw load_pct way above setpoint means
@@ -2013,28 +2046,27 @@ laminar_ctrl_cb(void *arg __unused)
 	 */
 	if (laminar_ctrl_emergency > 0 &&
 	    load_pct > laminar_ctrl_emergency && n_parked > 0) {
+		/*
+		 * Emergency unpark: a burst arrived against a parked set.
+		 * Unpark all parked CPUs in one tick, bypassing patience.
+		 * The band's own cold-start used to need a separate fast
+		 * path here -- the L term on load_lead_compensated now
+		 * handles it without a special case (RLC residuals plan).
+		 */
 		CPU_FOREACH(cpu) {
 			tdq = LAMINAR_TDQ_CPU(cpu);
 			if (atomic_load_int(&tdq->ltdq_resistance_power) > 0)
 				atomic_store_int(&tdq->ltdq_resistance_power, 0);
-			/*
-			 * Emergency fast-path also pulls the preempt band up
-			 * to max immediately on every CPU, bypassing the
-			 * EWMA smoother.  Without this, the first 2-3
-			 * controller ticks of a bench cold-start run with
-			 * band=0 -- wakees hit the slice quantum and the
-			 * watchdog tail extends multi-second while threads
-			 * migrate to the just-unparked CPUs.  The same
-			 * eager-actuation reasoning that justifies emergency
-			 * unpark over the patience-gated path applies here.
-			 */
-			if (laminar_ctrl_band_enable)
-				atomic_store_int(&tdq->ltdq_ctrl_preempt_band,
-				    laminar_ctrl_band_max);
 		}
 		laminar_ctrl_unpark_streak = 0;
 		laminar_ctrl_park_streak = 0;
-		goto reschedule;
+		/*
+		 * Fall through to the band-update block below so the just-
+		 * unparked CPUs get a non-zero ctrl_preempt_band on this
+		 * same tick (driven by load_lead_compensated, which already
+		 * reflects the burst).  Without this fallthrough, the band
+		 * stayed at 0 until the next controller tick.
+		 */
 	}
 
 	upper = laminar_ctrl_headroom + laminar_ctrl_deadband;
@@ -2078,7 +2110,7 @@ laminar_ctrl_cb(void *arg __unused)
 	 */
 	if (laminar_ctrl_band_enable) {
 		int band_target = 0;
-		int load_for_band = laminar_ctrl_load_ewma;
+		int load_for_band = load_lead_compensated;
 		if (load_for_band > laminar_ctrl_band_thresh &&
 		    laminar_ctrl_band_step > 0) {
 			band_target = (load_for_band - laminar_ctrl_band_thresh) /
