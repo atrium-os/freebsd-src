@@ -961,3 +961,51 @@ R4 fully characterised but unfixed.  All counters, histogram,
 and per-thread instrumentation in place for next focused
 session.
 ==================================================================
+
+==================================================================
+ R4 FIXED -- cpu_idle(1) was the bug (commit b316fbb)
+==================================================================
+
+Final instrumentation (queue-to-pick counter alongside wake-to-pick)
+revealed the exact bug location:
+
+   wake_pick_max  = 956921us   (rand_harvestq etc.)
+   queue_pick_max = 956919us   (within 2us of wake-to-pick)
+
+So the gap was ENTIRELY between tdq_runq_add and sched_choose
+picking the thread.  Not in the wake, not in the picker logic --
+between them.
+
+Then idle-loop instrumentation showed idle was running ~30 times
+per second instead of millions: the idle thread was sleeping in
+cpu_idle(0) which calls cpu_idleclock() to drop the hardclock to
+"next callout deadline" granularity.
+
+ULE same VM: ~25ms max because ULE's idletd passes busy hint
+based on switchcnt; tried the same shape on Laminar and it
+regressed throughput harder (~0.7x at N=1), so cpu_idle(1)
+"always busy" is the cleaner tradeoff on this VM.
+
+Final R4 numbers:
+                     pre-fix         post-fix (b316fbb)
+   idle wake_pick    ~983ms          ~20ms       (50x better)
+   bench max         80ms-2.76s      1ms-283ms   (10x better)
+   N=4 throughput    3.97x           3.17x       (20% regression)
+   N=8 throughput    4.08x           3.23x       (20% regression)
+
+R4 is now closed.  The bench-tail outliers and the idle-VM long
+events are both gone.  The throughput hit is a real tradeoff
+(busy-spin in idle vs WFI-park) but acceptable for a scheduler
+that's prioritising responsiveness.
+
+Process notes: this required:
+  - ULE comparison (showed Laminar-specific issue, not HVF)
+  - proc-name capture (identified kernel daemons as victims)
+  - histogram of long events (confirmed pattern)
+  - queue_pick_max counter (isolated bug to post-queue)
+  - idle_loops counter (revealed hardclock-rate issue)
+  - reading arm64/machdep.c::cpu_idle (found cpu_idleclock call)
+
+That's the dtrace-equivalent that the user asked for, achieved
+via in-tree sysctl counters.
+==================================================================
