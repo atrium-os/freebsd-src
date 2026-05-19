@@ -1127,8 +1127,16 @@ laminar_signal(struct laminar_tdq *tdq)
 
 	sample = laminar_scaled_cost(tdq);
 	prev = atomic_load_int(&tdq->ltdq_signal_ewma);
-	ema = (LAMINAR_EWMA_OLD * prev + LAMINAR_EWMA_NEW * sample) /
-	    LAMINAR_EWMA_DEN;
+	/*
+	 * Round-to-nearest, not truncate.  Plain integer truncation gets
+	 * stuck on rising integer transitions: prev=0 sample=2 yields
+	 * (0+2)/2=1, then (1+2)/2=1, ema never reaches 2.  A persistent
+	 * load=2 vs load=0 imbalance ends up gap=1 < threshold=2 and
+	 * the balancer never fires -- this was the bench_fair bimodal
+	 * pattern (50% of N=4 runs at >60% spread, balancer stuck).
+	 */
+	ema = (LAMINAR_EWMA_OLD * prev + LAMINAR_EWMA_NEW * sample +
+	    LAMINAR_EWMA_DEN / 2) / LAMINAR_EWMA_DEN;
 	atomic_store_int(&tdq->ltdq_signal_ewma, ema);
 	return (ema);
 }
@@ -1222,12 +1230,21 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 		/*
 		 * Fast path: ts_cpu is idle (load == 0), unparked, and
 		 * NUMA-local.  Skipping the global scan here matters most
-		 * for forks/wakeups onto an idle parent; with load > 0
-		 * we must scan, otherwise N children of one parent pile
-		 * onto a single CPU and the balancer takes seconds to
-		 * spread them (DESIGN.md §1 trade).
+		 * for wakeups onto an idle parent.
+		 *
+		 * IMPORTANT: skip this for newly-created threads
+		 * (td_lastcpu == NOCPU).  In a tight fork() loop, child N+1's
+		 * pickcpu reads load(ts_cpu) before child N's tdq_add has
+		 * incremented it, so siblings race onto the same CPU even
+		 * though one of them has already been placed there.  The
+		 * balancer then has multiple ticks of work to undo it, and
+		 * bench_fair's 5s window can run out before placement
+		 * converges -- this was the bimodal pattern (50% of N=4
+		 * runs perfectly fair, 50% at 60%+ spread with one starved
+		 * thread).  Forks always do the full scan.
 		 */
-		if (atomic_load_int(&_ts_tdq->ltdq_load) == 0 &&
+		if (td->td_lastcpu != NOCPU &&
+		    atomic_load_int(&_ts_tdq->ltdq_load) == 0 &&
 		    atomic_load_int(&_ts_tdq->ltdq_resistance) == 0 &&
 		    atomic_load_int(&_ts_tdq->ltdq_resistance_power) == 0 &&
 		    laminar_numa_cost(td, ts_cpu) == 0)
