@@ -603,6 +603,7 @@ extern u_long laminar_lag_cap;
 extern u_long laminar_preempt_cooldown;
 extern u_long laminar_wake_pick_max_us;
 extern u_long laminar_wake_pick_long_count;
+extern char   laminar_wake_pick_max_comm[16];
 extern u_long laminar_choose_calls;
 extern u_long laminar_slice_ends;
 extern u_long laminar_wake_picks;
@@ -2719,12 +2720,17 @@ sched_laminar_choose(void)
 			sbintime_t now = sbinuptime();
 			sbintime_t delta = now - ts->ts_wake_ts;
 			/* sbintime: seconds<<32 | fraction.  *1e6>>32 = us. */
-			uint64_t delay_us = (uint64_t)
+			uint64_t delay_us = delta < 0 ? 0 : (uint64_t)
 			    (((uint64_t)delta * 1000000ULL) >> 32);
 
 			laminar_wake_picks++;
-			if (delay_us > laminar_wake_pick_max_us)
+			if (delay_us > laminar_wake_pick_max_us) {
 				laminar_wake_pick_max_us = delay_us;
+				/* Capture the proc name for diagnosis. */
+				strlcpy(laminar_wake_pick_max_comm,
+				    td->td_proc->p_comm,
+				    sizeof(laminar_wake_pick_max_comm));
+			}
 			if (delay_us > LAMINAR_WAKE_LONG_US)
 				laminar_wake_pick_long_count++;
 			ts->ts_wake_ts = 0;
@@ -2869,6 +2875,7 @@ u_long laminar_lag_cap = 1000000;
  */
 u_long laminar_wake_pick_max_us = 0;
 u_long laminar_wake_pick_long_count = 0;
+char   laminar_wake_pick_max_comm[16] = "";
 /* Picker chain instrumentation for R4 root-cause. */
 u_long laminar_choose_calls = 0;	/* sched_choose invocations */
 u_long laminar_slice_ends = 0;		/* TDF_SLICEEND fired */
@@ -2899,6 +2906,9 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_max_us, CTLFLAG_RW,
 SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
     &laminar_wake_pick_long_count, 0,
     "Laminar: count of wake-to-on-cpu delays exceeding 100ms.  Write 0 to reset.");
+SYSCTL_STRING(_kern_sched, OID_AUTO, wake_pick_max_comm, CTLFLAG_RD,
+    laminar_wake_pick_max_comm, sizeof(laminar_wake_pick_max_comm),
+    "Laminar: proc name of the thread that hit wake_pick_max_us.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, choose_calls, CTLFLAG_RW,
     &laminar_choose_calls, 0,
     "Laminar: sched_choose invocations since reset.  Write 0 to reset.");
