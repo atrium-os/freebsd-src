@@ -1047,3 +1047,60 @@ R4 IS PROPERLY CLOSED.  Both axes preserved:
   - wake-tail: 983ms -> 20ms (50x better, R4 fix)
   - throughput: 3.97 -> 3.81-3.95 (within bench noise)
 ==================================================================
+
+==================================================================
+ R4 follow-up: is_timeshare priority filter (5e754d3) verification
+==================================================================
+
+After the cpu_idle(1) fix above, a deeper R4 root cause was
+identified: laminar_is_timeshare() only checked td_pri_class,
+not td_priority.  Kernel daemons created via kproc_create1()
+(pagedaemon, rand_harvestq, bufdaemon, etc.) inherit
+td_pri_class=PRI_TIMESHARE from thread0 but get td_priority=PVM
+(41 -- kernel range).  Pre-fix they went into the SoA vruntime
+picker where their kernel priority was ignored; under spin=8
+contention spinners' lower vruntimes won and daemons stalled
+for seconds.
+
+Fix: gate is_timeshare on BOTH class AND priority:
+    PRI_BASE(td->td_pri_class) == PRI_TIMESHARE &&
+    td->td_priority >= PRI_MIN_TIMESHARE
+
+Verification -- 5 latency runs (spin=8 watch=4 T=5s) post-fix:
+    run 1: max=2391ms  <-- residual
+    run 2: max=91ms
+    run 3: max=91ms
+    run 4: max=94ms
+    run 5: max=94ms
+
+p99.9 across runs: 50-64ms (run 1 also has 50ms outlier in
+p99.9; only the single absolute max breaks).
+
+Counter snapshot after all 5 runs:
+    wake_pick_max_us:        94472  (wakelat)
+    queue_pick_max_us:       94969  (kernel)
+    wake_pick_long_count:    0
+    cp_ipi:                  0      (same-CPU preempt unused)
+    cp_skip_idle:            5036
+    cp_skip_owe:             607
+    cp_skip_cool:            47
+
+The 2.39s outlier in run 1 was NOT captured by wake-pick
+instrumentation (which capped at 94ms), implying it was not a
+wake-pick stall.  Likely candidates:
+  - callout-fire delay on a hardclock-deprived CPU (spinners
+    pinning all cores, hardclock missing ticks)
+  - fork/exec scheduling delay at bench start
+  - HVF host-side stall correlated with run start
+
+Status: R4 is substantially better (1-in-5 multi-second outlier
+vs prior 3-in-10), and the dominant kernel-daemon-stall pathway
+is closed.  A residual ~1/5 outlier at the highest contention
+remains; chasing it requires either kernel tracing of the
+callout subsystem or HVF-side observability.
+
+User confirmed: this is also the most likely cause of historical
+ssh instability during heavy sched-laminar benching -- sshd /
+TCP-timer / network kthreads are all PRI_TIMESHARE+PVM daemons
+that would have been mis-classified into SoA pre-fix.
+==================================================================
