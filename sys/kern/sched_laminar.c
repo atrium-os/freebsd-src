@@ -1904,6 +1904,20 @@ laminar_ctrl_cb(void *arg __unused)
 			tdq = LAMINAR_TDQ_CPU(cpu);
 			if (atomic_load_int(&tdq->ltdq_resistance_power) > 0)
 				atomic_store_int(&tdq->ltdq_resistance_power, 0);
+			/*
+			 * Emergency fast-path also pulls the preempt band up
+			 * to max immediately on every CPU, bypassing the
+			 * EWMA smoother.  Without this, the first 2-3
+			 * controller ticks of a bench cold-start run with
+			 * band=0 -- wakees hit the slice quantum and the
+			 * watchdog tail extends multi-second while threads
+			 * migrate to the just-unparked CPUs.  The same
+			 * eager-actuation reasoning that justifies emergency
+			 * unpark over the patience-gated path applies here.
+			 */
+			if (laminar_ctrl_band_enable)
+				atomic_store_int(&tdq->ltdq_ctrl_preempt_band,
+				    laminar_ctrl_band_max);
 		}
 		laminar_ctrl_unpark_streak = 0;
 		laminar_ctrl_park_streak = 0;
