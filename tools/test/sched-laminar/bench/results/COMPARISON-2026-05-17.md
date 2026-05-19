@@ -908,3 +908,56 @@ Given budget, leaving R4 narrowed but unfixed.  All other
 residuals (R1-R3, R5) closed properly.  R4 is well-characterised
 now -- a focused future investigation should land the fix.
 ==================================================================
+
+==================================================================
+ R4 deeper trace: notify_ipi=0, all wakes are SAME-CPU
+==================================================================
+
+Critical counter observation during 5s idle window:
+   wake_picks            = 336
+   choose_calls          = 519
+   notify_ipi            = 0           <- NO cross-CPU IPIs
+   cp_ipi                = 0
+   wake_pick_max_us      = 985706
+   wake_pick_max_comm    = bufdaemon
+   wake_pick_long_count  = 21
+
+ALL 336 wakes took the SAME-CPU path (cpu == PCPU_GET(cpuid)).
+No cross-CPU IPIs.  This means:
+   callout fires on CPU X (hardclock interrupt context)
+   curthread on X = idle thread (interrupted)
+   sched_wakeup runs on X for bufdaemon
+   pickcpu returns ts_cpu (= X, soft affinity)
+   tdq_add_internal increments ltdq_load[X]
+   setpreempt sets AST on idle thread
+
+After hardclock returns, idle thread resumes:
+   cpu_idle (WFI) returns immediately (HVF doesn't park)
+   while-loop: atomic_load_int(ltdq_load) == 0?
+   If load was incremented, should be > 0, exit, mi_switch
+
+The whole chain SHOULD be <10us yet some wakes take 985ms.
+
+Suspects:
+  1. ltdq_load increment not visible to idle's atomic_load_int
+     immediately (memory ordering)
+  2. Idle's while-loop somehow doesn't re-check load promptly
+     (compiler optimisation? cpu_idle interrupt handling?)
+  3. mi_switch path from idle has a Laminar-specific slow path
+     (some lock contention?)
+  4. ts_wake_ts measurement captures a stale time from some path
+     (fork-time? unmeasured-wake-path? I can't find it)
+
+ULE's sched_choose is structurally identical to Laminar's.
+ULE's idle loop has the same shape.  Yet ULE bounded at 25ms.
+
+This is the limit of black-box debug.  Next investigation needs:
+  - dtrace on specific bufdaemon thread tracking
+    setrunnable -> sched_wakeup -> tdq_add_internal ->
+    setpreempt -> AST -> idle exit -> mi_switch -> sched_choose
+    with timestamps at each step.
+
+R4 fully characterised but unfixed.  All counters, histogram,
+and per-thread instrumentation in place for next focused
+session.
+==================================================================
