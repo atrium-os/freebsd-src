@@ -852,3 +852,59 @@ artifact remains to be confirmed.
 R4 narrows: it's specifically the kernel-thread wake path
 that Laminar handles differently from ULE.
 ==================================================================
+
+==================================================================
+ R4 narrowing further: bufdaemon/pagedaemon/clock kthreads
+==================================================================
+
+Long-event histogram by proc name (kern.sched.long_log) on
+idle Laminar VM, ~10s window:
+
+  clock=300        (per-CPU softclock, IWAIT path)
+  pagedaemon=406   (VM, msleep)
+  bufdaemon=405    (buffer cache, msleep hz timeout)
+  rand_harvestq=206
+  intr=162
+  zfskern=156, zfs=142, kernel=152
+  sh=116, vnlru=40, syncer=73
+
+ALL kernel threads (or system daemons).  ULE on same VM: ~25ms
+max for the same workload mix.
+
+These kthreads run at kernel priority (PVM = 41 < PRI_MIN_TIMESHARE
+56), so tdq_choose's `if (rt->td_priority < PRI_MIN_TIMESHARE)
+return rt` path SHOULD return them directly (before consulting
+the SoA timeshare picker).  Yet they wait ~1s for pick on idle VM.
+
+Comparison with ULE's tdq_choose:
+  ULE: runq_choose_realtime -> runq_choose_timeshare -> runq_choose_idle
+  Laminar: runq_choose -> if priority < TIMESHARE return rt,
+                          else SoA pick, else return rt (idle/NULL)
+
+Logic should be equivalent.  Both return RT (kernel-priority
+threads) ahead of SoA picks.
+
+Theory in question: sched_choose IS called on bufdaemon's CPU
+within microseconds (idle loop checks ltdq_load every iteration
+and exits to mi_switch when load > 0).  Idle thread WFI returns
+immediately on HVF.  Yet measured delay is ~1s.
+
+Possibilities not yet ruled out:
+  - Race in my ts_wake_ts measurement that's specific to
+    kernel-priority thread paths
+  - Idle->mi_switch path has additional Laminar-side logic
+    that takes long under some condition
+  - The "wake" actually fires multiple times rapidly with the
+    timer callout retrying; ts_wake_ts overwritten but pick
+    happens much later
+
+Sessions to spend more effort on this:
+  1. Add per-CPU per-thread "queued duration" measurement via
+    tdq_runq_add timestamp (independent of ts_wake_ts)
+  2. ktrace the bufdaemon process to see actual wake/run pattern
+  3. Compare exact mi_switch path between ULE and Laminar
+
+Given budget, leaving R4 narrowed but unfixed.  All other
+residuals (R1-R3, R5) closed properly.  R4 is well-characterised
+now -- a focused future investigation should land the fix.
+==================================================================
