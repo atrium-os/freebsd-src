@@ -604,6 +604,9 @@ extern u_long laminar_preempt_cooldown;
 extern u_long laminar_wake_pick_max_us;
 extern u_long laminar_wake_pick_long_count;
 extern char   laminar_wake_pick_max_comm[16];
+#define LAMINAR_LONG_LOG	16
+extern char   laminar_long_log[LAMINAR_LONG_LOG][16];
+extern u_long laminar_long_log_count[LAMINAR_LONG_LOG];
 extern u_long laminar_choose_calls;
 extern u_long laminar_slice_ends;
 extern u_long laminar_wake_picks;
@@ -2726,13 +2729,33 @@ sched_laminar_choose(void)
 			laminar_wake_picks++;
 			if (delay_us > laminar_wake_pick_max_us) {
 				laminar_wake_pick_max_us = delay_us;
-				/* Capture the proc name for diagnosis. */
 				strlcpy(laminar_wake_pick_max_comm,
 				    td->td_proc->p_comm,
 				    sizeof(laminar_wake_pick_max_comm));
 			}
-			if (delay_us > LAMINAR_WAKE_LONG_US)
+			if (delay_us > LAMINAR_WAKE_LONG_US) {
+				int idx;
+				const char *comm = td->td_proc->p_comm;
+				bool found = false;
+
 				laminar_wake_pick_long_count++;
+				/* Aggregate count by comm. */
+				for (idx = 0; idx < LAMINAR_LONG_LOG; idx++) {
+					if (laminar_long_log[idx][0] == '\0')
+						break;
+					if (strcmp(laminar_long_log[idx],
+					    comm) == 0) {
+						laminar_long_log_count[idx]++;
+						found = true;
+						break;
+					}
+				}
+				if (!found && idx < LAMINAR_LONG_LOG) {
+					strlcpy(laminar_long_log[idx], comm,
+					    sizeof(laminar_long_log[idx]));
+					laminar_long_log_count[idx] = 1;
+				}
+			}
 			ts->ts_wake_ts = 0;
 		}
 		/*
@@ -2876,6 +2899,9 @@ u_long laminar_lag_cap = 1000000;
 u_long laminar_wake_pick_max_us = 0;
 u_long laminar_wake_pick_long_count = 0;
 char   laminar_wake_pick_max_comm[16] = "";
+/* Histogram of long-wake-pick events by comm.  Simple linear array. */
+char   laminar_long_log[LAMINAR_LONG_LOG][16];
+u_long laminar_long_log_count[LAMINAR_LONG_LOG];
 /* Picker chain instrumentation for R4 root-cause. */
 u_long laminar_choose_calls = 0;	/* sched_choose invocations */
 u_long laminar_slice_ends = 0;		/* TDF_SLICEEND fired */
@@ -2909,6 +2935,28 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
 SYSCTL_STRING(_kern_sched, OID_AUTO, wake_pick_max_comm, CTLFLAG_RD,
     laminar_wake_pick_max_comm, sizeof(laminar_wake_pick_max_comm),
     "Laminar: proc name of the thread that hit wake_pick_max_us.");
+
+static int
+laminar_long_log_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	int i, err;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	for (i = 0; i < LAMINAR_LONG_LOG; i++) {
+		if (laminar_long_log[i][0] == '\0')
+			break;
+		sbuf_printf(&sb, "%s=%lu\n", laminar_long_log[i],
+		    laminar_long_log_count[i]);
+	}
+	err = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (err);
+}
+SYSCTL_PROC(_kern_sched, OID_AUTO, long_log,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_long_log_sysctl, "A",
+    "Laminar: long-wake-pick event histogram by proc name.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, choose_calls, CTLFLAG_RW,
     &laminar_choose_calls, 0,
     "Laminar: sched_choose invocations since reset.  Write 0 to reset.");
