@@ -818,7 +818,24 @@ static __inline bool
 laminar_is_timeshare(struct thread *td)
 {
 
-	return (PRI_BASE(td->td_pri_class) == PRI_TIMESHARE);
+	/*
+	 * Class AND numeric priority must both indicate timeshare.
+	 * Kernel daemons (pagedaemon, bufdaemon, rand_harvestq, etc.)
+	 * are created via kproc_create which sets td_pri_class to
+	 * PRI_TIMESHARE (inherited from thread0) but td_priority to
+	 * PVM (= 41, kernel-priority range).  Putting them in the
+	 * SoA timeshare picker means vruntime fairness IGNORES their
+	 * kernel priority -- spinners with lower vruntime got picked
+	 * over them, stranding pagedaemon/rand_harvestq for seconds
+	 * under heavy load.  This was the R4 root cause under load.
+	 *
+	 * Filter on priority too: only threads with priority in the
+	 * timeshare numeric range belong in SoA; kernel-priority
+	 * sleepers go to the priority-bucket runq where they are
+	 * picked ahead of timeshare by tdq_choose's rt-path.
+	 */
+	return (PRI_BASE(td->td_pri_class) == PRI_TIMESHARE &&
+	    td->td_priority >= PRI_MIN_TIMESHARE);
 }
 
 #ifdef SMP
