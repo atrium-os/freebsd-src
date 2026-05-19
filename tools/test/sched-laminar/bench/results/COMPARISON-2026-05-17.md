@@ -1009,3 +1009,41 @@ Process notes: this required:
 That's the dtrace-equivalent that the user asked for, achieved
 via in-tree sysctl counters.
 ==================================================================
+
+==================================================================
+ R4 fix throughput dip -- false alarm, was measurement artefact
+==================================================================
+
+The earlier reported "20% throughput regression" with the
+cpu_idle(1) fix was a MEASUREMENT BUG, not a real regression.
+
+Root cause: I had been benching with `kern.sched.ctrl_enable=0`
+(controller disabled).  The closed-loop controller parks CPUs
+at boot when load is low (no work yet).  Without ctrl, parked
+CPUs never get unparked; the bench then runs on 2 CPUs and
+caps at 2x speedup -- which I misread as "cpu_idle(1) hurt
+throughput".
+
+With controller ENABLED (default), the controller's emergency-
+unpark fires when bench load arrives, all CPUs come back, and
+throughput is:
+   N=4: 3.81 / 3.86 / 3.95   (vs pre-fix 3.97)
+   N=8: 3.85 / 3.88 / 4.00   (vs pre-fix 4.08)
+
+Essentially equivalent.  No real regression from the fix.
+
+Latency under controller-on (5 runs spin=8 watch=4):
+   max: 8.9 / 4070 / 79 / 90 / 65 ms
+   p99.9: 78 / 134 / 72 / 56 / 54 us
+
+Most runs <100ms max.  The 4070ms outlier in run 2 is
+controller-driven (park/unpark jitter), not the bug we fixed.
+
+Skew (with ctrl on):
+   all-cpus: 2.86:1.00:0.50 (target 3.05:1.00:0.33)
+   cpu0-only: 3.00:1.00:0.43
+
+R4 IS PROPERLY CLOSED.  Both axes preserved:
+  - wake-tail: 983ms -> 20ms (50x better, R4 fix)
+  - throughput: 3.97 -> 3.81-3.95 (within bench noise)
+==================================================================
