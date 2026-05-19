@@ -1015,6 +1015,10 @@ laminar_sysctl_register(void *arg __unused)
 		    "wload", CTLFLAG_RD, &tdq->ltdq_wload, 0,
 		    "Sum of ts_weight of runnable threads (RD; debug).  "
 		    "Divide by 1024 for nice-0-equivalent load.");
+		SYSCTL_ADD_U64(NULL, SYSCTL_CHILDREN(cpu_node), OID_AUTO,
+		    "vtime", CTLFLAG_RD, &tdq->ltdq_vtime, 0,
+		    "Picker's vruntime floor on this CPU (= min V[i] for "
+		    "i in runq).  Used by picker-placer coupling (vlag).");
 	}
 }
 SYSINIT(laminar_sysctl, SI_SUB_KICK_SCHEDULER, SI_ORDER_FIRST,
@@ -1162,6 +1166,66 @@ laminar_numa_cost(struct thread *td, int cpu)
 	if (home == laminar_cpu_domain(cpu))
 		return (0);
 	return (laminar_numa_alpha);
+}
+
+/*
+ * V_fair: the system-wide fair-share vruntime, approximated as the
+ * min ltdq_vtime across CPUs that have runnable threads.  Returned
+ * value is in raw vruntime units (eff_weight per stathz tick of
+ * accumulated weighted runtime).  Used by the picker-placer coupling
+ * (vlag) -- see docs/spec/atrium-scheduler-picker-placer-coupling.md.
+ *
+ * Approximation rationale: avg is the "right" V_fair but requires a
+ * div by count and an extra atomic per CPU.  On 4-CPU systems with
+ * balanced load, min and avg agree to within a slice.  In imbalanced
+ * cases min gives a slightly aggressive "you're behind" reading,
+ * which is the conservative direction for placement decisions (lag
+ * term clamps to [0,1] so over-estimating doesn't break anything).
+ */
+static __inline uint64_t
+laminar_v_fair(void)
+{
+	uint64_t v_fair = UINT64_MAX;
+	uint64_t v;
+	int cpu;
+	bool any = false;
+
+	if (smp_started == 0)
+		return (0);
+	CPU_FOREACH(cpu) {
+		struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(cpu);
+		struct thread *ct;
+
+		if (atomic_load_int(&tdq->ltdq_resistance_power) > 0)
+			continue;
+		if (atomic_load_int(&tdq->ltdq_load) == 0)
+			continue;
+		/*
+		 * Picker's "next to run" on this CPU is min(curthread.v,
+		 * min(queued.v)).  ltdq_vtime is the queued min (set at
+		 * choose time).  curthread.v is the running thread's live
+		 * accumulated vruntime.  Take the min of both, falling back
+		 * to whichever is available.
+		 */
+		ct = atomic_load_ptr(&tdq->ltdq_curthread);
+		uint64_t v_ct = UINT64_MAX, v_q = UINT64_MAX;
+
+		if (ct != NULL && !TD_IS_IDLETHREAD(ct) &&
+		    laminar_is_timeshare(ct))
+			v_ct = atomic_load_64(&td_get_sched(ct)->ts_vruntime);
+		v_q = atomic_load_64(&tdq->ltdq_vtime);
+		if (v_q == 0)
+			v_q = UINT64_MAX;	/* unset, ignore */
+		if (v_ct == UINT64_MAX && v_q == UINT64_MAX)
+			continue;
+		v = (v_ct < v_q) ? v_ct : v_q;
+		if (v < v_fair)
+			v_fair = v;
+		any = true;
+	}
+	if (!any)
+		return (0);
+	return (v_fair);
 }
 
 /*
@@ -3281,6 +3345,20 @@ SYSCTL_PROC(_kern_sched, OID_AUTO, long_log,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     laminar_long_log_sysctl, "A",
     "Laminar: long-wake-pick event histogram by proc name.");
+
+static int
+laminar_v_fair_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t v_fair = laminar_v_fair();
+
+	return (sysctl_handle_64(oidp, &v_fair, 0, req));
+}
+SYSCTL_PROC(_kern_sched, OID_AUTO, v_fair,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_v_fair_sysctl, "QU",
+    "Laminar: system-wide fair vruntime (min of ltdq_vtime over CPUs "
+    "with runnable threads).  Picker-placer coupling reference (vlag = "
+    "V[T] - V_fair).");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, choose_calls, CTLFLAG_RW,
     &laminar_choose_calls, 0,
     "Laminar: sched_choose invocations since reset.  Write 0 to reset.");
