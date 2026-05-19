@@ -643,3 +643,46 @@ within the irreducible HVF dispatch envelope.
 The remaining outliers belong to the host hypervisor, not the
 guest scheduler.
 ==================================================================
+
+==================================================================
+ RETRACTION: HVF hypothesis was wrong -- bug is Laminar-side
+==================================================================
+
+User asked to validate the HVF hypothesis by running the same
+idle wakelat under ULE on the same VM.  Built GENERIC kernel,
+booted with kern.sched.name="ULE" (both schedulers in the
+binary; runtime selectable via loader tunable).
+
+ULE same workload (1 watcher, 1ms sleep, 5s, 6 runs):
+   max: 108us, 25ms, 82us, 160us, 197us, 150us
+
+Laminar same workload, 1 run:
+   user max = 809ms
+   kernel sched_choose max = 987ms
+
+ULE worst max = 25ms.  Laminar = 987ms.  **40x gap.**
+
+If HVF were descheduling the vCPU for ~1s, ULE would see the
+same delay (it doesn't know about HVF either).  ULE bounded at
+25ms means the host dispatch is fine; the multi-second delay is
+inside Laminar's wake-pick path.
+
+The previous follow-up #6 conclusion that R4 is HVF is WRONG.
+The remaining outlier IS a Laminar bug.
+
+Suspects:
+  - My wake_pick instrumentation (ts_wake_ts measurement) could
+    be measuring stale timestamps in some corner case
+  - Inherited vruntime path may leave waker stranded above floor
+    in a state my DOWN clamp doesn't catch
+  - SoA picker may have a stale shard_min that prevents picking
+    the just-woken thread
+  - Counter atomic-add races (sub-millis effect at most though)
+
+Need to verify by:
+  1. Reproducing under Laminar with extra instrumentation
+  2. Comparing kernel sched_choose timing for Laminar vs ULE
+     (would need symmetric counters)
+
+R4 is NOT closed.  Reopening.
+==================================================================
