@@ -152,6 +152,70 @@ _Static_assert((LAMINAR_TS_CAP % LAMINAR_SHARD_SIZE) == 0,
 #define	LAMINAR_EWMA_DEN	(LAMINAR_EWMA_OLD + LAMINAR_EWMA_NEW)
 
 /*
+ * Lead-compensated EWMA (the "L" in RLC).  Every Laminar filter today
+ * is first-order (single EWMA pole = RC low-pass); a single pole forces
+ * a tradeoff between noise rejection and transient response.  The
+ * residual gaps to ULE after 2026-05-19 (cold-start wake-max, balancer
+ * lag, fork-time placement spill) are all the same fact: a first-order
+ * filter takes ~5 time constants to absorb a step input.
+ *
+ * Adding a zero to the transfer function -- a discrete lead compensator
+ * -- gives near-instant response to step changes without compromising
+ * steady-state smoothing.  Continuous-time:
+ *
+ *           1 + s * tau_d
+ *   G(s) = ---------------
+ *           1 + s * tau_p
+ *
+ * Discrete form maintains the existing LP plus one new state variable
+ * (prev_input):
+ *
+ *   delta  = x - state->prev_input
+ *   ewma   = round_div(OLD * ewma + NEW * x, DEN)    -- standard LP
+ *   output = ewma + (K_d * delta) / LEAD_DEN          -- + lead term
+ *   prev_input = x
+ *
+ * K_d / LEAD_DEN is the lead gain.  Default 4/8 = 0.5 ⇒ output is
+ * pushed halfway from EWMA toward x on each step.  With K_d=0 the
+ * filter is exactly the pre-existing EWMA.  K_d > LEAD_DEN causes
+ * overshoot (under-damped); under-damping is fine for fast actuators
+ * (band) but undesirable for slow ones (park/unpark hysteresis), so
+ * each site picks its own K_d.
+ *
+ * Settled-input behaviour is identical to the pure EWMA: delta = 0,
+ * lead term = 0, output = ewma.  No new tuning is required to preserve
+ * existing steady-state behaviour at any site.
+ */
+#define	LAMINAR_LEAD_DEN		8
+#define	LAMINAR_LEAD_KD_DEFAULT		4	/* 4/8 = 0.5 (no overshoot) */
+
+struct laminar_lead_state {
+	int	prev_input;	/* x[n-1] */
+	int	ewma;		/* low-pass component (existing EWMA shape) */
+};
+
+static __inline int
+laminar_lead_ewma_update(struct laminar_lead_state *s, int x, int kd)
+{
+	int delta = x - s->prev_input;
+	int lead;
+
+	s->ewma = (LAMINAR_EWMA_OLD * s->ewma + LAMINAR_EWMA_NEW * x +
+	    LAMINAR_EWMA_DEN / 2) / LAMINAR_EWMA_DEN;
+	s->prev_input = x;
+	/*
+	 * Round-to-nearest on the lead term, handling negative delta.
+	 * The bias term is signed-correct so the rounding is symmetric.
+	 */
+	lead = kd * delta;
+	if (lead >= 0)
+		lead = (lead + LAMINAR_LEAD_DEN / 2) / LAMINAR_LEAD_DEN;
+	else
+		lead = (lead - LAMINAR_LEAD_DEN / 2) / LAMINAR_LEAD_DEN;
+	return (s->ewma + lead);
+}
+
+/*
  * IPC affinity tunables (whitepaper §6).
  *   CONF_MIN: confidence threshold at which the dom_waker slot is
  *     trusted as the thread's IPC home.
