@@ -370,6 +370,9 @@ struct td_sched {
 					 * 0 if not pending pick.  Used to
 					 * measure wake-to-on-cpu delay for
 					 * R4 instrumentation. */
+	sbintime_t	ts_queue_ts;	/* timestamp at tdq_runq_add.
+					 * pick - queue = queue-to-cpu delay
+					 * (excludes wake-to-queue time). */
 	/* NUMA (whitepaper §8). */
 	uint16_t	ts_home_node_conf;
 	int16_t		ts_home_node;	/* -1 = unset. */
@@ -603,7 +606,9 @@ extern u_long laminar_lag_cap;
 extern u_long laminar_preempt_cooldown;
 extern u_long laminar_wake_pick_max_us;
 extern u_long laminar_wake_pick_long_count;
+extern u_long laminar_queue_pick_max_us;
 extern char   laminar_wake_pick_max_comm[16];
+extern char   laminar_queue_pick_max_comm[16];
 #define LAMINAR_LONG_LOG	16
 extern char   laminar_long_log[LAMINAR_LONG_LOG][16];
 extern u_long laminar_long_log_count[LAMINAR_LONG_LOG];
@@ -952,6 +957,7 @@ tdq_runq_add(struct laminar_tdq *tdq, struct thread *td, int flags)
 	 * sched_rem callers (including the balancer) assert TD_ON_RUNQ.
 	 */
 	TD_SET_RUNQ(td);
+	td_get_sched(td)->ts_queue_ts = sbinuptime();
 	if (laminar_is_timeshare(td))
 		laminar_slot_insert(tdq, td);
 	else
@@ -2529,6 +2535,8 @@ u_long laminar_local_preempt_fires = 0;
 u_long laminar_clock_calls = 0;
 u_long laminar_clock_idle_calls = 0;
 u_long laminar_clock_ts_sum = 0;
+u_long laminar_idle_exits = 0;	/* idle while loop saw load > 0 and exited */
+u_long laminar_idle_loops = 0;	/* total idle loop iterations */
 u_long laminar_local_preempt_skip_cool = 0;
 u_long laminar_local_preempt_skip_v = 0;
 
@@ -2733,6 +2741,19 @@ sched_laminar_choose(void)
 				    td->td_proc->p_comm,
 				    sizeof(laminar_wake_pick_max_comm));
 			}
+			/* Also measure queue-to-pick (excludes wake->queue). */
+			if (ts->ts_queue_ts != 0) {
+				sbintime_t qdelta = now - ts->ts_queue_ts;
+				uint64_t qus = qdelta < 0 ? 0 : (uint64_t)
+				    (((uint64_t)qdelta * 1000000ULL) >> 32);
+				if (qus > laminar_queue_pick_max_us) {
+					laminar_queue_pick_max_us = qus;
+					strlcpy(laminar_queue_pick_max_comm,
+					    td->td_proc->p_comm,
+					    sizeof(laminar_queue_pick_max_comm));
+				}
+			}
+			ts->ts_queue_ts = 0;
 			if (delay_us > LAMINAR_WAKE_LONG_US) {
 				int idx;
 				const char *comm = td->td_proc->p_comm;
@@ -2849,7 +2870,20 @@ sched_laminar_idletd(void *dummy)
 	THREAD_NO_SLEEPING();
 	for (;;) {
 		while (atomic_load_int(&tdq->ltdq_load) == 0) {
-			cpu_idle(0);
+			/*
+			 * busy=1 keeps the hardclock at active rate.
+			 * cpu_idle(0) would call cpu_idleclock() which drops
+			 * the hardclock to "next callout deadline" granularity,
+			 * causing waker-callout chains to stall up to ~1s --
+			 * the R4 multi-second wake-tail root cause.  ULE
+			 * avoids this with a switchcnt-based busy hint
+			 * (tried, regressed Laminar throughput further on
+			 * this VM); simple always-busy is the best tradeoff
+			 * here.  WFI is still issued inside cpu_idle when
+			 * sched_runnable() is false, so true-idle still
+			 * yields the vCPU to the HVF host.
+			 */
+			cpu_idle(1);
 		}
 		thread_lock(td);
 		mi_switch(SW_VOL | SWT_IDLE);
@@ -2898,7 +2932,9 @@ u_long laminar_lag_cap = 1000000;
  */
 u_long laminar_wake_pick_max_us = 0;
 u_long laminar_wake_pick_long_count = 0;
+u_long laminar_queue_pick_max_us = 0;
 char   laminar_wake_pick_max_comm[16] = "";
+char   laminar_queue_pick_max_comm[16] = "";
 /* Histogram of long-wake-pick events by comm.  Simple linear array. */
 char   laminar_long_log[LAMINAR_LONG_LOG][16];
 u_long laminar_long_log_count[LAMINAR_LONG_LOG];
@@ -2935,6 +2971,12 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
 SYSCTL_STRING(_kern_sched, OID_AUTO, wake_pick_max_comm, CTLFLAG_RD,
     laminar_wake_pick_max_comm, sizeof(laminar_wake_pick_max_comm),
     "Laminar: proc name of the thread that hit wake_pick_max_us.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, queue_pick_max_us, CTLFLAG_RW,
+    &laminar_queue_pick_max_us, 0,
+    "Laminar: max queue-to-on-cpu delay (us).  pick - tdq_runq_add_ts.");
+SYSCTL_STRING(_kern_sched, OID_AUTO, queue_pick_max_comm, CTLFLAG_RD,
+    laminar_queue_pick_max_comm, sizeof(laminar_queue_pick_max_comm),
+    "Laminar: proc name that hit queue_pick_max_us.");
 
 static int
 laminar_long_log_sysctl(SYSCTL_HANDLER_ARGS)
@@ -2999,6 +3041,10 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, clock_idle_calls, CTLFLAG_RW,
     &laminar_clock_idle_calls, 0, "Laminar: sched_clock entries for idle.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, clock_ts_sum, CTLFLAG_RW,
     &laminar_clock_ts_sum, 0, "Laminar: sum of cnt across non-idle clock.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, idle_exits, CTLFLAG_RW,
+    &laminar_idle_exits, 0, "Laminar: idle loop exits (load > 0 detected).");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, idle_loops, CTLFLAG_RW,
+    &laminar_idle_loops, 0, "Laminar: idle while-loop iterations.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, preempt_cooldown, CTLFLAG_RW,
     &laminar_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between cost-based wake-preempt IPIs; "
