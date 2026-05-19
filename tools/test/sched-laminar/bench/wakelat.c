@@ -130,8 +130,16 @@ main(int argc, char **argv)
 			continue;
 		per_w[i] = n;
 		all = realloc(all, (total + n) * sizeof(*all));
-		if (read(pipes[i * 2], all + total, n * sizeof(*all)) !=
-		    (ssize_t)(n * sizeof(*all)))
+		size_t want = (size_t)n * sizeof(*all);
+		char *buf = (char *)(all + total);
+		while (want > 0) {
+			ssize_t r = read(pipes[i * 2], buf, want);
+			if (r <= 0)
+				break;
+			buf += r;
+			want -= (size_t)r;
+		}
+		if (want != 0)
 			break;
 		total += n;
 	}
