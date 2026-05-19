@@ -785,3 +785,70 @@ The bounded-lag vruntime rebase IS the right RLC analog of
 ULE's priority recomputation -- we just need to make it work
 reliably.
 ==================================================================
+
+==================================================================
+ R4 perpetrators: KERNEL threads, not user
+==================================================================
+
+Proc-name capture (commit 17cfbae) identifies the threads
+hitting wake_pick_max_us on an idle Laminar VM:
+
+  run1: max=984ms  comm=vnlru
+  run2: max=950ms  comm=clock
+  run3: max=985ms  comm=clock
+  run4: max=984ms  comm=clock
+  run5: max=978ms  comm=clock         (long_count 25/run @ idle)
+
+All three:
+  - clock           pid 2  state RL  -- per-CPU softclock_thread
+  - rand_harvestq   pid 7  state RL  -- entropy harvester
+  - vnlru           pid 15 state DL  -- vnode LRU
+
+Their wake paths into Laminar:
+
+  clock        : callout_process -> TD_CLR_IWAIT(td)
+                                 -> sched_wakeup(td, SRQ_INTR)
+                                    (from hardclock interrupt context)
+
+  rand_harvestq: tsleep_sbt timeout -> callout -> wakeup(chan)
+                                    -> sleepq_resume_thread
+                                    -> setrunnable
+                                    -> sched_wakeup
+
+  vnlru        : msleep on bufdaemon condition
+
+All converge on sched_laminar_wakeup, which stamps ts_wake_ts
+and calls sched_laminar_add.  Delta measured is pick_time -
+stamp_time, indicating these kernel threads queue at wake but
+take ~1s to be picked.
+
+On idle VM with no other timeshare load, these kthreads SHOULD
+be picked promptly via the runq priority bucket (their priority
+is < PRI_MIN_TIMESHARE).  Why they're delayed is the open
+question.
+
+ULE same VM never sees this delay (max ~25ms) because ULE's
+sched_priority recomputation on wake boosts the kthread's
+effective priority, ensuring it wins the picker.  Laminar's
+RLC-shaped equivalent (bounded-lag vruntime rebase) operates
+on SoA timeshare threads but kernel threads go through the
+runq priority bucket -- so the rebase doesn't apply.
+
+For kernel threads in the runq priority bucket, the only way
+to ensure prompt pick is via the priority-based tdq_notify
+check.  My tdq_notify fix (commit 5c6cbd7) compares pre-add
+oldpri vs post-add lowpri.  For an idle dst with newpri being
+a kernel thread, this SHOULD fire IPI.
+
+But evidently doesn't.  Next step: instrument tdq_notify to
+log which path fires (or doesn't) for kernel thread wakes.
+
+Critically: the bench MEASUREMENT shows multi-second tails
+when measuring USER threads under load (commits earlier in
+this doc).  Whether the kernel-thread wake-pick of ~1s
+contributes to user-perceived latency or is a separate
+artifact remains to be confirmed.
+
+R4 narrows: it's specifically the kernel-thread wake path
+that Laminar handles differently from ULE.
+==================================================================
