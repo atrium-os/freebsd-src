@@ -732,3 +732,56 @@ R4 stays open as a known Laminar wake-pick bug with the comm-name
 instrumentation staged but not yet rebuilt.  Bench is otherwise
 in good shape for the design's claims.
 ==================================================================
+
+==================================================================
+ ULE source comparison: priority recomputation gap
+==================================================================
+
+User suggested comparing sched_ule.c vs sched_laminar.c to find
+the wake-path divergence.  Decisive finding in sched_ule_wakeup:
+
+ULE wakes a thread by:
+  1. Updating sleep-tick counters (interactivity input)
+  2. Resetting ts_slice to 0
+  3. Calling sched_priority(td) IMPLICITLY via sched_add ->
+     re-priority based on interactivity score
+  4. sched_add -> pickcpu -> tdq_add -> tdq_notify
+
+The critical step is **sched_priority recomputation on wake**.
+A timeshare thread that slept recently gets a LOWER priority
+value (more important; bounded by sched_interact at the
+INTERACT range, otherwise BATCH).  Then:
+
+   sched_setpreempt(td->td_priority) on same-CPU
+     -> if (pri < ctd->td_priority) ast_sched_locked(ctd, TDA_SCHED)
+
+Because the woken thread's priority is now NUMERICALLY LOWER
+than the incumbent's (which has accumulated cpu run-time and
+moved into BATCH), the AST fires reliably.  Hence ULE's idle-
+case max <25ms.
+
+Laminar doesn't recompute priority on wake; td_priority stays
+constant.  For timeshare-vs-timeshare, the priority check in
+setpreempt NEVER fires.  We rely instead on the bounded-lag
+vruntime rebase as the RLC-shaped equivalent (waker becomes
+min-vruntime locally so SoA picks it next), plus the same-CPU
+cost-preempt mechanism (commit 6d05b9f8) which uses vruntime
+comparison.
+
+Apparently this isn't sufficient -- idle Laminar VM still shows
+~1s max wake-pick.  The proc-name instrumentation (commit
+17cfbaec) will identify WHICH thread hits the max, which should
+narrow the failure mode (specific kernel daemon? specific
+vruntime state?  Specific code path?).
+
+Next-session debugging plan:
+  1. Rebuild + boot with commit 17cfbaec
+  2. Idle VM 10s, read kern.sched.wake_pick_max_comm
+  3. Cross-reference the proc with its wake path
+  4. Compare to ULE's handling for that specific proc
+  5. RLC-shaped fix proposal
+
+The bounded-lag vruntime rebase IS the right RLC analog of
+ULE's priority recomputation -- we just need to make it work
+reliably.
+==================================================================
