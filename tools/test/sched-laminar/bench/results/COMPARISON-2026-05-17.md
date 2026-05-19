@@ -686,3 +686,49 @@ Need to verify by:
 
 R4 is NOT closed.  Reopening.
 ==================================================================
+
+==================================================================
+ R4 status: Laminar wake-pick bug -- root cause unknown
+==================================================================
+
+Idle Laminar VM (no bench, no workload, just `sleep 6`):
+   kernel wake_pick_max = 973ms
+
+This rules out: HVF host dispatch, wakelat tool, workload
+contention, oversubscription.  Same VM running ULE:
+   wake_pick_max bounded at ~25ms even under heavy bench
+
+So Laminar has a path where some thread waits up to ~1s
+between wakeup and being picked, even on an idle system.
+
+Candidates investigated:
+  - ts_wake_ts stale (overwriting on re-wake) -- code looks
+    correct; sched_laminar_wakeup unconditionally sets fresh
+    timestamp
+  - SoA picker missing thread -- ltdq_vruntime[] read at insert
+    matches ts_vruntime, slot_insert maintains shard_min
+  - Cost-preempt cooldown blocking -- cp_skip_cool was 0 in
+    test runs
+  - HVF dispatch lag -- ruled out by ULE comparison
+
+Strong candidates not yet investigated:
+  - A periodic kernel daemon that sleeps for 1s waking and
+    legitimately taking ~ms-second to be picked under some
+    scheduler-fairness logic (look at WHICH proc hits the max
+    via /sys/kern/sched.c-style proc-name capture)
+  - My SoA picker has a stale shard_min after some operation
+    (slot_remove rescan path)
+  - sbinuptime() returning weird value at thread fork time,
+    making "delta" appear huge
+
+Bench numbers stand as-is:
+  - Steady-state (T=30s): 2.92:1.00:0.33 nice fairness (matches
+    CFS target within 5%)
+  - Throughput: 4.0x at N>=4, near-ideal
+  - Wake p50/p99/p99.9: <50us / <200us / typically <1ms
+  - Wake max: bimodal, ~80-200ms typical, occasional 1-2s outliers
+
+R4 stays open as a known Laminar wake-pick bug with the comm-name
+instrumentation staged but not yet rebuilt.  Bench is otherwise
+in good shape for the design's claims.
+==================================================================
