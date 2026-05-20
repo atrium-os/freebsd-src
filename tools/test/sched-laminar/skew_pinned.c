@@ -108,34 +108,51 @@ main(int argc, char **argv)
 	for (c = 0; c < NCLASSES; c++)
 		class_idx[c] = k, k += PER_CLASS;
 
-	for (c = 0; c < NCLASSES; c++) {
-		for (i = 0; i < PER_CLASS; i++) {
-			int idx = class_idx[c] + i;
-			int target_cpu = i % ncpus;
-			pid_t p;
+	{
+		cpuset_t orig;
 
-			if (pipe(&pipes[idx * 2]) < 0)
-				err(1, "pipe");
-			p = fork();
-			if (p < 0)
-				err(1, "fork");
-			if (p == 0) {
-				unsigned long long it;
+		if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
+		    sizeof(orig), &orig) < 0)
+			err(1, "cpuset_getaffinity");
 
-				close(pipes[idx * 2]);
+		for (c = 0; c < NCLASSES; c++) {
+			for (i = 0; i < PER_CLASS; i++) {
+				int idx = class_idx[c] + i;
+				int target_cpu = i % ncpus;
+				pid_t p;
+
+				if (pipe(&pipes[idx * 2]) < 0)
+					err(1, "pipe");
+				/*
+				 * Pin parent to target before fork so child
+				 * inherits the affinity AND is placed there
+				 * at sched_add time -- no post-fork migration
+				 * window.
+				 */
 				if (pin_self(target_cpu) < 0)
-					err(1, "cpuset_setaffinity");
-				if (setpriority(PRIO_PROCESS, 0,
-				    nice_vals[c]) < 0)
-					err(1, "setpriority");
-				it = child_spin(duration);
-				(void)write(pipes[idx * 2 + 1], &it,
-				    sizeof(it));
-				_exit(0);
+					err(1, "pin parent pre-fork");
+				p = fork();
+				if (p < 0)
+					err(1, "fork");
+				if (p == 0) {
+					unsigned long long it;
+
+					close(pipes[idx * 2]);
+					if (setpriority(PRIO_PROCESS, 0,
+					    nice_vals[c]) < 0)
+						err(1, "setpriority");
+					it = child_spin(duration);
+					(void)write(pipes[idx * 2 + 1],
+					    &it, sizeof(it));
+					_exit(0);
+				}
+				close(pipes[idx * 2 + 1]);
+				kids[idx] = p;
 			}
-			close(pipes[idx * 2 + 1]);
-			kids[idx] = p;
 		}
+		/* Restore parent's affinity so it isn't pinned to last cpu. */
+		(void)cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
+		    sizeof(orig), &orig);
 	}
 
 	/* Collect. */
