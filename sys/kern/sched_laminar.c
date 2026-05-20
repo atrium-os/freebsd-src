@@ -707,6 +707,7 @@ extern u_long laminar_lag_cap;
 extern u_long laminar_preempt_cooldown;
 extern u_long laminar_wake_pick_max_us;
 extern u_long laminar_wake_pick_long_count;
+extern u_long laminar_wake_pick_long_threshold;
 extern u_long laminar_queue_pick_max_us;
 extern char   laminar_wake_pick_max_comm[16];
 extern char   laminar_queue_pick_max_comm[16];
@@ -3090,7 +3091,7 @@ sched_laminar_choose(void)
 				}
 			}
 			ts->ts_queue_ts = 0;
-			if (delay_us > LAMINAR_WAKE_LONG_US) {
+			if (delay_us > laminar_wake_pick_long_threshold) {
 				int idx;
 				const char *comm = td->td_proc->p_comm;
 				bool found = false;
@@ -3313,7 +3314,13 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_max_us, CTLFLAG_RW,
     "Laminar: max wake-to-on-cpu delay (us) since reset.  Write 0 to reset.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_count, CTLFLAG_RW,
     &laminar_wake_pick_long_count, 0,
-    "Laminar: count of wake-to-on-cpu delays exceeding 100ms.  Write 0 to reset.");
+    "Laminar: count of wake-to-on-cpu delays exceeding "
+    "wake_pick_long_threshold.  Write 0 to reset.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, wake_pick_long_threshold, CTLFLAG_RW,
+    &laminar_wake_pick_long_threshold, 0,
+    "Laminar: us threshold for wake_pick_long_count + long_log "
+    "comm histogram.  Default 100000 (100ms); lower for finer "
+    "tail-event capture.");
 SYSCTL_STRING(_kern_sched, OID_AUTO, wake_pick_max_comm, CTLFLAG_RD,
     laminar_wake_pick_max_comm, sizeof(laminar_wake_pick_max_comm),
     "Laminar: proc name of the thread that hit wake_pick_max_us.");
