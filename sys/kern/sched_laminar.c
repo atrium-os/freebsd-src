@@ -1330,6 +1330,121 @@ laminar_thread_cost(struct thread *td, int cpu)
 }
 
 /*
+ * Placement-trace ring (2026-05-20).  Records each new-thread (fork)
+ * placement decision: the chosen CPU, the inherited ts_cpu seed, and a
+ * per-CPU snapshot of load/wload/R at the moment pickcpu ran.  Enabled
+ * via kern.sched.place_trace_enable; dumped via kern.sched.place_trace_dump;
+ * also bumps kern.sched.balance_migrations_total at every successful
+ * balancer migration.  Diagnostic only; not load-bearing.
+ */
+#define	LAMINAR_PLACE_TRACE_RING	256
+#define	LAMINAR_PLACE_TRACE_NCPU	16
+
+struct laminar_place_rec {
+	int		ticks;
+	int		cpu;		/* chosen target */
+	int		ts_cpu_seed;	/* inherited ts_cpu at entry */
+	int		td_lastcpu;	/* td_lastcpu at entry */
+	uint32_t	load[LAMINAR_PLACE_TRACE_NCPU];
+	uint32_t	wload[LAMINAR_PLACE_TRACE_NCPU];
+	uint32_t	r[LAMINAR_PLACE_TRACE_NCPU];
+	pid_t		pid;
+	lwpid_t		tid;
+};
+
+static struct laminar_place_rec laminar_place_ring[LAMINAR_PLACE_TRACE_RING];
+static u_int laminar_place_head;
+static int laminar_place_trace_enable;
+static unsigned long laminar_balance_migrations_total;
+
+SYSCTL_INT(_kern_sched, OID_AUTO, place_trace_enable, CTLFLAG_RW,
+    &laminar_place_trace_enable, 0,
+    "Laminar: enable fork-time placement trace ring");
+
+SYSCTL_ULONG(_kern_sched, OID_AUTO, balance_migrations_total, CTLFLAG_RW,
+    &laminar_balance_migrations_total, 0,
+    "Laminar: total balancer migrations since boot/reset (write 0)");
+
+static void
+laminar_place_trace_record(struct thread *td, int cpu, int ts_cpu_seed)
+{
+	struct laminar_place_rec *r;
+	struct laminar_tdq *tdq;
+	u_int idx;
+	int c;
+
+	if (!laminar_place_trace_enable)
+		return;
+	idx = atomic_fetchadd_int(&laminar_place_head, 1) %
+	    LAMINAR_PLACE_TRACE_RING;
+	r = &laminar_place_ring[idx];
+	r->ticks = ticks;
+	r->cpu = cpu;
+	r->ts_cpu_seed = ts_cpu_seed;
+	r->td_lastcpu = td->td_lastcpu;
+	r->pid = (td->td_proc != NULL) ? td->td_proc->p_pid : -1;
+	r->tid = td->td_tid;
+	memset(r->load, 0, sizeof(r->load));
+	memset(r->wload, 0, sizeof(r->wload));
+	memset(r->r, 0, sizeof(r->r));
+	CPU_FOREACH(c) {
+		if (c >= LAMINAR_PLACE_TRACE_NCPU)
+			continue;
+		tdq = LAMINAR_TDQ_CPU(c);
+		r->load[c] = atomic_load_int(&tdq->ltdq_load);
+		r->wload[c] = (uint32_t)atomic_load_64(
+		    __DECONST(uint64_t *, &tdq->ltdq_wload));
+		r->r[c] = atomic_load_int(&tdq->ltdq_resistance);
+	}
+}
+
+static int
+laminar_place_trace_dump_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	struct laminar_place_rec *r;
+	u_int head, n, i, idx;
+	int error, c, ncpu;
+
+	sbuf_new_for_sysctl(&sb, NULL, 4096, req);
+	head = atomic_load_int(&laminar_place_head);
+	n = (head < LAMINAR_PLACE_TRACE_RING) ? head :
+	    LAMINAR_PLACE_TRACE_RING;
+	ncpu = mp_ncpus;
+	if (ncpu > LAMINAR_PLACE_TRACE_NCPU)
+		ncpu = LAMINAR_PLACE_TRACE_NCPU;
+	sbuf_printf(&sb, "head=%u entries=%u ncpu=%d\n", head, n, ncpu);
+	for (i = 0; i < n; i++) {
+		idx = (head - n + i) % LAMINAR_PLACE_TRACE_RING;
+		r = &laminar_place_ring[idx];
+		sbuf_printf(&sb,
+		    "t=%d pid=%d tid=%d lastcpu=%d ts_seed=%d -> cpu=%d ; load=",
+		    r->ticks, r->pid, r->tid, r->td_lastcpu,
+		    r->ts_cpu_seed, r->cpu);
+		for (c = 0; c < ncpu; c++)
+			sbuf_printf(&sb, "%u%s", r->load[c],
+			    c == ncpu - 1 ? "" : ",");
+		sbuf_printf(&sb, " wload=");
+		for (c = 0; c < ncpu; c++)
+			sbuf_printf(&sb, "%u%s", r->wload[c],
+			    c == ncpu - 1 ? "" : ",");
+		sbuf_printf(&sb, " r=");
+		for (c = 0; c < ncpu; c++)
+			sbuf_printf(&sb, "%u%s", r->r[c],
+			    c == ncpu - 1 ? "" : ",");
+		sbuf_printf(&sb, "\n");
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
+SYSCTL_PROC(_kern_sched, OID_AUTO, place_trace_dump,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_place_trace_dump_sysctl, "A",
+    "Laminar: dump fork-time placement trace ring");
+
+/*
  * Pick a target CPU for the thread.  Phase B: honor ts_cpu by
  * default (preserves the phase A behavior + lets the periodic
  * balancer handle long-term spread), and only shop around when
@@ -1444,6 +1559,8 @@ done_scan:
 	 */
 	if (best_cpu < 0)
 		best_cpu = self;
+	if (td->td_lastcpu == NOCPU)
+		laminar_place_trace_record(td, best_cpu, ts_cpu);
 	return (best_cpu);
 }
 
@@ -1749,6 +1866,7 @@ laminar_balance_pair(struct laminar_tdq *high, struct laminar_tdq *low)
 			tdq_notify(low, old_lowpri);
 	}
 	moved = true;
+	atomic_add_long(&laminar_balance_migrations_total, 1);
 out:
 	LAMINAR_TDQ_UNLOCK(high);
 	LAMINAR_TDQ_UNLOCK(low);
