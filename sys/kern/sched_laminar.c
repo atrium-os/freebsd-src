@@ -71,6 +71,11 @@
 
 #ifdef SMP
 static void laminar_dvfs_step(int load_lead, int load_bare);
+/* Phase H state referenced by laminar_ctrl_cb before its full definition. */
+static int laminar_phaseh_enable;
+static int laminar_phaseh_present;
+static int laminar_dvfs_n_levels;
+static int laminar_dvfs_cur_idx;
 #endif
 
 /*
@@ -2278,8 +2283,27 @@ laminar_ctrl_cb(void *arg __unused)
 		/* Under-loaded -- park a CPU (but keep at least 1 alive). */
 		laminar_ctrl_park_streak++;
 		laminar_ctrl_unpark_streak = 0;
+		/*
+		 * Phase H.3: gate parking on having reached the minimum
+		 * cpufreq level first.  Frequency-first, park-second: the
+		 * gentle ramp through P-states recovers more power per unit
+		 * disruption than parking does, and a parked CPU at top
+		 * freq still leaks energy through its power rail.  Only
+		 * park once we are already at min frequency AND the load
+		 * has stayed below the lower threshold for park_pat ticks.
+		 *
+		 * Inert if phase H is disabled or no cpufreq backend, so
+		 * the existing phase-G park behavior is preserved on
+		 * platforms without DVFS.
+		 */
+		bool freq_at_floor = true;
+		if (laminar_phaseh_enable && laminar_phaseh_present &&
+		    laminar_dvfs_n_levels > 0)
+			freq_at_floor = (laminar_dvfs_cur_idx >=
+			    laminar_dvfs_n_levels - 1);
 		if (laminar_ctrl_park_streak >= laminar_ctrl_park_pat &&
-		    min_cpu >= 0 && n_parked < n_total - 1) {
+		    min_cpu >= 0 && n_parked < n_total - 1 &&
+		    freq_at_floor) {
 			tdq = LAMINAR_TDQ_CPU(min_cpu);
 			atomic_store_int(&tdq->ltdq_resistance_power,
 			    laminar_ctrl_evac_r);
@@ -2371,8 +2395,8 @@ laminar_ctrl_start(void)
  * task does CPUFREQ_SET + CPUFREQ_GET + per-CPU ltdq_capacity write.
  */
 static device_t laminar_cf_dev[MAXCPU];	/* cpufreq child per CPU, NULL = absent */
-static int laminar_phaseh_present;	/* 1 if at least one cf_dev found */
-static int laminar_phaseh_enable = 0;	/* master switch (H.2 default off) */
+/* laminar_phaseh_present, laminar_phaseh_enable, laminar_dvfs_n_levels,
+ * laminar_dvfs_cur_idx forward-declared near top of file. */
 static int laminar_power_policy = 5;	/* 0..10, 5 = balanced (today's default) */
 
 /* H.2 damping parameters (sysctl-tunable). */
@@ -2383,9 +2407,7 @@ static int laminar_dvfs_target_headroom = 25;	/* % capacity above load_pct */
 /* H.2 state. */
 #define	LAMINAR_DVFS_MAX_LEVELS	16
 static struct cf_level laminar_dvfs_levels[LAMINAR_DVFS_MAX_LEVELS];
-static int laminar_dvfs_n_levels;
 static int laminar_dvfs_max_freq;	/* levels[0].total_set.freq, MHz */
-static int laminar_dvfs_cur_idx;	/* last-committed level index */
 static int laminar_dvfs_committed_idx;	/* atomic, read by taskqueue */
 static int laminar_dvfs_up_streak;
 static int laminar_dvfs_down_streak;
@@ -2399,9 +2421,110 @@ SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_enable, CTLFLAG_RW,
     &laminar_phaseh_enable, 0,
     "Laminar phase H (DVFS) master enable; controller writes P-state via "
     "cpufreq(4) when 1 and a backend is present");
-SYSCTL_INT(_kern_sched, OID_AUTO, power_policy, CTLFLAG_RW,
-    &laminar_power_policy, 0,
-    "Laminar power policy (0=powersave .. 5=balanced .. 10=performance)");
+
+/*
+ * Phase H.4: power policy table.  power_policy (0..10) maps to a set
+ * of underlying knobs that shape both the parking controller (phase G)
+ * and the DVFS controller (phase H.2-3) without introducing a separate
+ * decision path.  Level 5 = balanced = today's defaults.  Level 10 =
+ * performance = pins freq at max (huge headroom + never-downshift) AND
+ * blocks parking (freq_at_floor gate from H.3 stays false).  Level 0 =
+ * powersave = aggressive on both axes.
+ */
+static const struct laminar_policy_knobs {
+	int headroom;		/* ctrl_headroom %                       */
+	int park_pat;		/* ctrl_park_pat ticks                   */
+	int dvfs_headroom;	/* dvfs_target_headroom %                */
+	int dvfs_down_pat;	/* dvfs_down_patience ticks              */
+} laminar_policy_table[11] = {
+	/* 0: powersave */ {  30,        10,    5,            3 },
+	/* 1            */ {  39,        14,    9,            3 },
+	/* 2            */ {  48,        18,   13,            4 },
+	/* 3            */ {  57,        22,   17,            4 },
+	/* 4            */ {  66,        26,   21,            5 },
+	/* 5: balanced  */ {  75,        30,   25,            5 },
+	/* 6            */ {  79,        50,   35,            6 },
+	/* 7            */ {  83,       100,   45,            8 },
+	/* 8            */ {  87,      1000,   60,           12 },
+	/* 9            */ {  91,     10000,   80,           20 },
+	/* 10: perf     */ {  95, INT_MAX/2,  100,    INT_MAX/2 },
+};
+
+static void
+laminar_apply_power_policy(int level)
+{
+	const struct laminar_policy_knobs *k;
+
+	if (level < 0)
+		level = 0;
+	if (level > 10)
+		level = 10;
+	laminar_power_policy = level;
+	k = &laminar_policy_table[level];
+	laminar_ctrl_headroom = k->headroom;
+	laminar_ctrl_park_pat = k->park_pat;
+	laminar_dvfs_target_headroom = k->dvfs_headroom;
+	laminar_dvfs_down_patience = k->dvfs_down_pat;
+}
+
+static int
+laminar_power_policy_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	int val, error;
+
+	val = laminar_power_policy;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	laminar_apply_power_policy(val);
+	return (0);
+}
+
+static int
+laminar_power_policy_name_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	char buf[16];
+	int new_level, error;
+	const char *name;
+
+	switch (laminar_power_policy) {
+	case 0:  name = "powersave"; break;
+	case 5:  name = "balanced";  break;
+	case 10: name = "performance"; break;
+	default:
+		if (laminar_power_policy < 5)
+			name = "below-balanced";
+		else
+			name = "above-balanced";
+		break;
+	}
+	strlcpy(buf, name, sizeof(buf));
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (strcmp(buf, "powersave") == 0)
+		new_level = 0;
+	else if (strcmp(buf, "balanced") == 0)
+		new_level = 5;
+	else if (strcmp(buf, "performance") == 0)
+		new_level = 10;
+	else
+		return (EINVAL);
+	laminar_apply_power_policy(new_level);
+	return (0);
+}
+
+SYSCTL_PROC(_kern_sched, OID_AUTO, power_policy,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_power_policy_sysctl, "I",
+    "Laminar power policy (0=powersave .. 5=balanced .. 10=performance); "
+    "writing maps to ctrl_headroom, ctrl_park_pat, dvfs_target_headroom, "
+    "and dvfs_down_patience via a single curated lookup table");
+SYSCTL_PROC(_kern_sched, OID_AUTO, power_policy_name,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_power_policy_name_sysctl, "A",
+    "Laminar power policy by name: 'powersave' (level 0), 'balanced' "
+    "(5, default), or 'performance' (10)");
 SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_present, CTLFLAG_RD,
     &laminar_phaseh_present, 0,
     "1 if a cpufreq(4) backend was found for any CPU, 0 otherwise");
