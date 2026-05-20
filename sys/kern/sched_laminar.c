@@ -64,7 +64,14 @@
 #include <sys/turnstile.h>
 #include <sys/bus.h>
 #include <sys/cpu.h>
+#include <sys/taskqueue.h>
 #include <machine/smp.h>
+
+#include "cpufreq_if.h"
+
+#ifdef SMP
+static void laminar_dvfs_step(int load_lead, int load_bare);
+#endif
 
 /*
  * Per-thread scheduler state.  Appended to each struct thread; accessed
@@ -2315,6 +2322,15 @@ laminar_ctrl_cb(void *arg __unused)
 		}
 	}
 
+	/*
+	 * Phase H.2: DVFS actuation.  Inert unless phaseh_enable=1 AND a
+	 * cpufreq backend was found at SI_SUB_LAST.  Uses the same load
+	 * signals already computed:
+	 *   load_lead_compensated -- eager (upshift decisions)
+	 *   laminar_ctrl_load_ewma -- patient (downshift decisions)
+	 */
+	laminar_dvfs_step(load_lead_compensated, laminar_ctrl_load_ewma);
+
 reschedule:
 	callout_reset(&laminar_ctrl_callout,
 	    imax(1, hz * laminar_ctrl_interval / 1000),
@@ -2334,47 +2350,297 @@ laminar_ctrl_start(void)
 /*
  * Phase H: DVFS as a second RLC actuation channel.
  *
- * Scope of this commit (H.1): discovery + sysctl skeleton, no
- * frequency actuation.  Validates the structural integration
- * without risk to picker/placer/controller behaviour.  On QEMU and
- * any platform without a cpufreq(4) backend, all phase-H paths
- * are inert.
+ * Scope (H.2): closed-loop frequency actuation through cpufreq(4),
+ * driven by the same controller (laminar_ctrl_cb) that today writes
+ * R_power for parking.  Same cost equation: lowering frequency
+ * lowers ltdq_capacity, which raises (load+R)*CAP_BASE/capacity, so
+ * placer naturally sends less work there.  Inert without a cpufreq
+ * backend (laminar_phaseh_present=0) or when phaseh_enable=0.
  *
- * Design: see docs/spec/atrium-scheduler-phase-H-dvfs.md.
+ * Design: docs/spec/atrium-scheduler-phase-H-dvfs.md.
  *
- * RLC tie-in: phase H will (in H.2+) modulate ltdq_capacity to
- * track each CPU's current operating frequency, reusing the
- * existing cost equation (load + R) * CAP_BASE / capacity.  DVFS
- * becomes a second actuation channel for the same controller
- * that today writes R_power for parking.
+ * Damping (asymmetric, matches phase-G's lazy-park / eager-unpark):
+ *   up:   1-tick patience, jump straight to target (lead-compensated
+ *         load drives this; bursts must respond quickly).
+ *   down: 5-tick patience, one level per commit (gentle ramp; avoids
+ *         high->low->high oscillation that would waste cache).
+ *
+ * cf_set_method takes an sx lock (kern_cpu.c:91), so actuation MUST
+ * happen outside the callout context.  The controller computes a
+ * target index in the callout and enqueues a taskqueue task; the
+ * task does CPUFREQ_SET + CPUFREQ_GET + per-CPU ltdq_capacity write.
  */
 static device_t laminar_cf_dev[MAXCPU];	/* cpufreq child per CPU, NULL = absent */
 static int laminar_phaseh_present;	/* 1 if at least one cf_dev found */
-static int laminar_phaseh_enable = 0;	/* master switch; H.1 is observational
-					 * only, kept off until H.2 ships */
+static int laminar_phaseh_enable = 0;	/* master switch (H.2 default off) */
 static int laminar_power_policy = 5;	/* 0..10, 5 = balanced (today's default) */
+
+/* H.2 damping parameters (sysctl-tunable). */
+static int laminar_dvfs_up_patience = 1;	/* ticks before commit on upshift */
+static int laminar_dvfs_down_patience = 5;	/* ticks before commit on downshift */
+static int laminar_dvfs_target_headroom = 25;	/* % capacity above load_pct */
+
+/* H.2 state. */
+#define	LAMINAR_DVFS_MAX_LEVELS	16
+static struct cf_level laminar_dvfs_levels[LAMINAR_DVFS_MAX_LEVELS];
+static int laminar_dvfs_n_levels;
+static int laminar_dvfs_max_freq;	/* levels[0].total_set.freq, MHz */
+static int laminar_dvfs_cur_idx;	/* last-committed level index */
+static int laminar_dvfs_committed_idx;	/* atomic, read by taskqueue */
+static int laminar_dvfs_up_streak;
+static int laminar_dvfs_down_streak;
+static int laminar_dvfs_changes_total;	/* observability */
+
+static struct taskqueue *laminar_dvfs_tq;
+static struct task laminar_dvfs_task;
+static int laminar_dvfs_task_inflight;	/* coalesce enqueues */
 
 SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_enable, CTLFLAG_RW,
     &laminar_phaseh_enable, 0,
-    "Laminar phase H (DVFS) master enable; H.1 is discovery-only so "
-    "this currently has no effect");
+    "Laminar phase H (DVFS) master enable; controller writes P-state via "
+    "cpufreq(4) when 1 and a backend is present");
 SYSCTL_INT(_kern_sched, OID_AUTO, power_policy, CTLFLAG_RW,
     &laminar_power_policy, 0,
-    "Laminar power policy (0=powersave .. 5=balanced .. 10=performance); "
-    "H.1 records the value but does not yet actuate");
+    "Laminar power policy (0=powersave .. 5=balanced .. 10=performance)");
 SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_present, CTLFLAG_RD,
     &laminar_phaseh_present, 0,
     "1 if a cpufreq(4) backend was found for any CPU, 0 otherwise");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_up_patience, CTLFLAG_RW,
+    &laminar_dvfs_up_patience, 0,
+    "Laminar DVFS: ticks of consistent upshift target before committing "
+    "(default 1 = ~100 ms; lead-compensator amplifies bursts so 1 tick is "
+    "responsive)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_down_patience, CTLFLAG_RW,
+    &laminar_dvfs_down_patience, 0,
+    "Laminar DVFS: ticks of consistent downshift target before committing "
+    "(default 5 = ~500 ms; gentle ramp avoids cache-wasting oscillation)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_target_headroom, CTLFLAG_RW,
+    &laminar_dvfs_target_headroom, 0,
+    "Laminar DVFS: percent capacity above current load_pct used as the "
+    "frequency target (default 25)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_cur_idx, CTLFLAG_RD,
+    &laminar_dvfs_cur_idx, 0,
+    "Laminar DVFS: current P-state index (0 = fastest)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_n_levels, CTLFLAG_RD,
+    &laminar_dvfs_n_levels, 0,
+    "Laminar DVFS: number of cached P-state levels (0 until first apply)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_max_freq, CTLFLAG_RD,
+    &laminar_dvfs_max_freq, 0,
+    "Laminar DVFS: max frequency from cached levels[0], MHz");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_changes_total, CTLFLAG_RW,
+    &laminar_dvfs_changes_total, 0,
+    "Laminar DVFS: total CPUFREQ_SET applications since boot (write 0 reset)");
+
+/*
+ * Update per-CPU ltdq_capacity to reflect a newly-applied frequency.
+ * Called from the taskqueue after CPUFREQ_GET reports the achieved freq.
+ * Per kern_cpu.c, cpufreq is system-wide uniform, so all CPUs get the
+ * same capacity ratio.
+ */
+static void
+laminar_dvfs_write_capacity(int achieved_freq_mhz)
+{
+	struct laminar_tdq *tdq;
+	int cpu, new_cap;
+
+	if (laminar_dvfs_max_freq <= 0)
+		return;
+	new_cap = achieved_freq_mhz * LAMINAR_CAP_BASE / laminar_dvfs_max_freq;
+	if (new_cap < 1)
+		new_cap = 1;	/* divide-by-zero guard in laminar_scaled_cost */
+	if (new_cap > LAMINAR_CAP_BASE)
+		new_cap = LAMINAR_CAP_BASE;
+	CPU_FOREACH(cpu) {
+		tdq = LAMINAR_TDQ_CPU(cpu);
+		atomic_store_int(&tdq->ltdq_capacity, new_cap);
+	}
+}
+
+/*
+ * Taskqueue handler: applies the committed P-state.  Lazy-discovers
+ * the level array on first call (CPUFREQ_LEVELS takes the cpufreq sx
+ * lock, which sleeps -- safe here, not in the callout).
+ */
+static void
+laminar_dvfs_apply(void *ctx __unused, int pending __unused)
+{
+	device_t cf;
+	int target_idx, count, error;
+	struct cf_level cur_level;
+
+	cf = laminar_cf_dev[0];	/* uniform system-wide; one cf_dev suffices */
+	if (cf == NULL) {
+		atomic_store_int(&laminar_dvfs_task_inflight, 0);
+		return;
+	}
+
+	/* Lazy level discovery on first invocation. */
+	if (laminar_dvfs_n_levels == 0) {
+		count = LAMINAR_DVFS_MAX_LEVELS;
+		error = CPUFREQ_LEVELS(cf, laminar_dvfs_levels, &count);
+		if (error != 0 || count <= 0) {
+			atomic_store_int(&laminar_dvfs_task_inflight, 0);
+			return;	/* will retry on next enqueue */
+		}
+		laminar_dvfs_n_levels = count;
+		laminar_dvfs_max_freq = laminar_dvfs_levels[0].total_set.freq;
+		/* Seed cur to whatever cpufreq is at now. */
+		if (CPUFREQ_GET(cf, &cur_level) == 0) {
+			int i;
+			for (i = 0; i < count; i++) {
+				if (laminar_dvfs_levels[i].total_set.freq ==
+				    cur_level.total_set.freq) {
+					laminar_dvfs_cur_idx = i;
+					break;
+				}
+			}
+			laminar_dvfs_write_capacity(cur_level.total_set.freq);
+		}
+	}
+
+	target_idx = atomic_load_int(&laminar_dvfs_committed_idx);
+	if (target_idx < 0 || target_idx >= laminar_dvfs_n_levels) {
+		atomic_store_int(&laminar_dvfs_task_inflight, 0);
+		return;
+	}
+	if (target_idx == laminar_dvfs_cur_idx) {
+		atomic_store_int(&laminar_dvfs_task_inflight, 0);
+		return;
+	}
+
+	error = CPUFREQ_SET(cf, &laminar_dvfs_levels[target_idx],
+	    CPUFREQ_PRIO_KERN);
+	if (error == 0) {
+		if (CPUFREQ_GET(cf, &cur_level) == 0) {
+			laminar_dvfs_write_capacity(cur_level.total_set.freq);
+			laminar_dvfs_cur_idx = target_idx;
+			laminar_dvfs_changes_total++;
+		}
+	}
+	atomic_store_int(&laminar_dvfs_task_inflight, 0);
+}
+
+/*
+ * Compute the controller's target P-state index from a load_pct
+ * sample, apply asymmetric patience, and enqueue the taskqueue if
+ * the commit threshold is reached.  Called once per controller tick
+ * from laminar_ctrl_cb.
+ *
+ * load_lead is the lead-compensated load_pct (eager up-response);
+ * load_bare is the bare EWMA (patient down-response).
+ *
+ * Returns immediately if phase H is disabled, no backend, or levels
+ * not yet discovered (first taskqueue invocation populates them).
+ */
+static void
+laminar_dvfs_step(int load_lead, int load_bare)
+{
+	int target_freq, target_idx, i;
+	int up_freq, mid;
+	int down_freq;
+
+	if (!laminar_phaseh_enable || !laminar_phaseh_present)
+		return;
+	if (laminar_dvfs_n_levels == 0) {
+		/* Kick the taskqueue to discover levels; harmless if pending. */
+		if (atomic_cmpset_int(&laminar_dvfs_task_inflight, 0, 1))
+			taskqueue_enqueue(laminar_dvfs_tq, &laminar_dvfs_task);
+		return;
+	}
+
+	/*
+	 * Up-decision uses lead-compensated load (eager).  Map load + headroom
+	 * to a target frequency, then to the nearest level (levels[] sorted
+	 * descending by freq).  Snap by midpoint between adjacent levels.
+	 */
+	{
+		int load_for_up = load_lead + laminar_dvfs_target_headroom;
+		if (load_for_up > 100)
+			load_for_up = 100;
+		if (load_for_up < 1)
+			load_for_up = 1;
+		up_freq = laminar_dvfs_max_freq * load_for_up / 100;
+	}
+	{
+		int load_for_dn = load_bare + laminar_dvfs_target_headroom;
+		if (load_for_dn > 100)
+			load_for_dn = 100;
+		if (load_for_dn < 1)
+			load_for_dn = 1;
+		down_freq = laminar_dvfs_max_freq * load_for_dn / 100;
+	}
+
+	/* For commit purposes, derive ONE target_idx.  Use the up freq (eager). */
+	target_freq = up_freq;
+	target_idx = laminar_dvfs_n_levels - 1;
+	for (i = 0; i < laminar_dvfs_n_levels - 1; i++) {
+		mid = (laminar_dvfs_levels[i].total_set.freq +
+		    laminar_dvfs_levels[i + 1].total_set.freq) / 2;
+		if (target_freq >= mid) {
+			target_idx = i;
+			break;
+		}
+	}
+
+	if (target_idx == laminar_dvfs_cur_idx) {
+		laminar_dvfs_up_streak = 0;
+		laminar_dvfs_down_streak = 0;
+		return;
+	}
+
+	if (target_idx < laminar_dvfs_cur_idx) {
+		/* upshift (faster) */
+		laminar_dvfs_down_streak = 0;
+		laminar_dvfs_up_streak++;
+		if (laminar_dvfs_up_streak >= laminar_dvfs_up_patience) {
+			/* Jump straight to target. */
+			laminar_dvfs_up_streak = 0;
+			atomic_store_int(&laminar_dvfs_committed_idx,
+			    target_idx);
+			if (atomic_cmpset_int(&laminar_dvfs_task_inflight, 0, 1))
+				taskqueue_enqueue(laminar_dvfs_tq,
+				    &laminar_dvfs_task);
+		}
+	} else {
+		/* downshift (slower).  Re-evaluate using bare-EWMA target. */
+		int down_idx = laminar_dvfs_n_levels - 1;
+		int j;
+		for (j = 0; j < laminar_dvfs_n_levels - 1; j++) {
+			int dmid = (laminar_dvfs_levels[j].total_set.freq +
+			    laminar_dvfs_levels[j + 1].total_set.freq) / 2;
+			if (down_freq >= dmid) {
+				down_idx = j;
+				break;
+			}
+		}
+		if (down_idx <= laminar_dvfs_cur_idx) {
+			/* Bare EWMA disagrees with lead-compensated -- hold. */
+			laminar_dvfs_up_streak = 0;
+			laminar_dvfs_down_streak = 0;
+			return;
+		}
+		laminar_dvfs_up_streak = 0;
+		laminar_dvfs_down_streak++;
+		if (laminar_dvfs_down_streak >= laminar_dvfs_down_patience) {
+			/* One level per commit. */
+			laminar_dvfs_down_streak = 0;
+			atomic_store_int(&laminar_dvfs_committed_idx,
+			    laminar_dvfs_cur_idx + 1);
+			if (atomic_cmpset_int(&laminar_dvfs_task_inflight, 0, 1))
+				taskqueue_enqueue(laminar_dvfs_tq,
+				    &laminar_dvfs_task);
+		}
+	}
+}
 
 /*
  * Walk all CPUs, look up the cpufreq child of each cpu device, cache
  * the device_t pointer.  Runs once at SI_SUB_LAST so device attach is
- * complete.  All operations are read-only on newbus state (no driver
- * methods invoked here).
+ * complete.  Also creates the DVFS taskqueue used by H.2 actuation.
  *
  * Per kern_cpu.c:1096-1098, FreeBSD's cpufreq core enforces uniform
  * system-wide P-state today, so finding any one CPU's cf_dev is
- * sufficient for actuation in H.2.  We still cache per CPU so future
+ * sufficient for actuation.  We still cache per CPU so future
  * per-domain support is a drop-in.
  */
 static void
@@ -2394,12 +2660,19 @@ laminar_phaseh_init(void *arg __unused)
 			found++;
 	}
 	laminar_phaseh_present = (found > 0) ? 1 : 0;
-	if (laminar_phaseh_present)
+	if (laminar_phaseh_present) {
+		TASK_INIT(&laminar_dvfs_task, 0, laminar_dvfs_apply, NULL);
+		laminar_dvfs_tq = taskqueue_create("laminar_dvfs", M_WAITOK,
+		    taskqueue_thread_enqueue, &laminar_dvfs_tq);
+		taskqueue_start_threads(&laminar_dvfs_tq, 1, PWAIT,
+		    "laminar_dvfs");
 		printf("laminar: phase H (DVFS) -- cpufreq backend found on "
-		    "%d CPU(s); actuation deferred to H.2.\n", found);
-	else
+		    "%d CPU(s); set kern.sched.phaseh_enable=1 to actuate.\n",
+		    found);
+	} else {
 		printf("laminar: phase H (DVFS) -- no cpufreq backend; "
 		    "park-only power control.\n");
+	}
 }
 SYSINIT(laminar_phaseh, SI_SUB_LAST, SI_ORDER_ANY, laminar_phaseh_init, NULL);
 #endif /* SMP */
