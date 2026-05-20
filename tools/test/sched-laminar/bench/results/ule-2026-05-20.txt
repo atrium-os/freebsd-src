@@ -1,0 +1,50 @@
+==================================================================
+  Scheduler: ULE
+  Uptime:     5:06AM  up 16 secs, 0 users, load averages: 8.00, 1.89, 0.68
+  Date:      Wed May 20 05:06:37 UTC 2026
+  Build:     FreeBSD 16.0-CURRENT #121: Wed May 20 04:49:14 UTC 2026     root@atriu...
+==================================================================
+
+--- bench_throughput ---
+ULE          N=1   T=5 s total_iters=191742       vs-1-spinner=1.03  x spread=0.0%
+ULE          N=2   T=5 s total_iters=382687       vs-1-spinner=2.05  x spread=0.2%
+ULE          N=4   T=5 s total_iters=746746       vs-1-spinner=4.00  x spread=0.3%
+ULE          N=8   T=5 s total_iters=751739       vs-1-spinner=4.03  x spread=10.0%
+ULE          N=16  T=5 s total_iters=757880       vs-1-spinner=4.06  x spread=12.3%
+ULE          N=32  T=5 s total_iters=764083       vs-1-spinner=4.09  x spread=10.6%
+
+--- bench_fair ---
+ULE          N=4   T=5  s mean_iters=188724       spread=0.1% (lower=fairer)
+ULE          N=4   T=15 s mean_iters=556436       spread=0.1% (lower=fairer)
+ULE          N=8   T=5  s mean_iters=94895        spread=13.7% (lower=fairer)
+ULE          N=8   T=15 s mean_iters=286544       spread=2.6% (lower=fairer)
+ULE          N=16  T=5  s mean_iters=46855        spread=20.2% (lower=fairer)
+ULE          N=16  T=15 s mean_iters=142014       spread=6.9% (lower=fairer)
+
+--- bench_skew ---
+ULE          all-cpus     nice-5_iters=154612     0_iters=146138     +5_iters=105680     ratio=1.06:1.00:0.72 (target 3.05:1.00:0.33)
+ULE          cpu0-only    nice-5_iters=41379      0_iters=33028      +5_iters=28739      ratio=1.25:1.00:0.87 (target 3.05:1.00:0.33)
+
+--- bench_burst ---
+ULE          B=4 S=4 T=10s spinner_iters_mean=358595     spread=12.9% burst_wakes=1065 (106.5/s)
+
+--- bench_latency ---
+ULE          spin=0 watch=1 T=5s p50=6.4 p90=8.0 p99=19.5 p99.9=188.2 max=808.7
+ULE          spin=0 watch=4 T=5s p50=9.6 p90=13.6 p99=35.0 p99.9=177.4 max=1312.9
+ULE          spin=4 watch=1 T=5s p50=6.8 p90=10.0 p99=29.7 p99.9=166.1 max=26904.5
+ULE          spin=4 watch=4 T=5s p50=7.1 p90=11.0 p99=39.2 p99.9=333.4 max=86444.5
+ULE          spin=8 watch=4 T=5s p50=7.0 p90=10.5 p99=37.4 p99.9=360.0 max=45235.4
+
+--- bench_ipc ---
+ULE          pairs=1   bg_spinners=0 T=5s round_trips=1262052    rt_mean_us=3.96
+ULE          pairs=4   bg_spinners=0 T=5s round_trips=12382329   rt_mean_us=1.61 (per-pair mean)
+ULE          slack=0  pairs=4 bg=0 T=5s round_trips=12614069   rt_mean_us=1.59
+ULE          slack=1  pairs=4 bg=0 T=5s round_trips=12341333   rt_mean_us=1.62
+ULE          slack=2  pairs=4 bg=0 T=5s round_trips=12316994   rt_mean_us=1.62
+ULE          slack=4  pairs=4 bg=0 T=5s round_trips=11831982   rt_mean_us=1.69
+ULE          slack=8  pairs=4 bg=0 T=5s round_trips=12451445   rt_mean_us=1.61
+ULE          pairs=4   bg_spinners=4 T=5s round_trips=4650850    rt_mean_us=4.31
+
+==================================================================
+  END  (ULE)
+==================================================================
