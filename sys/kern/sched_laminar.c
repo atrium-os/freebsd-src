@@ -62,6 +62,8 @@
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/turnstile.h>
+#include <sys/bus.h>
+#include <sys/cpu.h>
 #include <machine/smp.h>
 
 /*
@@ -2328,6 +2330,78 @@ laminar_ctrl_start(void)
 	    imax(1, hz * laminar_ctrl_interval / 1000),
 	    laminar_ctrl_cb, NULL);
 }
+
+/*
+ * Phase H: DVFS as a second RLC actuation channel.
+ *
+ * Scope of this commit (H.1): discovery + sysctl skeleton, no
+ * frequency actuation.  Validates the structural integration
+ * without risk to picker/placer/controller behaviour.  On QEMU and
+ * any platform without a cpufreq(4) backend, all phase-H paths
+ * are inert.
+ *
+ * Design: see docs/spec/atrium-scheduler-phase-H-dvfs.md.
+ *
+ * RLC tie-in: phase H will (in H.2+) modulate ltdq_capacity to
+ * track each CPU's current operating frequency, reusing the
+ * existing cost equation (load + R) * CAP_BASE / capacity.  DVFS
+ * becomes a second actuation channel for the same controller
+ * that today writes R_power for parking.
+ */
+static device_t laminar_cf_dev[MAXCPU];	/* cpufreq child per CPU, NULL = absent */
+static int laminar_phaseh_present;	/* 1 if at least one cf_dev found */
+static int laminar_phaseh_enable = 0;	/* master switch; H.1 is observational
+					 * only, kept off until H.2 ships */
+static int laminar_power_policy = 5;	/* 0..10, 5 = balanced (today's default) */
+
+SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_enable, CTLFLAG_RW,
+    &laminar_phaseh_enable, 0,
+    "Laminar phase H (DVFS) master enable; H.1 is discovery-only so "
+    "this currently has no effect");
+SYSCTL_INT(_kern_sched, OID_AUTO, power_policy, CTLFLAG_RW,
+    &laminar_power_policy, 0,
+    "Laminar power policy (0=powersave .. 5=balanced .. 10=performance); "
+    "H.1 records the value but does not yet actuate");
+SYSCTL_INT(_kern_sched, OID_AUTO, phaseh_present, CTLFLAG_RD,
+    &laminar_phaseh_present, 0,
+    "1 if a cpufreq(4) backend was found for any CPU, 0 otherwise");
+
+/*
+ * Walk all CPUs, look up the cpufreq child of each cpu device, cache
+ * the device_t pointer.  Runs once at SI_SUB_LAST so device attach is
+ * complete.  All operations are read-only on newbus state (no driver
+ * methods invoked here).
+ *
+ * Per kern_cpu.c:1096-1098, FreeBSD's cpufreq core enforces uniform
+ * system-wide P-state today, so finding any one CPU's cf_dev is
+ * sufficient for actuation in H.2.  We still cache per CPU so future
+ * per-domain support is a drop-in.
+ */
+static void
+laminar_phaseh_init(void *arg __unused)
+{
+	device_t cpu_dev, cf_dev;
+	int cpu, found = 0;
+
+	CPU_FOREACH(cpu) {
+		cpu_dev = pcpu_find(cpu)->pc_device;
+		if (cpu_dev == NULL)
+			continue;
+		cf_dev = device_find_child(cpu_dev, "cpufreq",
+		    DEVICE_UNIT_ANY);
+		laminar_cf_dev[cpu] = cf_dev;
+		if (cf_dev != NULL)
+			found++;
+	}
+	laminar_phaseh_present = (found > 0) ? 1 : 0;
+	if (laminar_phaseh_present)
+		printf("laminar: phase H (DVFS) -- cpufreq backend found on "
+		    "%d CPU(s); actuation deferred to H.2.\n", found);
+	else
+		printf("laminar: phase H (DVFS) -- no cpufreq backend; "
+		    "park-only power control.\n");
+}
+SYSINIT(laminar_phaseh, SI_SUB_LAST, SI_ORDER_ANY, laminar_phaseh_init, NULL);
 #endif /* SMP */
 
 /*
