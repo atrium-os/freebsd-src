@@ -3706,11 +3706,24 @@ sched_laminar_bind(struct thread *td, int cpu)
 static void
 sched_laminar_unbind(struct thread *td)
 {
+	struct td_sched *ts;
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	KASSERT(td == curthread,
 	    ("sched_laminar_unbind: not curthread"));
-	td_get_sched(td)->ts_flags &= ~TSF_BOUND;
+	ts = td_get_sched(td);
+	if ((ts->ts_flags & TSF_BOUND) == 0)
+		return;
+	ts->ts_flags &= ~TSF_BOUND;
+	/*
+	 * Pair the sched_pin() taken in sched_laminar_bind.  Without
+	 * this, td_pinned accumulates and THREAD_CAN_MIGRATE eventually
+	 * returns false; the next sched_bind() then hits mi_switch
+	 * trying to migrate an unmovable thread and deadlocks.  Exposed
+	 * by cpufreq's bind-do_set-unbind pattern when a cpufreq driver
+	 * (e.g. cpufreq_mock) is present.
+	 */
+	sched_unpin();
 }
 
 static int

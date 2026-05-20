@@ -1,0 +1,4 @@
+include GENERIC
+ident   LAMINAR-DEV
+options SCHED_LAMINAR
+device cpufreq_mock

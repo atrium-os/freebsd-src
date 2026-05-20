@@ -1360,6 +1360,7 @@ dev/clk/clk_fixed.c		optional clk
 dev/clk/clk_gate.c		optional clk
 dev/clk/clk_link.c		optional clk
 dev/clk/clk_mux.c		optional clk
+dev/cpufreq/cpufreq_mock.c	optional cpufreq cpufreq_mock
 dev/cpufreq/ichss.c		optional cpufreq pci
 dev/cxgb/cxgb_main.c		optional cxgb pci \
 	compile-with "${NORMAL_C} -I$S/dev/cxgb"
