@@ -1,0 +1,14 @@
+#
+# ATRIUM -- production kernel config for the Atrium platform on arm64.
+#
+# Inherits GENERIC and swaps in the Laminar scheduler.  Phase H (DVFS)
+# is compiled in but disabled at boot (kern.sched.phaseh_enable=0);
+# enable per-platform after validating the local cpufreq(4) backend.
+#
+# For developer / instrumented kernels see LAMINAR-DEV (adds
+# cpufreq_mock for synthetic DVFS testing on platforms without a real
+# cpufreq driver, e.g. QEMU TCG/HVF).
+#
+include GENERIC
+ident   ATRIUM
+options SCHED_LAMINAR
