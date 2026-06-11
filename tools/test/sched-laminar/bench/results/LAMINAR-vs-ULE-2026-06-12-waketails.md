@@ -64,3 +64,40 @@ Raw: `laminar-2026-06-12.txt`, `ule-2026-06-12.txt`. This is the plan's D10
   now with a number to beat: p99 ≤ ~100 µs at spin=8, max ≤ ~100 ms at spin=16.
 - P0.3 is reproduced, characterized, and has discriminating hypotheses; the
   DTrace pass is the remaining work before any balancer claims.
+
+## P0.3 round 2 — DTrace discrimination (same day)
+
+Instrumented enqueue→on-cpu latency (`waketrace.d`, `waketrace2.d`).
+
+**Result 1 (the big one): the multi-second delay is *pre-enqueue*.** A traced
+run reproduced max = 5.22 s in wakelat, yet **zero** enqueue→on-cpu gaps over
+200 ms fired for wakelat threads. The woken thread was never sitting on a
+runqueue for seconds — the time elapses between the *intended* wake (nanosleep
+expiry) and the *enqueue*. Hypothesis (a) (stale shard-min picker masking) is
+**dead in its original form**; the suspect is the **timer/wakeup path**:
+callout → sleepq wakeup → setrunnable. Since ULE on the same kernel caps at
+70 ms, it is *scheduler-dependent* — pointing at how Laminar schedules/permits
+the softclock ("clock"/"intr") threads, or at the cpu_tick/eventtimer **rearm
+interaction** (one-shot ARM MPCore eventtimer, `periodic=0`: a missed rearm
+costs until the next scheduled event — seconds-scale by nature).
+
+**Result 2: the artifact is DTrace-shy.** 0-for-9 traced runs reproduced the
+multi-second max (vs ~40% untraced). P(0/9 | p=0.4) ≈ 1% — the tracing's extra
+interrupts/timing perturbation almost certainly mask it. Consistent with a
+lost/late timer-rearm or IPI race, not a queue-state bug.
+
+**Next discriminators (non-perturbing):**
+1. `piperlat`: watchdogs block on a pipe written by an **rtprio spinning
+   ticker** (no callout anywhere in the wake path). Multi-second persists →
+   post-wakeup scheduler path after all; vanishes → callout/eventtimer path
+   confirmed.
+2. KTR (compiled-in, near-zero overhead) timestamps in `sleepq_timeout` vs
+   callout-scheduled time — fold into the P2 kernel work (the lane needs
+   callout precision instrumentation anyway, plan risk R2).
+3. Audit Laminar's treatment of `PRI_ITHD` enqueue/preempt vs ULE's, and the
+   `cpu_idle`/eventtimer rearm interaction (no idle at spin=16, so rearm happens
+   from the tick path — does Laminar's tick handling differ?).
+
+Status: P0.3 narrowed from "scheduler picker bug" to "timer-or-ithread wake
+path, perturbation-masked, Laminar-correlated". The plan's R2 risk (callout
+precision in the VM) and this artifact may be the same animal.
