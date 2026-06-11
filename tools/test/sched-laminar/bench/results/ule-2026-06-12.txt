@@ -1,0 +1,20 @@
+# ule wake-latency baseline (plan P0.2), sched=ULE, same kernel #141
+== pass 1 ==
+wake_latency_us p50=5.3 p90=10.0 p99=30.8 p99.9=120.4 max=307.0
+wake_latency_us p50=5.8 p90=9.5 p99=23.0 p99.9=53.7 max=24840.8
+== pass 2 ==
+wake_latency_us p50=5.6 p90=13.1 p99=43.3 p99.9=1067.7 max=2193.7
+wake_latency_us p50=6.1 p90=11.8 p99=39.2 p99.9=110.8 max=41467.0
+== pass 3 ==
+wake_latency_us p50=6.0 p90=20.0 p99=128.4 p99.9=1450.4 max=4611.6
+wake_latency_us p50=11.1 p90=370.2 p99=9419.9 p99.9=29252.6 max=50237.9
+== pass 4 ==
+wake_latency_us p50=7.4 p90=27.7 p99=849.0 p99.9=7463.0 max=10938.8
+wake_latency_us p50=6.2 p90=14.3 p99=55.3 p99.9=2192.3 max=22513.0
+== pass 5 ==
+wake_latency_us p50=7.9 p90=27.8 p99=934.2 p99.9=5373.5 max=15811.7
+wake_latency_us p50=5.7 p90=9.7 p99=26.0 p99.9=69.9 max=46142.3
+== heavy-tail: spin=16 watch=4 T=10 ==
+wake_latency_us p50=5.6 p90=9.5 p99=26.7 p99.9=2709.8 max=51718.1
+wake_latency_us p50=5.6 p90=9.5 p99=25.0 p99.9=5604.2 max=53983.6
+wake_latency_us p50=5.7 p90=9.5 p99=24.8 p99.9=472.5 max=69506.8
