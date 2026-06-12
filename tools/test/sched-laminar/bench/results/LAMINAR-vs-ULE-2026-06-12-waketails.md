@@ -370,3 +370,33 @@ Gates (frame shape 4800/16667, work 4 ms, 600 periods, 16 spinners):
 Next (J.2): frescod sponsors real Fresco client frame threads anchored
 to the display kmod's vblank; EVFILT_DEADLINE miss delivery to the
 broker.
+
+## Phase J.2a — the broker miss feed (2026-06-12)
+
+A missed deadline now reaches the broker as an event, not just a
+counter: the replenish callout records {pid, tid, periods, misses} into
+the owning fd's ring; EVFILT_READ on the broker fd fires; read(2)
+drains the records. Notification defers through taskqueue_fast — the
+deadline machinery stays in the timer interrupt, only the policy
+notification rides a thread.
+
+Two lessons paid for in panics:
+1. taskqueue_enqueue CANNOT run under the tdq spin lock — enqueue wakes
+   the taskqueue swi, and that wake re-enters sched_add ("laminar
+   setcpu cross-CPU recursion"). Deferred past the unlock, next to the
+   already-deferred wakeup().
+2. taskqueue_thread cannot be enqueued from a direct-exec callout at
+   all (sleep mutex in interrupt context); taskqueue_fast exists for
+   exactly this.
+
+Gate (vbroker miss mode, client 0 stalls 100 ms mid-run, 16 spinners):
+broker receives MISS events pid/tid-correct for exactly the stall
+window (periods 302-304, misses 1-3); client 0 final misses = 6 = the
+stall's frame count; client 1 untouched (0 misses). Clean/kill/
+metronome regressions all hold.
+
+frescod's event loop shape is now complete on the kernel side: kevent
+on the broker fd → read miss records → react by policy (skip a frame,
+resize a buffer, withdraw a hopeless client). Next: J.2b — frescod
+sponsoring real Fresco client frame threads anchored to the display
+kmod's vblank.
