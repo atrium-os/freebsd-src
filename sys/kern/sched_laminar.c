@@ -382,6 +382,7 @@ struct laminar_prison {
 	int		lpr_id;		/* prison.pr_id, -1 = free */
 	uint32_t	lpr_weight;	/* user-set; LAMINAR_NICE_0_WEIGHT default */
 	uint32_t	lpr_nthreads;	/* atomic-updated runnable count */
+	uint32_t	lpr_broker;	/* D9: deadline_broker capability */
 };
 static struct laminar_prison laminar_prisons[LAMINAR_MAX_PRISONS];
 
@@ -398,6 +399,7 @@ laminar_prisons_init(void *arg __unused)
 		laminar_prisons[i].lpr_id = -1;
 		laminar_prisons[i].lpr_weight = LAMINAR_NICE_0_WEIGHT;
 		laminar_prisons[i].lpr_nthreads = 0;
+		laminar_prisons[i].lpr_broker = 0;
 	}
 }
 SYSINIT(laminar_prisons, SI_SUB_INTRINSIC, SI_ORDER_ANY,
@@ -1950,6 +1952,55 @@ laminar_jails_sysctl(SYSCTL_HANDLER_ARGS)
 	sbuf_delete(&sb);
 	return (error);
 }
+/*
+ * D9: the deadline_broker capability's kernel half.  portcullisd (host
+ * root) writes "pr_id 0|1" when materializing a jail whose manifest
+ * grants deadline_broker; reads list flagged jails.  Writes from
+ * INSIDE a jail are rejected — a jail cannot self-grant.  SPONSOR_FOR
+ * consults this for jailed callers (host root keeps priv_check).
+ */
+static int
+laminar_brokers_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	char ibuf[32];
+	int error, i, id, on;
+
+	if (req->newptr != NULL) {
+		if (req->td->td_ucred->cr_prison != &prison0)
+			return (EPERM);
+		if (req->newlen >= sizeof(ibuf))
+			return (EINVAL);
+		error = SYSCTL_IN(req, ibuf, req->newlen);
+		if (error != 0)
+			return (error);
+		ibuf[req->newlen] = '\0';
+		if (sscanf(ibuf, "%d %d", &id, &on) != 2 || id < 0)
+			return (EINVAL);
+		struct laminar_prison *lpr = laminar_prison_claim(id);
+		if (lpr == NULL)
+			return (ENOMEM);
+		atomic_store_int(&lpr->lpr_broker, on != 0);
+		return (0);
+	}
+	sbuf_new_for_sysctl(&sb, NULL, 64, req);
+	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
+		int slot = atomic_load_int(&laminar_prisons[i].lpr_id);
+		if (slot < 0 ||
+		    atomic_load_int(&laminar_prisons[i].lpr_broker) == 0)
+			continue;
+		sbuf_printf(&sb, "%d\n", slot);
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_sched, OID_AUTO, deadline_brokers,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    laminar_brokers_sysctl, "A",
+    "Laminar D9: jails holding the deadline_broker capability "
+    "(write 'pr_id 0|1' from the host; read lists granted pr_ids)");
+
 SYSCTL_PROC(_kern_sched, OID_AUTO, jails,
     CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
     laminar_jails_sysctl, "A",
@@ -4213,12 +4264,23 @@ laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		int error;
 
 		/*
-		 * Broker privilege: root for now; the Portcullis manifest
-		 * deadline_broker capability replaces this check (plan D9).
+		 * Broker permission (D9): on the host, root (priv_check);
+		 * inside a jail, the jail must hold the deadline_broker
+		 * capability — granted by portcullisd from the manifest
+		 * via kern.sched.deadline_brokers, never self-grantable.
 		 */
-		error = priv_check(td, PRIV_SCHED_RTPRIO);
-		if (error != 0)
-			return (error);
+		if (td->td_ucred->cr_prison == &prison0) {
+			error = priv_check(td, PRIV_SCHED_RTPRIO);
+			if (error != 0)
+				return (error);
+		} else {
+			struct laminar_prison *lpr = laminar_prison_lookup(
+			    td->td_ucred->cr_prison->pr_id);
+
+			if (lpr == NULL ||
+			    atomic_load_int(&lpr->lpr_broker) == 0)
+				return (EPERM);
+		}
 		priv = laminar_lane_get_priv();
 		if (priv == NULL)
 			return (EBUSY);
@@ -4226,7 +4288,14 @@ laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		if (target == NULL)
 			return (ESRCH);
 		/* tdfind returns with the target's proc locked, which
-		 * also holds off thread_exit until we are published. */
+		 * also holds off thread_exit until we are published.
+		 * Jail visibility: a broker may only sponsor threads it
+		 * can see (its own jail's clients, or anyone for host). */
+		error = p_cansee(td, target->td_proc);
+		if (error != 0) {
+			PROC_UNLOCK(target->td_proc);
+			return (error);
+		}
 		error = laminar_lane_sponsor_td(target, r->q_us, r->t_us,
 		    r->anchor_ns, priv);
 		PROC_UNLOCK(target->td_proc);
