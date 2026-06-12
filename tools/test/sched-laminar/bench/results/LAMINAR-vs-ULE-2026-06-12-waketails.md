@@ -400,3 +400,22 @@ on the broker fd → read miss records → react by policy (skip a frame,
 resize a buffer, withdraw a hopeless client). Next: J.2b — frescod
 sponsoring real Fresco client frame threads anchored to the display
 kmod's vblank.
+
+## Phase J.2b — frescod IS the broker (2026-06-12, bsd repo af1912d)
+
+The mock broker is retired: real frescod (frescod-aqueduct, venus
+profile, real 60 Hz vblank from /dev/atrium-display0) now sponsors
+client frame threads. Clients send OP_LANE_REQUEST {pid, tid, q_us}
+over the Fresco socket; frescod verifies pid against LOCAL_PEERCRED,
+sponsors with T = the connector refresh interval, grid anchored to the
+latest wait_vblank return; disconnect withdraws; the J.2a miss feed
+drains into the compositor loop each vblank.
+
+Gate (in-VM, 16 spinners): lane-client sponsored via the protocol; 606
+frames 0 misses; deliberate 100 ms stall = exactly 6 misses, each
+arriving in frescod's log with correct pid/tid/period in real time.
+
+Phase J complete: brokered, vblank-anchored, miss-fed deadline lane,
+kernel-to-compositor. Next per plan: P4 inheritance (K-a turnstile
+deadline bands), the lyrad audio broker when lyrad exists, and the
+manifest deadline_broker capability to replace the root gate (D9).
