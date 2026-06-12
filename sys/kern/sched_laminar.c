@@ -358,6 +358,7 @@ struct laminar_lane_entity {
 	void		*le_priv;	/* owning /dev/laminar fd cookie */
 	u_char		le_saved_upri;	/* pre-band td_base_user_pri */
 	bool		le_banded;	/* K-a band applied */
+	uint64_t	le_gen;		/* bumped at teardown (K-b adopters) */
 	/* stats (read via LAMIOC_STATS) */
 	uint64_t	le_periods;
 	uint64_t	le_misses;	/* period ended, work not yielded */
@@ -547,6 +548,12 @@ struct td_sched {
 					 * 0 if not pending pick.  Used to
 					 * measure wake-to-on-cpu delay for
 					 * R4 instrumentation. */
+	struct laminar_lane_entity *ts_adopted; /* (t) K-b: entity whose
+					 * budget this thread burns while
+					 * working on the client's behalf */
+	uint64_t	ts_adopted_gen;	/* le_gen snapshot at ADOPT */
+	sbintime_t	ts_adopt_start;	/* on-cpu stamp while adopted */
+	u_char		ts_adopt_upri;	/* pre-adoption base_user_pri */
 	struct laminar_lane_entity *ts_lane; /* (t) deadline-lane entity, or
 					 * NULL.  Consumers re-check
 					 * le_td == td (entities are a
@@ -3795,6 +3802,8 @@ struct lam_lane_req_for {
 #define	LAMIOC_STATS	_IOR('L', 4, struct lam_lane_stats)
 #define	LAMIOC_SPONSOR_FOR	_IOW('L', 5, struct lam_lane_req_for)
 #define	LAMIOC_WITHDRAW_FOR	_IOW('L', 6, struct lam_lane_req_for)
+#define	LAMIOC_ADOPT		_IOW('L', 7, struct lam_lane_req_for)
+#define	LAMIOC_DROP		_IO('L', 8)
 
 /*
  * Miss event record, delivered to the owning fd via read(2); EVFILT_READ
@@ -4139,6 +4148,7 @@ laminar_lane_teardown_common(struct laminar_lane_entity *le,
 	le->le_td = NULL;	/* pick + replenish stop touching it */
 	le->le_priv = NULL;
 	le->le_banded = false;
+	le->le_gen++;		/* invalidates K-b adopters */
 	if (td_get_sched(otd)->ts_lane == le)
 		td_get_sched(otd)->ts_lane = NULL;
 	tdq->ltdq_lane_n--;
@@ -4199,6 +4209,7 @@ laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 
 	if (__predict_false(le != NULL) && le->le_td == td)
 		laminar_lane_teardown_common(le, false);
+	td_get_sched(td)->ts_adopted = NULL;	/* K-b: dying adopter */
 }
 
 static int
@@ -4240,6 +4251,74 @@ laminar_lane_yield(struct thread *td)
 	 */
 	(void)tsleep_sbt(le, 0, "lane", deadline + (le->le_t_sbt >> 3), 0,
 	    C_ABSOLUTE);
+	return (0);
+}
+
+/*
+ * K-b deadline lending: the caller (an Aqueduct server thread working
+ * on a lane client's request) ADOPTs the client's entity — it gains
+ * the K-a band for SELECTION, and its runtime is CHARGED to the
+ * client's CBS budget (see the charge path in sched_laminar_choose and
+ * the overrun detector in sched_laminar_clock).  Band priority is
+ * never free: it always burns an admitted budget, so adoption cannot
+ * out-schedule the admission cap.  Gated like SPONSOR_FOR (D9 broker
+ * capability + p_cansee).  le_gen guards entity-slot reuse.
+ */
+static int
+laminar_lane_adopt(struct thread *td, pid_t pid, lwpid_t tid)
+{
+	struct laminar_lane_entity *le;
+	struct thread *target;
+
+	if (td_get_sched(td)->ts_lane != NULL ||
+	    td_get_sched(td)->ts_adopted != NULL)
+		return (EBUSY);
+	target = tdfind(tid, pid);
+	if (target == NULL)
+		return (ESRCH);
+	if (p_cansee(td, target->td_proc) != 0) {
+		PROC_UNLOCK(target->td_proc);
+		return (ESRCH);
+	}
+	le = td_get_sched(target)->ts_lane;
+	if (le == NULL || le->le_td != target) {
+		PROC_UNLOCK(target->td_proc);
+		return (ENOENT);
+	}
+	td_get_sched(td)->ts_adopted = le;
+	td_get_sched(td)->ts_adopted_gen = le->le_gen;
+	/* the adopter is on-cpu NOW — charging starts here, not at the
+	 * next pick (a band-priority burn may never switch under load) */
+	td_get_sched(td)->ts_adopt_start = sbinuptime();
+	PROC_UNLOCK(target->td_proc);
+
+	thread_lock(td);
+	td_get_sched(td)->ts_adopt_upri = td->td_base_user_pri;
+	if (td->td_base_user_pri > LAMINAR_LANE_BAND) {
+		td->td_base_user_pri = LAMINAR_LANE_BAND;
+		if (td->td_user_pri > LAMINAR_LANE_BAND)
+			td->td_user_pri = LAMINAR_LANE_BAND;
+	}
+	thread_unlock(td);
+	return (0);
+}
+
+static int
+laminar_lane_drop(struct thread *td)
+{
+	struct td_sched *ts = td_get_sched(td);
+
+	if (ts->ts_adopted == NULL)
+		return (ENOENT);
+	ts->ts_adopted = NULL;
+	thread_lock(td);
+	if (td->td_base_user_pri == LAMINAR_LANE_BAND)
+		td->td_base_user_pri = ts->ts_adopt_upri;
+	if (td->td_user_pri == LAMINAR_LANE_BAND &&
+	    td->td_lend_user_pri > ts->ts_adopt_upri)
+		td->td_user_pri = ts->ts_adopt_upri;
+	td->td_priority = td->td_user_pri;
+	thread_unlock(td);
 	return (0);
 }
 
@@ -4321,6 +4400,27 @@ laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		laminar_lane_teardown(le);
 		return (0);
 	}
+	case LAMIOC_ADOPT: {
+		struct lam_lane_req_for *r = (struct lam_lane_req_for *)data;
+		int error;
+
+		/* same permission shape as SPONSOR_FOR (D9) */
+		if (td->td_ucred->cr_prison == &prison0) {
+			error = priv_check(td, PRIV_SCHED_RTPRIO);
+			if (error != 0)
+				return (error);
+		} else {
+			struct laminar_prison *lpr = laminar_prison_lookup(
+			    td->td_ucred->cr_prison->pr_id);
+
+			if (lpr == NULL ||
+			    atomic_load_int(&lpr->lpr_broker) == 0)
+				return (EPERM);
+		}
+		return (laminar_lane_adopt(td, r->pid, r->tid));
+	}
+	case LAMIOC_DROP:
+		return (laminar_lane_drop(td));
 	case LAMIOC_WITHDRAW:
 		return (laminar_lane_withdraw(td));
 	case LAMIOC_YIELD:
@@ -4611,7 +4711,14 @@ sched_laminar_add(struct thread *td, int flags)
 			}
 			laminar_lane_wakes++;
 			if (ctd != NULL && !TD_IS_IDLETHREAD(ctd) &&
-			    laminar_is_timeshare(ctd)) {
+			    (laminar_is_timeshare(ctd) ||
+			    ctd->td_priority == LAMINAR_LANE_BAND)) {
+				/*
+				 * Band-priority incumbents (adopted
+				 * servers, PI-boosted holders) are
+				 * preemptible by a lane wake too —
+				 * re-choose orders by deadline.
+				 */
 				ast_sched_locked(ctd, TDA_SCHED);
 				laminar_lane_preempts++;
 			} else if (ctd != NULL && !TD_IS_IDLETHREAD(ctd))
@@ -4677,10 +4784,32 @@ sched_laminar_choose(void)
 			    (((uint64_t)ran * 1000000ULL) >> 32);
 			ole->le_run_start = 0;
 		}
+		/*
+		 * K-b charge-back: an ADOPTED server thread burns the
+		 * client entity's budget for its on-cpu time.  le_gen
+		 * guards slot reuse; cross-CPU budget write races with
+		 * the entity's own CPU are tolerable (the budget is a
+		 * throttling signal, not an invariant).
+		 */
+		ole = ots->ts_adopted;
+		if (ole != NULL && ots->ts_adopt_start != 0) {
+			sbintime_t ran = sbinuptime() - ots->ts_adopt_start;
+
+			if (ole->le_gen == ots->ts_adopted_gen &&
+			    ole->le_td != NULL)
+				ole->le_budget_us -= (int64_t)
+				    (((uint64_t)ran * 1000000ULL) >> 32);
+			ots->ts_adopt_start = 0;
+		}
 	}
 	td = tdq_choose(tdq);
 	if (td != NULL) {
 		struct td_sched *ts = td_get_sched(td);
+
+		/* K-b: adopted server going on-cpu burns the client's
+		 * budget from here (charged at the next switch). */
+		if (__predict_false(ts->ts_adopted != NULL))
+			ts->ts_adopt_start = sbinuptime();
 
 		/* R4 instrumentation: wake_ts -> on_cpu delay. */
 		if (ts->ts_wake_ts != 0) {
@@ -4775,6 +4904,33 @@ sched_laminar_clock(struct thread *td, int cnt)
 	 * the D5 guarantee).  TDF_SLICEEND forces the AST so the overrunner
 	 * yields the CPU promptly rather than at its natural switch.
 	 */
+	if (__predict_false(laminar_deadline_enable) &&
+	    ts->ts_adopted != NULL) {
+		struct laminar_lane_entity *le = ts->ts_adopted;
+
+		/*
+		 * K-b: the adopted server exhausted the client's budget —
+		 * throttle the ENTITY (its budget is gone; CBS denies
+		 * everyone until replenish) and demote this thread's band
+		 * (we hold its thread lock).  le_throttled is a cross-CPU
+		 * bool write here: a tolerable racy signal.
+		 */
+		if (le->le_gen == ts->ts_adopted_gen && le->le_td != NULL &&
+		    !le->le_throttled && ts->ts_adopt_start != 0) {
+			sbintime_t ran = sbinuptime() - ts->ts_adopt_start;
+			int64_t ran_us = (int64_t)
+			    (((uint64_t)ran * 1000000ULL) >> 32);
+
+			if (le->le_budget_us - ran_us <= 0) {
+				le->le_throttled = true;
+				le->le_throttles++;
+				td->td_flags |= TDF_SLICEEND;
+				td->td_base_user_pri = ts->ts_adopt_upri;
+				td->td_user_pri = ts->ts_adopt_upri;
+				td->td_priority = ts->ts_adopt_upri;
+			}
+		}
+	}
 	if (__predict_false(laminar_deadline_enable) && ts->ts_lane != NULL) {
 		struct laminar_lane_entity *le = ts->ts_lane;
 
