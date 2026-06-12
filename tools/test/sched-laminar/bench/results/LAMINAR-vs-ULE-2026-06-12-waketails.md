@@ -469,3 +469,33 @@ grant cannot sponsor (EPERM, clients never admitted); grant -> jailed
 broker runs clean; revoke -> denied again; self-grant from inside the
 jail -> EPERM. Deadlines are now Portcullis capabilities end to end,
 per the federation doc's admission rule.
+
+## Phase K-b — deadline lending with charge-back (2026-06-12)
+
+Explicit adoption is the lending primitive: a broker-privileged server
+thread ADOPTs a lane client's entity (LAMIOC_ADOPT {pid,tid} / DROP) —
+it gains the K-a band for SELECTION while its on-cpu time is CHARGED to
+the client's CBS budget. Band priority is never free: it always burns
+an admitted budget, so adoption cannot out-schedule the admission cap.
+Gated like SPONSOR_FOR (D9 broker capability + p_cansee); le_gen guards
+entity-slot reuse; turnstile-path attribution stays K-a-approximate
+(the PI lend API does not carry the lender).
+
+Two bugs found by the gate, both now fixed:
+1. Charging stamped only at pick — a band-priority burn that never
+   switches was never charged. Now stamped at ADOPT.
+2. A lane wake could not preempt a BAND-priority incumbent
+   (laminar_is_timeshare(ctd) excluded it) — an adopted server burning
+   on the client's CPU blocked the client's own wakes (measured as a
+   53% miss storm). Lane wakes now AST band incumbents too; re-choose
+   orders by deadline.
+
+Gate (16 spinners): client 1501 periods 0 misses; the server's 50 ms
+adopted burn produced exactly burn/T = 6-7 entity throttles (the
+charge-back arithmetic, period-exact); metronome and lane-pi
+regressions hold. sys/sys/proc.h: thread0_storage reserve 10 -> 14
+u64s for the grown td_sched.
+
+The kernel primitive for Aqueduct deadline-context propagation is now
+complete: a server handling a deadline client's request ADOPTs for the
+request's duration — the userspace protocol work rides this.
