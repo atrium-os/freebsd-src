@@ -344,3 +344,29 @@ ULE's.
 Protocol going forward: gapdet is the standing sentinel; if a dirty
 window recurs, run gapdet on BOTH kernels INSIDE the window before
 attributing. The phase-J broker is unblocked.
+
+## Phase J.1 — broker sponsorship landed (2026-06-12)
+
+Kernel: LAMIOC_SPONSOR_FOR {pid, tid, q_us, t_us, anchor_ns} — a broker
+fd sponsors CLIENT threads; anchor_ns phase-aligns the period grid to a
+hardware timestamp (vblank). One fd owns many entities (cdevpriv cookie
++ le_priv tag; fd close sweeps all — broker crash reclaims its clients).
+LAMIOC_WITHDRAW_FOR (owner-checked). thread_dtor eventhandler reclaims a
+client's entity when the client dies with no fd-close tied to it.
+Privilege: root (PRIV_SCHED_RTPRIO) until the manifest deadline_broker
+capability (plan D9).
+
+vbroker (mock frescod): sponsors N forked clients on a shared synthetic
+vblank grid; clients work+YIELD per frame; SIGKILL robustness mode.
+
+Gates (frame shape 4800/16667, work 4 ms, 600 periods, 16 spinners):
+- 2 clients: 0 misses each (1 pre-sync startup period, baselined).
+- 4 clients: admission spreads one per CPU; 0 misses each, replenish
+  lateness 71–79 µs.
+- kill test: SIGKILL client 0 mid-run — no panic, entity reclaimed via
+  thread-dtor, broker WITHDRAW_FOR returns ESRCH, survivor 0 misses.
+- regression: self-sponsored metronome audio shape 1000 periods 0 miss.
+
+Next (J.2): frescod sponsors real Fresco client frame threads anchored
+to the display kmod's vblank; EVFILT_DEADLINE miss delivery to the
+broker.

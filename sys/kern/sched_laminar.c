@@ -50,6 +50,8 @@
 #include <sys/cpuset.h>
 #include <sys/callout.h>
 #include <sys/conf.h>
+#include <sys/eventhandler.h>
+#include <sys/priv.h>
 #include <sys/jail.h>
 #include <sys/limits.h>
 #include <sys/lock.h>
@@ -348,6 +350,7 @@ struct laminar_lane_entity {
 	sbintime_t	le_deadline;	/* absolute current-period deadline */
 	sbintime_t	le_run_start;	/* sbinuptime at last on-cpu (0 = off) */
 	struct callout	le_callout;	/* period replenishment */
+	void		*le_priv;	/* owning /dev/laminar fd cookie */
 	/* stats (read via LAMIOC_STATS) */
 	uint64_t	le_periods;
 	uint64_t	le_misses;	/* period ended, work not yielded */
@@ -361,7 +364,8 @@ static u_long laminar_lane_sponsors = 0;
 static u_long laminar_lane_preempts = 0;
 static u_long laminar_lane_wakes = 0;	/* lane wakes seen at local sched_add */
 static u_long laminar_lane_wake_blocked = 0; /* incumbent not timeshare */
-static void laminar_lane_dtor(void *data);
+static void laminar_lane_priv_dtor(void *data);
+static void laminar_lane_teardown(struct laminar_lane_entity *le);
 
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
@@ -3695,10 +3699,25 @@ struct lam_lane_stats {
 	int32_t cpu;
 	int32_t pad;
 };
+/*
+ * Broker sponsorship (phase J): a trusted daemon (frescod, lyrad)
+ * sponsors a CLIENT thread's deadlines.  anchor_ns (CLOCK_MONOTONIC)
+ * phase-aligns the period grid to the hardware fact the deadline
+ * derives from (a vblank timestamp, an audio DMA edge); 0 = no anchor.
+ */
+struct lam_lane_req_for {
+	int32_t		pid;
+	int32_t		tid;
+	uint64_t	q_us, t_us;
+	uint64_t	anchor_ns;
+};
+
 #define	LAMIOC_SPONSOR	_IOW('L', 1, struct lam_lane_req)
 #define	LAMIOC_WITHDRAW	_IO('L', 2)
 #define	LAMIOC_YIELD	_IO('L', 3)
 #define	LAMIOC_STATS	_IOR('L', 4, struct lam_lane_stats)
+#define	LAMIOC_SPONSOR_FOR	_IOW('L', 5, struct lam_lane_req_for)
+#define	LAMIOC_WITHDRAW_FOR	_IOW('L', 6, struct lam_lane_req_for)
 
 /*
  * Period replenishment.  Runs as a callout pinned to the entity's CPU;
@@ -3745,19 +3764,37 @@ laminar_lane_replenish(void *arg)
 		wakeup(le);
 }
 
-/* Sponsor curthread as a lane entity; picks the least lane-utilized CPU. */
+/*
+ * The fd-owner cookie: one per /dev/laminar open that has sponsored
+ * anything.  Entities tag their owner via le_priv; the cdevpriv dtor
+ * sweeps every lane slot owned by the cookie, so a broker (frescod,
+ * lyrad) crashing or closing its fd reclaims ALL its clients' entities.
+ */
+struct laminar_lane_priv {
+	int	lp_unused;
+};
+
+/*
+ * Sponsor `target` as a lane entity owned by `priv`; picks the least
+ * lane-utilized admissible CPU.  anchor_ns != 0 aligns the period grid
+ * to that CLOCK_MONOTONIC instant (a vblank timestamp): the first
+ * deadline is the next grid point of anchor + k*T, so replenishment
+ * ticks in phase with the hardware the deadline derives from.
+ */
 static int
-laminar_lane_sponsor(struct thread *td, uint64_t q_us, uint64_t t_us)
+laminar_lane_sponsor_td(struct thread *target, uint64_t q_us, uint64_t t_us,
+    uint64_t anchor_ns, void *priv)
 {
 	struct laminar_tdq *tdq;
 	struct laminar_lane_entity *le = NULL;
+	sbintime_t now, first, t_sbt;
 	int cpu, best_cpu = -1, best_util = INT_MAX, util, i;
 
 	if (!laminar_deadline_enable)
 		return (ENXIO);
 	if (q_us == 0 || t_us < 1000 || t_us > 1000000 || q_us >= t_us)
 		return (EINVAL);
-	if (td_get_sched(td)->ts_lane != NULL)
+	if (td_get_sched(target)->ts_lane != NULL)
 		return (EBUSY);
 	util = (int)((q_us * 1000) / t_us);	/* per-mille */
 
@@ -3780,6 +3817,18 @@ laminar_lane_sponsor(struct thread *td, uint64_t q_us, uint64_t t_us)
 	 * covers the dominant wake path; a rare balancer migration
 	 * self-corrects at the next wake.
 	 */
+	t_sbt = (sbintime_t)t_us * SBT_1US;
+	now = sbinuptime();
+	if (anchor_ns != 0) {
+		sbintime_t asbt = nstosbt((int64_t)anchor_ns);
+
+		if (asbt <= now)
+			first = asbt + ((now - asbt) / t_sbt + 1) * t_sbt;
+		else
+			first = asbt;
+	} else
+		first = now + t_sbt;
+
 	tdq = LAMINAR_TDQ_CPU(best_cpu);
 	LAMINAR_TDQ_LOCK(tdq);
 	for (i = 0; i < LAMINAR_LANE_MAX; i++) {
@@ -3795,38 +3844,51 @@ laminar_lane_sponsor(struct thread *td, uint64_t q_us, uint64_t t_us)
 	le->le_cpu = best_cpu;
 	le->le_q_us = q_us;
 	le->le_t_us = t_us;
-	le->le_t_sbt = (sbintime_t)t_us * SBT_1US;
+	le->le_t_sbt = t_sbt;
 	le->le_budget_us = q_us;
 	le->le_throttled = false;
 	le->le_yielded = false;
 	le->le_periods = le->le_misses = le->le_throttles = 0;
 	le->le_max_late_us = 0;
-	le->le_deadline = sbinuptime() + le->le_t_sbt;
-	le->le_td = td;
-	td_get_sched(td)->ts_lane = le;
+	le->le_deadline = first;
+	le->le_priv = priv;
+	le->le_td = target;
+	td_get_sched(target)->ts_lane = le;
 	tdq->ltdq_lane_n++;
 	tdq->ltdq_lane_util += util;
 	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
 	    laminar_lane_replenish, le, best_cpu, C_ABSOLUTE | C_DIRECT_EXEC);
 	LAMINAR_TDQ_UNLOCK(tdq);
-	if (devfs_set_cdevpriv(le, laminar_lane_dtor) != 0) {
-		laminar_lane_dtor(le);	/* roll back */
-		return (EBUSY);
-	}
 	laminar_lane_sponsors++;
 	return (0);
 }
 
 /*
- * Entity teardown — the cdevpriv destructor, so a process that dies (or
- * closes the fd) without WITHDRAW cannot leave a stale entity whose
- * le_td points at a freed thread (learned by a use-after-free panic in
- * the lane pick: "ltdq_slot[i] == td failed").  Idempotent.
+ * Get (or create) the calling fd's owner cookie.  Returns NULL only on
+ * cdevpriv failure.
+ */
+static struct laminar_lane_priv *
+laminar_lane_get_priv(void)
+{
+	struct laminar_lane_priv *priv;
+
+	if (devfs_get_cdevpriv((void **)&priv) == 0)
+		return (priv);
+	priv = malloc(sizeof(*priv), M_LAMINAR, M_WAITOK | M_ZERO);
+	if (devfs_set_cdevpriv(priv, laminar_lane_priv_dtor) != 0) {
+		free(priv, M_LAMINAR);
+		return (NULL);
+	}
+	return (priv);
+}
+
+/*
+ * Entity teardown.  Idempotent; safe against the direct-exec replenish
+ * (le_td cleared under the tdq lock, then the callout drained).
  */
 static void
-laminar_lane_dtor(void *data)
+laminar_lane_teardown(struct laminar_lane_entity *le)
 {
-	struct laminar_lane_entity *le = data;
 	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(le->le_cpu);
 	struct thread *otd;
 	int util;
@@ -3839,6 +3901,7 @@ laminar_lane_dtor(void *data)
 	}
 	util = (int)((le->le_q_us * 1000) / le->le_t_us);
 	le->le_td = NULL;	/* pick + replenish stop touching it */
+	le->le_priv = NULL;
 	if (td_get_sched(otd)->ts_lane == le)
 		td_get_sched(otd)->ts_lane = NULL;
 	tdq->ltdq_lane_n--;
@@ -3847,12 +3910,53 @@ laminar_lane_dtor(void *data)
 	callout_drain(&le->le_callout);
 }
 
+/*
+ * cdevpriv destructor: sweep every lane slot owned by this fd's cookie.
+ * A process that dies (or closes the fd) without WITHDRAW cannot leave
+ * a stale entity whose le_td points at a freed thread (learned by a
+ * use-after-free panic in the lane pick: "ltdq_slot[i] == td failed");
+ * a BROKER dying reclaims all of its clients' entities at once.
+ */
+static void
+laminar_lane_priv_dtor(void *data)
+{
+	struct laminar_lane_priv *priv = data;
+	struct laminar_tdq *tdq;
+	int cpu, i;
+
+	CPU_FOREACH(cpu) {
+		tdq = LAMINAR_TDQ_CPU(cpu);
+		for (i = 0; i < LAMINAR_LANE_MAX; i++) {
+			if (tdq->ltdq_lane[i].le_priv == priv)
+				laminar_lane_teardown(&tdq->ltdq_lane[i]);
+		}
+	}
+	free(priv, M_LAMINAR);
+}
+
+/*
+ * Thread-exit invalidation: a BROKER-sponsored client thread can die
+ * with no fd close tied to its lifetime, so the thread teardown path
+ * must reclaim its entity.  thread_dtor runs in sleepable context with
+ * the (type-stable) thread struct still intact.
+ */
+static void
+laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
+{
+	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+
+	if (__predict_false(le != NULL) && le->le_td == td)
+		laminar_lane_teardown(le);
+}
+
 static int
 laminar_lane_withdraw(struct thread *td)
 {
-	if (td_get_sched(td)->ts_lane == NULL)
+	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+
+	if (le == NULL)
 		return (ENOENT);
-	devfs_clear_cdevpriv();	/* runs laminar_lane_dtor */
+	laminar_lane_teardown(le);
 	return (0);
 }
 
@@ -3894,8 +3998,58 @@ laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	switch (cmd) {
 	case LAMIOC_SPONSOR: {
 		struct lam_lane_req *r = (struct lam_lane_req *)data;
+		struct laminar_lane_priv *priv = laminar_lane_get_priv();
 
-		return (laminar_lane_sponsor(td, r->q_us, r->t_us));
+		if (priv == NULL)
+			return (EBUSY);
+		return (laminar_lane_sponsor_td(td, r->q_us, r->t_us, 0,
+		    priv));
+	}
+	case LAMIOC_SPONSOR_FOR: {
+		struct lam_lane_req_for *r = (struct lam_lane_req_for *)data;
+		struct laminar_lane_priv *priv;
+		struct thread *target;
+		int error;
+
+		/*
+		 * Broker privilege: root for now; the Portcullis manifest
+		 * deadline_broker capability replaces this check (plan D9).
+		 */
+		error = priv_check(td, PRIV_SCHED_RTPRIO);
+		if (error != 0)
+			return (error);
+		priv = laminar_lane_get_priv();
+		if (priv == NULL)
+			return (EBUSY);
+		target = tdfind(r->tid, r->pid);
+		if (target == NULL)
+			return (ESRCH);
+		/* tdfind returns with the target's proc locked, which
+		 * also holds off thread_exit until we are published. */
+		error = laminar_lane_sponsor_td(target, r->q_us, r->t_us,
+		    r->anchor_ns, priv);
+		PROC_UNLOCK(target->td_proc);
+		return (error);
+	}
+	case LAMIOC_WITHDRAW_FOR: {
+		struct lam_lane_req_for *r = (struct lam_lane_req_for *)data;
+		struct laminar_lane_priv *priv;
+		struct laminar_lane_entity *le;
+		struct thread *target;
+
+		if (devfs_get_cdevpriv((void **)&priv) != 0)
+			return (ENOENT);
+		target = tdfind(r->tid, r->pid);
+		if (target == NULL)
+			return (ESRCH);
+		le = td_get_sched(target)->ts_lane;
+		if (le == NULL || le->le_priv != priv) {
+			PROC_UNLOCK(target->td_proc);
+			return (le == NULL ? ENOENT : EPERM);
+		}
+		PROC_UNLOCK(target->td_proc);
+		laminar_lane_teardown(le);
+		return (0);
 	}
 	case LAMIOC_WITHDRAW:
 		return (laminar_lane_withdraw(td));
@@ -3942,6 +4096,8 @@ laminar_lane_dev_init(void *arg __unused)
 	mda.mda_gid = GID_WHEEL;
 	mda.mda_mode = 0600;
 	(void)make_dev_s(&mda, &dev, "laminar");
+	EVENTHANDLER_REGISTER(thread_dtor, laminar_lane_thread_dtor, NULL,
+	    EVENTHANDLER_PRI_ANY);
 }
 SYSINIT(laminar_lane_dev, SI_SUB_DRIVERS, SI_ORDER_ANY,
     laminar_lane_dev_init, NULL);
