@@ -453,3 +453,19 @@ Audio-chain-shaped inversion, fully closed by K-a. Regressions hold
 (metronome 0/1000, vbroker kill-test clean). Remaining for K-b:
 deadline LENDING with charge-back (the holder runs on the blocked
 entity's budget) and Aqueduct deadline-context propagation.
+
+## D9 — the deadline_broker capability (2026-06-12)
+
+SPONSOR_FOR's root gate is replaced by the manifest capability's kernel
+half: kern.sched.deadline_brokers (write "pr_id 0|1", host-root only —
+a jail cannot self-grant; read lists granted jails). portcullisd writes
+it at jail materialization from the manifest. Host root keeps
+priv_check; jailed callers need their prison flagged. tdfind targets
+are additionally filtered by p_cansee, so a jailed broker can only
+sponsor threads inside its own visibility.
+
+Gate (in-VM): host broker unchanged (clean); jailed broker without the
+grant cannot sponsor (EPERM, clients never admitted); grant -> jailed
+broker runs clean; revoke -> denied again; self-grant from inside the
+jail -> EPERM. Deadlines are now Portcullis capabilities end to end,
+per the federation doc's admission rule.
