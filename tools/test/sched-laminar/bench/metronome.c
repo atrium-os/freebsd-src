@@ -90,7 +90,10 @@ main(int argc, char **argv)
 	if (ioctl(fd, LAMIOC_SPONSOR, &req) != 0)
 		err(1, "LAMIOC_SPONSOR");
 
-	/* one period of work + yield, n_periods times */
+	/* one period of work + yield, n_periods times; track wake lateness
+	 * (YIELD-return vs the expected period grid). */
+	double t0 = now_sec(), wmax = 0, wsum = 0;
+	double first[8] = {0};
 	for (uint64_t p = 0; p < n_periods; p++) {
 		double until = now_sec() + work_us / 1e6;
 		volatile unsigned long acc = 0;
@@ -98,7 +101,16 @@ main(int argc, char **argv)
 			acc += p;
 		if (ioctl(fd, LAMIOC_YIELD) != 0)
 			err(1, "LAMIOC_YIELD");
+		double late = (now_sec() - t0) - (double)(p + 1) * req.t_us / 1e6;
+		if (p < 8)
+			first[p] = late * 1e6;
+		if (late > wmax)
+			wmax = late;
+		wsum += (late > 0 ? late : 0);
 	}
+	printf("wake_late_us max=%.0f mean=%.0f first8=[%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f]\n",
+	    wmax * 1e6, wsum / n_periods * 1e6, first[0], first[1], first[2],
+	    first[3], first[4], first[5], first[6], first[7]);
 
 	if (ioctl(fd, LAMIOC_STATS, &st) != 0)
 		err(1, "LAMIOC_STATS");

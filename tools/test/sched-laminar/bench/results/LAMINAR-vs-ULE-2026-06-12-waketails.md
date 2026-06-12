@@ -218,3 +218,41 @@ Next: instrument WHERE the callout latency lives (hardclock→swi-enqueue vs
 swi-enqueue→handler) — the swi wake path through setpreempt looks correct on
 inspection, pointing at eventtimer reprogramming / callout-wheel processing
 under load on ARM/HVF. Lane disabled (default): bench numbers unchanged.
+
+## Phase-I gate CLOSED (2026-06-12, second pass)
+
+Three kernel fixes landed after the first phase-I pass:
+
+1. **Replenish callout → C_DIRECT_EXEC.** The 8–227 ms replenish lateness
+   under 16 spinners was the softclock-swi *scheduling* latency (the swi
+   waits behind spinners), not eventtimer drift: running the replenish in
+   the timer interrupt itself collapsed worst lateness to 11–35 µs loaded.
+   This also localizes the P0.3 wakelat artifact: nanosleep-class wakes
+   ride the same swi path.
+2. **Wake-preempt gate dropped `!le_yielded`.** The YIELD sleep's backstop
+   timeout and the replenish callout expire at the same instant; when the
+   timeout path made the thread runnable first, `le_yielded` was still
+   true and the lane wake-preempt was skipped (lane_preempts stuck at 1,
+   alternating misses, 2 periods/cycle). The backstop now also sleeps T/8
+   *past* the deadline so the replenish wakeup() is the normal waker.
+3. **cdevpriv dtor + pick guard.** A metronome killed mid-run (ssh drop)
+   left a stale entity whose le_td pointed at a freed thread → UAF panic
+   in the lane pick ("ltdq_slot[i] == td"). Entity teardown is now the
+   cdevpriv destructor (fd close == withdraw, idempotent), and the EDF
+   pick skips entities whose thread is not queued on this CPU
+   (ts_cpu != ltdq_id, e.g. balancer-migrated).
+
+### Gate results (lane kernel, deadline_enable=1)
+
+    idle  audio:  periods=100  misses=0 throttles=0 max_replenish_late_us=1189 (boot noise)
+    16sp  audio:  periods=1000 misses=0 throttles=0 max_replenish_late_us=35
+    16sp  audio:  periods=1000 misses=0 throttles=1 max_replenish_late_us=31
+    16sp  frame:  periods=200  misses=0 throttles=0 max_replenish_late_us=11
+    counters: lane_wakes=2300 lane_preempts=2200 lane_wake_blocked=0
+    metronome wake-vs-grid (16sp): max 18 us, mean ~0
+
+An admitted (Q,T) entity on a fully saturated 4-vCPU timeshare kernel
+wakes within tens of microseconds of its period grid and misses zero
+deadlines — the P1 lane.rs proof now holds on the real kernel.
+Regression sanity with deadline_enable=0: piperlat p50 2.6 us, known
+equal-priority p99 plateau unchanged.
