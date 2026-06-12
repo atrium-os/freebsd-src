@@ -49,6 +49,7 @@
 #include <sys/kernel.h>
 #include <sys/cpuset.h>
 #include <sys/callout.h>
+#include <sys/conf.h>
 #include <sys/jail.h>
 #include <sys/limits.h>
 #include <sys/lock.h>
@@ -312,6 +313,53 @@ static int laminar_numa_alpha = 1;	/* extra cost per cross-domain hop */
  */
 static int laminar_rt_occupied_cost = 64;	/* in nice-0 thread units */
 
+/*
+ * Phase I: the declared real-deadline lane (CBS-lite over EDF).
+ * Design: docs/spec/atrium-scheduler-federation.md §1/§3 + the
+ * implementation plan D5-D9/S1-S3; math proven in gpusim lane.rs.
+ *
+ * A sponsored thread declares (Q budget, T period).  Admission caps
+ * per-CPU lane utilization (sum Q/T, per-mille) at
+ * laminar_deadline_util_max; entities are bound to their CPU.  The
+ * pick is EDF among released, in-budget entities, ahead of the
+ * timeshare SoA and behind the POSIX RT class (the escape hatch
+ * stays on top).  Budget is charged at statclock; exhaustion
+ * throttles the entity to plain timeshare until the per-entity
+ * replenishment callout (absolute, C_PRECISE, pinned to the
+ * entity's CPU) resets it at the period boundary — overrun
+ * isolation: a lying entity cannot eat its neighbours' deadlines.
+ * The callout also measures its own lateness (the plan's R2 / the
+ * wakelat bimodal artifact instrumentation).
+ *
+ * Everything is gated by laminar_deadline_enable (default 0):
+ * disabled, no behavior changes anywhere.
+ */
+#define	LAMINAR_LANE_MAX	8	/* entities per CPU */
+
+struct laminar_lane_entity {
+	struct thread	*le_td;		/* sponsored thread; NULL = free */
+	int		le_cpu;
+	bool		le_throttled;	/* budget exhausted this period */
+	bool		le_yielded;	/* done; sleeping until replenish */
+	int64_t		le_budget_us;	/* remaining budget this period */
+	uint64_t	le_q_us;	/* declared budget per period */
+	uint64_t	le_t_us;	/* declared period */
+	sbintime_t	le_t_sbt;	/* period in sbintime */
+	sbintime_t	le_deadline;	/* absolute current-period deadline */
+	sbintime_t	le_run_start;	/* sbinuptime at last on-cpu (0 = off) */
+	struct callout	le_callout;	/* period replenishment */
+	/* stats (read via LAMIOC_STATS) */
+	uint64_t	le_periods;
+	uint64_t	le_misses;	/* period ended, work not yielded */
+	uint64_t	le_throttles;
+	uint64_t	le_max_late_us;	/* worst replenish-callout lateness */
+};
+
+static int laminar_deadline_enable = 0;		/* RWTUN master gate */
+static int laminar_deadline_util_max = 750;	/* per-mille per CPU */
+static u_long laminar_lane_sponsors = 0;
+static u_long laminar_lane_preempts = 0;
+
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
 	int		lpr_id;		/* prison.pr_id, -1 = free */
@@ -480,6 +528,10 @@ struct td_sched {
 					 * 0 if not pending pick.  Used to
 					 * measure wake-to-on-cpu delay for
 					 * R4 instrumentation. */
+	struct laminar_lane_entity *ts_lane; /* (t) deadline-lane entity, or
+					 * NULL.  Consumers re-check
+					 * le_td == td (entities are a
+					 * static array, never freed). */
 	sbintime_t	ts_queue_ts;	/* timestamp at tdq_runq_add.
 					 * pick - queue = queue-to-cpu delay
 					 * (excludes wake-to-queue time). */
@@ -592,6 +644,11 @@ struct laminar_tdq {
 	struct runq	ltdq_runq;	/* (t) Active runq for all classes. */
 	uint32_t	ltdq_ts_n;	/* (t) Timeshare SoA slot count. */
 	uint32_t	ltdq_ts_cap;	/* (c) Timeshare SoA capacity. */
+	/* Deadline lane (phase I).  Array malloc'd at setup (keeps the
+	 * DPCPU footprint flat); all access under the tdq lock. */
+	struct laminar_lane_entity *ltdq_lane;	/* (t) LAMINAR_LANE_MAX slots */
+	int		ltdq_lane_n;	/* (t) live entities */
+	int		ltdq_lane_util;	/* (t) sum Q/T, per-mille */
 	uint64_t	*ltdq_vruntime;	/* (t) Hot, scanned within winning shard. */
 	struct thread	**ltdq_slot;	/* (t) Cold, by winner index. */
 	uint64_t	ltdq_vtime;	/* (t) Virtual time floor (A.5). */
@@ -781,6 +838,12 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	    sizeof(*tdq->ltdq_vruntime), M_LAMINAR, M_WAITOK | M_ZERO);
 	tdq->ltdq_slot = malloc(tdq->ltdq_ts_cap *
 	    sizeof(*tdq->ltdq_slot), M_LAMINAR, M_WAITOK | M_ZERO);
+	tdq->ltdq_lane = malloc(LAMINAR_LANE_MAX *
+	    sizeof(*tdq->ltdq_lane), M_LAMINAR, M_WAITOK | M_ZERO);
+	for (int _i = 0; _i < LAMINAR_LANE_MAX; _i++)
+		callout_init(&tdq->ltdq_lane[_i].le_callout, 1);
+	tdq->ltdq_lane_n = 0;
+	tdq->ltdq_lane_util = 0;
 	tdq->ltdq_vtime = 0;
 	tdq->ltdq_resistance = 0;
 	tdq->ltdq_resistance_power = 0;
@@ -1156,6 +1219,32 @@ tdq_choose(struct laminar_tdq *tdq)
 	rt = runq_choose(&tdq->ltdq_runq);
 	if (rt != NULL && rt->td_priority < PRI_MIN_TIMESHARE)
 		return (rt);
+	/*
+	 * Deadline lane: EDF among released, in-budget, un-yielded
+	 * entities whose thread is runnable here.  Behind the POSIX RT
+	 * class (the escape hatch stays on top), ahead of timeshare.
+	 * Entities are few (<= LAMINAR_LANE_MAX); a linear scan is the
+	 * S1 design.  The caller's tdq_runq_rem dequeues by ts_slot, so
+	 * returning an SoA-resident thread out of vruntime order is
+	 * fine; the vtime floor is deliberately not advanced (lane picks
+	 * don't participate in WFQ fairness).
+	 */
+	if (__predict_false(laminar_deadline_enable) &&
+	    tdq->ltdq_lane_n > 0) {
+		struct laminar_lane_entity *le, *best = NULL;
+		int i;
+
+		for (i = 0; i < LAMINAR_LANE_MAX; i++) {
+			le = &tdq->ltdq_lane[i];
+			if (le->le_td == NULL || le->le_throttled ||
+			    le->le_yielded || !TD_ON_RUNQ(le->le_td))
+				continue;
+			if (best == NULL || le->le_deadline < best->le_deadline)
+				best = le;
+		}
+		if (best != NULL)
+			return (best->le_td);
+	}
 	if (tdq->ltdq_ts_n != 0) {
 		uint32_t i = laminar_min_index(tdq);
 		/*
@@ -1534,6 +1623,10 @@ sched_laminar_pickcpu(struct thread *td, int flags)
 	ts_cpu = ts->ts_cpu;
 	if (!THREAD_CAN_MIGRATE(td))
 		return (ts_cpu);
+	/* Active lane entities are placed on their admitted CPU, always. */
+	if (__predict_false(laminar_deadline_enable) && ts->ts_lane != NULL &&
+	    ts->ts_lane->le_td == td)
+		return (ts->ts_lane->le_cpu);
 
 	/*
 	 * IPC affinity (whitepaper §6).  If we have a confident IPC
@@ -2210,6 +2303,16 @@ SYSCTL_INT(_kern_sched, OID_AUTO, rt_occupied_cost, CTLFLAG_RWTUN,
     &laminar_rt_occupied_cost, 0,
     "Laminar: placement cost added for a CPU currently running an "
     "above-timeshare (RT/interrupt) thread (0 = disabled)");
+SYSCTL_INT(_kern_sched, OID_AUTO, deadline_enable, CTLFLAG_RWTUN,
+    &laminar_deadline_enable, 0,
+    "Laminar phase I: enable the declared real-deadline lane (EDF+CBS)");
+SYSCTL_INT(_kern_sched, OID_AUTO, deadline_util_max, CTLFLAG_RWTUN,
+    &laminar_deadline_util_max, 0,
+    "Laminar: per-CPU deadline-lane utilization admission cap (per-mille)");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_sponsors, CTLFLAG_RD,
+    &laminar_lane_sponsors, 0, "Laminar: total lane sponsorships");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_preempts, CTLFLAG_RD,
+    &laminar_lane_preempts, 0, "Laminar: lane wake-preempts sent");
 SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
     &sched_slice, 0,
     "Laminar: base time slice in stathz ticks (low-load posture)");
@@ -3564,6 +3667,247 @@ sched_laminar_setpreempt(int pri)
 	ast_sched_locked(ctd, TDA_SCHED);
 }
 
+/*
+ * Deadline-lane management (phase I).  Control surface: /dev/laminar
+ * ioctls (cdev + ioctl is the Atrium house style; graduates to the
+ * broker syscall family with EVFILT_DEADLINE in phase J).  Phase I
+ * sponsors the CALLING thread only — the metronome self-sponsors;
+ * broker sponsorship-by-tid arrives with frescod integration.
+ */
+struct lam_lane_req {
+	uint64_t q_us;		/* budget per period */
+	uint64_t t_us;		/* period */
+};
+struct lam_lane_stats {
+	uint64_t periods;
+	uint64_t misses;
+	uint64_t throttles;
+	uint64_t max_late_us;	/* worst replenish-callout lateness */
+	int32_t cpu;
+	int32_t pad;
+};
+#define	LAMIOC_SPONSOR	_IOW('L', 1, struct lam_lane_req)
+#define	LAMIOC_WITHDRAW	_IO('L', 2)
+#define	LAMIOC_YIELD	_IO('L', 3)
+#define	LAMIOC_STATS	_IOR('L', 4, struct lam_lane_stats)
+
+/*
+ * Period replenishment.  Runs as a callout pinned to the entity's CPU;
+ * takes the tdq spin lock by hand (callout_init_mtx cannot carry a spin
+ * mutex).  Scores the closing period (miss = the thread neither yielded
+ * nor was throttled — it is still chewing past its deadline), resets the
+ * budget, releases a yielded sleeper, and measures its own lateness —
+ * the in-kernel callout-latency instrumentation the wakelat bimodal
+ * artifact needs (plan risk R2).
+ */
+static void
+laminar_lane_replenish(void *arg)
+{
+	struct laminar_lane_entity *le = arg;
+	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+	sbintime_t now, late;
+	bool was_yielded;
+
+	LAMINAR_TDQ_LOCK(tdq);
+	if (le->le_td == NULL) {	/* withdrawn while in flight */
+		LAMINAR_TDQ_UNLOCK(tdq);
+		return;
+	}
+	now = sbinuptime();
+	late = now - le->le_deadline;
+	if (late > 0) {
+		uint64_t late_us = ((uint64_t)late * 1000000ULL) >> 32;
+
+		if (late_us > le->le_max_late_us)
+			le->le_max_late_us = late_us;
+	}
+	le->le_periods++;
+	if (!le->le_yielded && !le->le_throttled)
+		le->le_misses++;
+	was_yielded = le->le_yielded;
+	le->le_yielded = false;
+	le->le_throttled = false;
+	le->le_budget_us = le->le_q_us;
+	le->le_deadline += le->le_t_sbt;
+	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
+	    laminar_lane_replenish, le, le->le_cpu, C_ABSOLUTE);
+	LAMINAR_TDQ_UNLOCK(tdq);
+	if (was_yielded)
+		wakeup(le);
+}
+
+/* Sponsor curthread as a lane entity; picks the least lane-utilized CPU. */
+static int
+laminar_lane_sponsor(struct thread *td, uint64_t q_us, uint64_t t_us)
+{
+	struct laminar_tdq *tdq;
+	struct laminar_lane_entity *le = NULL;
+	int cpu, best_cpu = -1, best_util = INT_MAX, util, i;
+
+	if (!laminar_deadline_enable)
+		return (ENXIO);
+	if (q_us == 0 || t_us < 1000 || t_us > 1000000 || q_us >= t_us)
+		return (EINVAL);
+	if (td_get_sched(td)->ts_lane != NULL)
+		return (EBUSY);
+	util = (int)((q_us * 1000) / t_us);	/* per-mille */
+
+	CPU_FOREACH(cpu) {
+		int u = LAMINAR_TDQ_CPU(cpu)->ltdq_lane_util;
+
+		if (u + util <= laminar_deadline_util_max && u < best_util) {
+			best_util = u;
+			best_cpu = cpu;
+		}
+	}
+	if (best_cpu < 0)
+		return (ENOSPC);	/* admission: no CPU has room */
+
+	/*
+	 * No sched_bind: it pins (td_pinned) and a user thread cannot
+	 * return to userspace pinned ("userret: Returning with pinned
+	 * thread" — learned by panic).  Placement is forced instead in
+	 * sched_laminar_pickcpu (active lane entity → le_cpu), which
+	 * covers the dominant wake path; a rare balancer migration
+	 * self-corrects at the next wake.
+	 */
+	tdq = LAMINAR_TDQ_CPU(best_cpu);
+	LAMINAR_TDQ_LOCK(tdq);
+	for (i = 0; i < LAMINAR_LANE_MAX; i++) {
+		if (tdq->ltdq_lane[i].le_td == NULL) {
+			le = &tdq->ltdq_lane[i];
+			break;
+		}
+	}
+	if (le == NULL) {
+		LAMINAR_TDQ_UNLOCK(tdq);
+		return (ENOSPC);
+	}
+	le->le_cpu = best_cpu;
+	le->le_q_us = q_us;
+	le->le_t_us = t_us;
+	le->le_t_sbt = (sbintime_t)t_us * SBT_1US;
+	le->le_budget_us = q_us;
+	le->le_throttled = false;
+	le->le_yielded = false;
+	le->le_periods = le->le_misses = le->le_throttles = 0;
+	le->le_max_late_us = 0;
+	le->le_deadline = sbinuptime() + le->le_t_sbt;
+	le->le_td = td;
+	td_get_sched(td)->ts_lane = le;
+	tdq->ltdq_lane_n++;
+	tdq->ltdq_lane_util += util;
+	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
+	    laminar_lane_replenish, le, best_cpu, C_ABSOLUTE);
+	LAMINAR_TDQ_UNLOCK(tdq);
+	laminar_lane_sponsors++;
+	return (0);
+}
+
+static int
+laminar_lane_withdraw(struct thread *td)
+{
+	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+	struct laminar_tdq *tdq;
+	int util;
+
+	if (le == NULL)
+		return (ENOENT);
+	tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+	LAMINAR_TDQ_LOCK(tdq);
+	util = (int)((le->le_q_us * 1000) / le->le_t_us);
+	le->le_td = NULL;	/* pick + replenish stop touching it */
+	td_get_sched(td)->ts_lane = NULL;
+	tdq->ltdq_lane_n--;
+	tdq->ltdq_lane_util -= util;
+	LAMINAR_TDQ_UNLOCK(tdq);
+	callout_drain(&le->le_callout);
+	return (0);
+}
+
+/*
+ * Done for this period: sleep until the replenishment callout.  The
+ * absolute-deadline tsleep_sbt makes the wakeup race harmless — if the
+ * callout's wakeup() slips between unlock and sleep, the sleep still
+ * expires at the same instant the deadline passes.
+ */
+static int
+laminar_lane_yield(struct thread *td)
+{
+	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+	struct laminar_tdq *tdq;
+	sbintime_t deadline;
+
+	if (le == NULL || le->le_td != td)
+		return (ENOENT);
+	tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+	LAMINAR_TDQ_LOCK(tdq);
+	le->le_yielded = true;
+	deadline = le->le_deadline;
+	LAMINAR_TDQ_UNLOCK(tdq);
+	(void)tsleep_sbt(le, 0, "lane", deadline, 0, C_ABSOLUTE);
+	return (0);
+}
+
+static int
+laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
+    struct thread *td)
+{
+	switch (cmd) {
+	case LAMIOC_SPONSOR: {
+		struct lam_lane_req *r = (struct lam_lane_req *)data;
+
+		return (laminar_lane_sponsor(td, r->q_us, r->t_us));
+	}
+	case LAMIOC_WITHDRAW:
+		return (laminar_lane_withdraw(td));
+	case LAMIOC_YIELD:
+		return (laminar_lane_yield(td));
+	case LAMIOC_STATS: {
+		struct lam_lane_stats *s = (struct lam_lane_stats *)data;
+		struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+		struct laminar_tdq *tdq;
+
+		if (le == NULL)
+			return (ENOENT);
+		tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+		LAMINAR_TDQ_LOCK(tdq);
+		s->periods = le->le_periods;
+		s->misses = le->le_misses;
+		s->throttles = le->le_throttles;
+		s->max_late_us = le->le_max_late_us;
+		s->cpu = le->le_cpu;
+		s->pad = 0;
+		LAMINAR_TDQ_UNLOCK(tdq);
+		return (0);
+	}
+	default:
+		return (ENOTTY);
+	}
+}
+
+static struct cdevsw laminar_lane_cdevsw = {
+	.d_version =	D_VERSION,
+	.d_ioctl =	laminar_lane_ioctl,
+	.d_name =	"laminar",
+};
+
+static void
+laminar_lane_dev_init(void *arg __unused)
+{
+	struct make_dev_args mda;
+	struct cdev *dev;
+
+	make_dev_args_init(&mda);
+	mda.mda_devsw = &laminar_lane_cdevsw;
+	mda.mda_uid = UID_ROOT;
+	mda.mda_gid = GID_WHEEL;
+	mda.mda_mode = 0600;
+	(void)make_dev_s(&mda, &dev, "laminar");
+}
+SYSINIT(laminar_lane_dev, SI_SUB_DRIVERS, SI_ORDER_ANY,
+    laminar_lane_dev_init, NULL);
+
 static void
 sched_laminar_add(struct thread *td, int flags)
 {
@@ -3607,6 +3951,18 @@ sched_laminar_add(struct thread *td, int flags)
 		 * non-timeshare and for the cooldown-blocked case.
 		 */
 		bool sent_cost_ipi = false;
+		/*
+		 * Deadline-lane wake: an in-budget lane entity's wake must
+		 * preempt a timeshare incumbent NOW — its deadline is real;
+		 * the vruntime gate and the cooldown do not apply (this is
+		 * the wake-preempt the 15.39ms p99 plateau measured the
+		 * absence of, scoped to the lane).
+		 */
+		bool lane_wake = __predict_false(laminar_deadline_enable) &&
+		    td_get_sched(td)->ts_lane != NULL &&
+		    td_get_sched(td)->ts_lane->le_td == td &&
+		    !td_get_sched(td)->ts_lane->le_throttled &&
+		    !td_get_sched(td)->ts_lane->le_yielded;
 		if (laminar_is_timeshare(td) &&
 		    (flags & SRQ_YIELDING) == 0) {
 			if (tdq->ltdq_curthread == NULL ||
@@ -3635,9 +3991,10 @@ sched_laminar_add(struct thread *td, int flags)
 				    LAMINAR_NICE_0_WEIGHT;
 				int now = ticks;
 
-				if (v > floor + r_band) {
+				if (!lane_wake && v > floor + r_band) {
 					laminar_cp_skip_v++;
-				} else if (now - tdq->ltdq_last_preempt <
+				} else if (!lane_wake &&
+				    now - tdq->ltdq_last_preempt <
 				    (int)laminar_preempt_cooldown) {
 					laminar_cp_skip_cool++;
 				} else if (tdq->ltdq_owepreempt) {
@@ -3648,14 +4005,36 @@ sched_laminar_add(struct thread *td, int flags)
 					atomic_thread_fence_seq_cst();
 					ipi_cpu(cpu, IPI_PREEMPT);
 					laminar_cp_ipi++;
+					if (lane_wake)
+						laminar_lane_preempts++;
 					sent_cost_ipi = true;
 				}
 			}
 		}
 		if (!sent_cost_ipi)
 			tdq_notify(tdq, lowpri);
-	} else if ((flags & SRQ_YIELDING) == 0)
+	} else if ((flags & SRQ_YIELDING) == 0) {
+		/*
+		 * Local lane wake (the common case: the replenishment
+		 * callout is pinned to the entity's CPU): force the AST on
+		 * a timeshare incumbent so the lane pick happens at the
+		 * next switch, not the next slice end.
+		 */
+		if (__predict_false(laminar_deadline_enable) &&
+		    td_get_sched(td)->ts_lane != NULL &&
+		    td_get_sched(td)->ts_lane->le_td == td &&
+		    !td_get_sched(td)->ts_lane->le_throttled &&
+		    !td_get_sched(td)->ts_lane->le_yielded) {
+			struct thread *ctd = tdq->ltdq_curthread;
+
+			if (ctd != NULL && !TD_IS_IDLETHREAD(ctd) &&
+			    laminar_is_timeshare(ctd)) {
+				ast_sched_locked(ctd, TDA_SCHED);
+				laminar_lane_preempts++;
+			}
+		}
 		sched_laminar_setpreempt(td->td_priority);
+	}
 #else
 	tdq = LAMINAR_TDQ_SELF();
 	if (td->td_lock != LAMINAR_TDQ_LOCKPTR(tdq)) {
@@ -3700,6 +4079,21 @@ sched_laminar_choose(void)
 	tdq = LAMINAR_TDQ_SELF();
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	laminar_choose_calls++;
+	/* Lane budget: charge the outgoing thread its actual on-cpu time. */
+	if (__predict_false(laminar_deadline_enable) &&
+	    tdq->ltdq_curthread != NULL) {
+		struct td_sched *ots = td_get_sched(tdq->ltdq_curthread);
+		struct laminar_lane_entity *ole = ots->ts_lane;
+
+		if (ole != NULL && ole->le_td == tdq->ltdq_curthread &&
+		    ole->le_run_start != 0) {
+			sbintime_t ran = sbinuptime() - ole->le_run_start;
+
+			ole->le_budget_us -= (int64_t)
+			    (((uint64_t)ran * 1000000ULL) >> 32);
+			ole->le_run_start = 0;
+		}
+	}
 	td = tdq_choose(tdq);
 	if (td != NULL) {
 		struct td_sched *ts = td_get_sched(td);
@@ -3765,6 +4159,13 @@ sched_laminar_choose(void)
 		 */
 		tdq_runq_rem(tdq, td);
 		tdq->ltdq_lowpri = td->td_priority;
+		if (__predict_false(laminar_deadline_enable)) {
+			struct laminar_lane_entity *nle =
+			    td_get_sched(td)->ts_lane;
+
+			if (nle != NULL && nle->le_td == td)
+				nle->le_run_start = sbinuptime();
+		}
 	} else {
 		tdq->ltdq_lowpri = PRI_MAX_IDLE;
 		td = PCPU_GET(idlethread);
@@ -3782,6 +4183,37 @@ sched_laminar_clock(struct thread *td, int cnt)
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	tdq = LAMINAR_TDQ_SELF();
 	ts = td_get_sched(td);
+
+	/*
+	 * Deadline-lane CBS budget charge.  Statclock granularity is the
+	 * phase-I budget clock; exhaustion throttles the entity to plain
+	 * timeshare until its replenishment callout (overrun isolation —
+	 * the D5 guarantee).  TDF_SLICEEND forces the AST so the overrunner
+	 * yields the CPU promptly rather than at its natural switch.
+	 */
+	if (__predict_false(laminar_deadline_enable) && ts->ts_lane != NULL) {
+		struct laminar_lane_entity *le = ts->ts_lane;
+
+		/*
+		 * Precise overrun DETECTION only — the actual charge happens
+		 * at switch-out in sched_laminar_choose with real elapsed
+		 * time.  A statclock-quantum charge here (7.9ms at
+		 * stathz=127) instantly mis-throttled ms-scale budgets
+		 * (measured: 15%% spurious throttles on an IDLE box).
+		 */
+		if (le->le_td == td && !le->le_throttled && !le->le_yielded &&
+		    le->le_run_start != 0) {
+			sbintime_t ran = sbinuptime() - le->le_run_start;
+			int64_t ran_us = (int64_t)
+			    (((uint64_t)ran * 1000000ULL) >> 32);
+
+			if (le->le_budget_us - ran_us <= 0) {
+				le->le_throttled = true;
+				le->le_throttles++;
+				td->td_flags |= TDF_SLICEEND;
+			}
+		}
+	}
 
 	/*
 	 * Account work to the thread's vruntime.  Phase A.4: ts_eff_weight
