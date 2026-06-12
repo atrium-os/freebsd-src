@@ -310,3 +310,37 @@ pipe-wake tails (piperlat 16 spinners, 4 watchdogs, 10 s × 3 passes):
    (spinlock hold times: balancer? sharded reduction?) or a Laminar-
    correlated HVF artifact (IPI rate), NOT scheduling policy. Must be
    bracketed before the frescod broker builds on lane latency.
+
+## Stall investigation: the "Laminar-only stalls" verdict (2026-06-12)
+
+gapdet.c (new): rtprio tight loop pinned to a CPU recording execution
+gaps — from userspace a multi-ms gap is host/HVF descheduling, a long
+interrupts-off section, or higher-priority kernel-thread monopoly.
+
+Dirty window (the boot that produced the A/B numbers above):
+Laminar cpu0 idle: 20 gaps, worst 11.3 ms; 16 spinners: 267 gaps,
+worst 27.2 ms. ULE (measured LATER): 1 gap ~1 ms in 30 s.
+
+Fresh Laminar boot, same load matrix: 0–5 gaps, worst 1.4 ms —
+ULE-grade — with the balancer at its default 100 ms period, parked at
+10 s, and re-enabled (balancer NOT implicated). deadline_enable on or
+off: no effect. And the lane gate at the same 10k-period horizon that
+previously showed 56–223 misses: **0 misses, 0 throttles, worst
+replenish lateness 139 µs–1.3 ms** — twice, including with gapdet
+running concurrently on another CPU.
+
+### Corrected verdict
+
+The stalls are EPISODIC and window-correlated, not systematically
+Laminar: the dirty window's ULE measurements were taken after the
+window had passed, so "Laminar-only" was a time-confounded comparison.
+A 96 ms-late C_DIRECT_EXEC callout is a delayed timer interrupt — no
+guest scheduler path plausibly holds interrupts off that long; host
+(HVF vCPU descheduling) episodes remain the prime suspect. What IS
+established: on a quiet system the lane delivers 0/10000 misses with
+sub-1.5 ms worst replenish lateness, and Laminar's gap profile equals
+ULE's.
+
+Protocol going forward: gapdet is the standing sentinel; if a dirty
+window recurs, run gapdet on BOTH kernels INSIDE the window before
+attributing. The phase-J broker is unblocked.
