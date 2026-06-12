@@ -101,3 +101,38 @@ lost/late timer-rearm or IPI race, not a queue-state bug.
 Status: P0.3 narrowed from "scheduler picker bug" to "timer-or-ithread wake
 path, perturbation-masked, Laminar-correlated". The plan's R2 risk (callout
 precision in the VM) and this artifact may be the same animal.
+
+## P0.3 round 3 — piperlat (callout-free wake path) + an RT placement bug
+
+`piperlat`: a busy-waiting ticker (no nanosleep → no callout → no eventtimer in
+the wake path) writes send-timestamps into pipes; timeshare watchdogs block in
+read(). Deltas cover wakeup→enqueue→pick→on-cpu only. (Percentiles are skewed
+by queue-drain after a stall — **max** is the comparable stat. Also fixed a
+fork-fd-inheritance deadlock in the harness itself; see source comment.)
+
+**Result 1 — the pipe wake path never goes multi-second.** Non-RT, spin=16,
+4 runs: max 31–47 ms (p50 2.6 µs; p99 ~8–15 ms = the same no-wake-preempt slice
+plateau). Today's interleaved wakelat controls happened not to fire the
+multi-second event (0/4; ~13% chance given the ~40% rate), so strictly this is
+cumulative rather than same-session evidence — but across *all* runs ever, the
+callout path has produced 2.2–5.2 s maxes repeatedly and the pipe path never
+exceeded 47 ms. The artifact lives in the **callout/eventtimer wake path**.
+
+**Result 2 — NEW, deterministic, severe: placement is RT-blind.** One RT
+busy-looper (piperlat `rt`): p50 14 ms, **p90 6.19 s, p99.9 8.17 s, max 8.19 s**
+— reproducible, not bimodal. Timeshare watchdogs keep being placed on the
+RT-occupied CPU and starve for the rest of the run: the placement signal
+(wload = Σ timeshare weights) does not see non-timeshare occupancy, and nothing
+steals them back. **Plan impact (P2-prerequisite):** the deadline lane runs
+threads above timeshare — without counting lane/RT occupancy in the placement
+signal (or marking such CPUs unavailable to timeshare placement), the lane
+would reproduce this starvation systemically. Fix belongs in `sched_laminar.c`
+placement (count PRI_ITHD/RT/lane occupancy into the effective load, or exclude
+occupied CPUs), gated + benched like every phase.
+
+**P0.3 disposition:** (i) multi-second nanosleep max → callout/eventtimer path,
+perturbation-sensitive; close via KTR in `sleepq_timeout`/callout rearm during
+P2 (same instrumentation as plan risk R2). (ii) RT-blind placement → confirmed
+bug with a deterministic reproducer (`piperlat N M T 1000 rt`); fix scheduled as
+a P2 prerequisite. (iii) The 15.39 ms p99 plateau (finding 2 above) → wake
+preemption, addressed by P2's lane-preempt mechanism.
