@@ -256,3 +256,57 @@ wakes within tens of microseconds of its period grid and misses zero
 deadlines — the P1 lane.rs proof now holds on the real kernel.
 Regression sanity with deadline_enable=0: piperlat p50 2.6 us, known
 equal-priority p99 plateau unchanged.
+
+## ULE A/B + long tails (2026-06-12, pre-broker checkpoint)
+
+Same kernel binary both sides (LAMINAR-DEV carries both schedulers;
+`kern.sched.name` tunable selects at boot). Workload: audio shape
+(T=2.7 ms, work=1 ms), 10000 periods (~27 s), 16 spinners on 4 vCPUs.
+metronome-posix = clock_nanosleep(TIMER_ABSTIME) grid + busy work;
+"miss" = work not finished by period end.
+
+| config                  | misses        | wake p50 | p99    | p99.9  | max     |
+|-------------------------|---------------|----------|--------|--------|---------|
+| Laminar LANE            | 56–223 (runs) | (a)      | (a)    | (a)    | (a)     |
+| Laminar timeshare       | 9859 (98.6%)  | 14.8 s   | —      | —      | 28 s    |
+| Laminar rtprio          | 23            | 6.7 µs   | 25 µs  | 6.2 ms | 13.9 ms |
+| ULE timeshare           | 332 (3.3%)    | 5.9 µs   | 49 ms  | 89 ms  | 100 ms  |
+| ULE rtprio              | 0             | 5.9 µs   | 15 µs  | 34 µs  | 473 µs  |
+| RT idle ctrl (Laminar)  | 0–4           | 5.2 µs   | 21 µs  | 0.1–1.5 ms | 1.1–8 ms |
+| RT idle ctrl (ULE)      | 0             | 4.7 µs   | 17 µs  | 49 µs  | 1.1 ms  |
+
+(a) The lane metronome's user-side percentiles proved unreliable at long
+horizons: residuals spread uniformly over [0, T/2] while the kernel saw
+only ~2% misses — if phase truly wandered, ~37% of replenishes would
+catch the thread mid-work. Suspected userspace-timecounter vs kernel-sbt
+phase artifact under HVF; un-diagnosed, kernel counters are the valid
+measure. Short-window raw lateness (500 periods, 16 spinners): max 18 µs.
+
+pipe-wake tails (piperlat 16 spinners, 4 watchdogs, 10 s × 3 passes):
+
+    Laminar: p50 2.6 µs  p99 2.8–15.4 ms  p99.9 24–47 ms  max 47–78 ms
+    ULE:     p50 2.4 µs  p99 24–28 µs     p99.9 126–142 ms max 315–402 ms
+
+### Reading
+
+1. **The lane is the only mechanism giving unprivileged, admitted work
+   near-RT periodicity.** Laminar timeshare fails the workload outright
+   (no equal-priority wake preempt — by design); the lane brings it to
+   ~0.5–2% misses, all correlated with rare platform/kernel stalls (see
+   3), with admission control and overrun isolation rtprio cannot give
+   (an admitted runaway gets throttled; an RT runaway starves the box,
+   and rtprio needs root).
+2. **Undeclared tails, honestly:** ULE's interactivity heuristic wins
+   p50–p99 on pipe wakes (25 µs vs Laminar's slice plateau, 2.8–15.4 ms);
+   Laminar's bounded-lag clamp wins the extreme tail by ~5× (max 78 ms
+   vs 402 ms). The federation doc's "competitive on undeclared tails"
+   holds at p99.9/max, not at p99 — the declared lane (not a heuristic)
+   is Atrium's answer for the wakes that matter.
+3. **OPEN before phase J:** Laminar boots show rare 7–97 ms stall events
+   that ULE boots do not (same horizons, adjacent runs): replenish
+   direct-exec callouts 31–97 ms late, RT wake max 13.9 ms vs ULE
+   473 µs, idle-control max 8 ms vs 1.1 ms. A late DIRECT callout means
+   a delayed timer interrupt — pointing at interrupts-disabled sections
+   (spinlock hold times: balancer? sharded reduction?) or a Laminar-
+   correlated HVF artifact (IPI rate), NOT scheduling policy. Must be
+   bracketed before the frescod broker builds on lane latency.
