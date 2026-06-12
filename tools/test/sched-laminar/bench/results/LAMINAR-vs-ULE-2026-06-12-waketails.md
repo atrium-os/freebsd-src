@@ -169,3 +169,28 @@ by construction.
 Remaining P0.3 thread: the bimodal multi-second *nanosleep* max (callout path)
 — unchanged by this fix, still closed via KTR in P2. Full bench_all regression
 sweep before P2 starts.
+
+## Regression sweep after the rt_occupied_cost fix (same day)
+
+Full suite on the fixed kernel (`laminar-2026-06-12-postfix.txt`), vs the
+2026-05-20 Laminar baseline:
+
+- **burst**: 181.6 wakes/s vs 155.6 — **+17%**.
+- **skew**: all-cpus 2.74:1.00:0.30 (target 3.05); cpu0-only **exactly
+  3.05:1.00:0.33** — nice weighting intact.
+- **latency**: all configs clean; notably spin=8 p99 = 17.3 µs in the sweep
+  pass (the 15.39 ms plateau did not appear — promising but needs repeated
+  passes before claiming; possibly the penalty now scatters simultaneous
+  kernel-priority wakers that previously piled onto one CPU).
+- **ipc**: 1-pair RTT 1.34 µs, 4-pair 2.12 µs — in line with May.
+- **throughput/fair**: noisy as documented (fork-storm variance). Knob on/off
+  A/B (2 runs each side + 2 confirm): N=8 cost=64 → 4.20/3.31/4.10/4.44x,
+  cost=0 → 4.18/4.18x — overlapping distributions, no attributable
+  regression; the knob-on set contains the single best result of the day
+  (4.44x at 6.1% spread).
+
+**Verdict: the placement fix is regression-clean within the suite's noise
+envelope, with burst improved and the RT-starvation pathology eliminated
+(~500x).** One bench-harness note: scripts lose +x over 9p (run from a guest
+copy) and spin-based benches need `../spin` next to the bench dir — the first
+sweep silently produced garbage iters without it.
