@@ -512,3 +512,31 @@ Self-regulating: a heavy client throttles itself, never frescod.
 In-VM (venus, 16 spinners): sponsored client 603 frames 0 misses with
 both threads adopted. Explicit wire-level deadline context for
 cross-service chains (app -> lyrad -> driver) rides the same primitive.
+
+## P6 (CPU half) — the energy-optimal DVFS floor f* (2026-06-12)
+
+The load-proportional DVFS target is now clamped to the energy-optimal
+floor: E(f) = k·W·f² + P_static·W/f is convex with minimum at
+f* = (P_static/2k)^(1/3) — BELOW f*, running slower wastes energy
+(leakage over the longer runtime beats the dynamic saving; race-to-idle
+at f* wins). In-kernel f* needs no model constants: energy per unit
+work at level i is (P_i − P_idle)/f_i straight from the cpufreq level
+table; f* = argmin, recomputed each step. kern.sched.dvfs_idle_mw
+(platform idle power the table excludes) raises f*;
+kern.sched.dvfs_fstar_idx is the observable. Levels without power data
+leave f* unconstrained (no behavior change).
+
+Gate (cpufreq_mock 5-level table): f* = idx 3 (800 MHz — the table's
+P/f argmin; the 400 MHz level is voltage-floored so P/f rises again,
+realistic); dvfs_idle_mw=300 moves f* to idx 4 as the math says; under
+power_policy=0 (powersave) the controller settled at cur_idx == 3 ==
+f* — the policy that previously dove to 400 MHz now stops at the
+energy-optimal floor. Clamp-only change, inert at phaseh_enable=0.
+
+Caveats recorded honestly: lane regressions could not be evaluated
+tonight — both VM profiles entered a dirty window (gapdet sentinel: 564
+gaps/41 ms worst headless; 240 ms-late direct callouts on venus),
+metronome dirty with phaseh OFF too, so the noise is the episodic
+host-stall class, not P6 (which is inert when disabled). Re-gate lanes
+in a clean window. The across-member half of P6 (watt-budget
+water_fill) awaits the GPU member integration.
