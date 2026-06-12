@@ -419,3 +419,37 @@ Phase J complete: brokered, vblank-anchored, miss-fed deadline lane,
 kernel-to-compositor. Next per plan: P4 inheritance (K-a turnstile
 deadline bands), the lyrad audio broker when lyrad exists, and the
 manifest deadline_broker capability to replace the root gate (D9).
+
+## Phase K-a — deadline inheritance via the turnstile band (2026-06-12)
+
+A sponsored, in-budget lane entity now carries its user priority at the
+BAND (PRI_MIN_TIMESHARE - 1, top of the kernel range). Inheritance then
+needs no new propagation machinery: when a lane thread blocks on a
+kernel lock or a PTHREAD_PRIO_INHERIT umtx, the EXISTING turnstile /
+umtx PI lends the band to the holder.
+
+The Laminar-specific design lesson (paid for in a wrong first cut):
+**lent priority is invisible inside the WFQ tier** — Laminar picks
+timeshare by vruntime, so a holder boosted to PRI_MIN_TIMESHARE stayed
+in the SoA and inherited nothing (measured: PI WORSE than the plain
+control). The band must sit BELOW PRI_MIN_TIMESHARE so a boosted holder
+routes to the priority-bucket runq that tdq_choose's rt-path picks
+ahead of everything timeshare — the holder wins SELECTION, not just
+preemption checks. Three corollaries landed with it: the rt-path defers
+active lane threads to the EDF scan (same-CPU lane entities keep real-
+deadline order instead of FIFO-within-band); the statclock throttle
+demotes the band for the rest of the period (an overrunner at kernel-
+range priority would defeat its own isolation); the lane wake path
+re-bands after a clean replenish.
+
+Gate (lane-pi: lane thread takes a shared mutex each 5 ms period; a
+nice-20 holder process grabs it in 300 us bursts; 16 spinners; clean
+window verified by gapdet, worst gap 936 us):
+
+    PLAIN (PRIO_NONE) control:  misses = 213 / 2001 (10.65%)
+    PI (PRIO_INHERIT) + band:   misses =   0 / 2001 (0.00%)
+
+Audio-chain-shaped inversion, fully closed by K-a. Regressions hold
+(metronome 0/1000, vbroker kill-test clean). Remaining for K-b:
+deadline LENDING with charge-back (the holder runs on the blocked
+entity's budget) and Aqueduct deadline-context propagation.
