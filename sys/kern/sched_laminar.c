@@ -356,6 +356,8 @@ struct laminar_lane_entity {
 	sbintime_t	le_run_start;	/* sbinuptime at last on-cpu (0 = off) */
 	struct callout	le_callout;	/* period replenishment */
 	void		*le_priv;	/* owning /dev/laminar fd cookie */
+	u_char		le_saved_upri;	/* pre-band td_base_user_pri */
+	bool		le_banded;	/* K-a band applied */
 	/* stats (read via LAMIOC_STATS) */
 	uint64_t	le_periods;
 	uint64_t	le_misses;	/* period ended, work not yielded */
@@ -371,6 +373,9 @@ static u_long laminar_lane_wakes = 0;	/* lane wakes seen at local sched_add */
 static u_long laminar_lane_wake_blocked = 0; /* incumbent not timeshare */
 static void laminar_lane_priv_dtor(void *data);
 static void laminar_lane_teardown(struct laminar_lane_entity *le);
+static void laminar_lane_band_apply(struct thread *td,
+    struct laminar_lane_entity *le);
+static void laminar_lane_band_restore(pid_t pid, lwpid_t tid, u_char saved);
 
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
@@ -1229,8 +1234,24 @@ tdq_choose(struct laminar_tdq *tdq)
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
 	rt = runq_choose(&tdq->ltdq_runq);
-	if (rt != NULL && rt->td_priority < PRI_MIN_TIMESHARE)
-		return (rt);
+	if (rt != NULL && rt->td_priority < PRI_MIN_TIMESHARE) {
+		struct laminar_lane_entity *rle = td_get_sched(rt)->ts_lane;
+
+		/*
+		 * A banded lane thread (K-a, priority LANE_BAND) lives in
+		 * this runq but is DISPATCHED by the EDF scan below, so
+		 * same-CPU lane entities order by real deadline rather
+		 * than FIFO-within-band.  Anything else here (POSIX RT,
+		 * kernel-priority sleepers, PI-BOOSTED HOLDERS at the
+		 * band) is returned as before — the boosted holder
+		 * winning selection IS the K-a inheritance mechanism.
+		 */
+		if (!(__predict_false(laminar_deadline_enable) &&
+		    rle != NULL && rle->le_td == rt && !rle->le_throttled &&
+		    !rle->le_yielded))
+			return (rt);
+		/* deferred: the EDF scan below dispatches lane threads */
+	}
 	/*
 	 * Deadline lane: EDF among released, in-budget, un-yielded
 	 * entities whose thread is runnable here.  Behind the POSIX RT
@@ -3924,6 +3945,8 @@ laminar_lane_sponsor_td(struct thread *target, uint64_t q_us, uint64_t t_us,
 	le->le_max_late_us = 0;
 	le->le_deadline = first;
 	le->le_priv = priv;
+	le->le_saved_upri = 0;
+	le->le_banded = false;
 	le->le_td = target;
 	td_get_sched(target)->ts_lane = le;
 	tdq->ltdq_lane_n++;
@@ -3931,8 +3954,78 @@ laminar_lane_sponsor_td(struct thread *target, uint64_t q_us, uint64_t t_us,
 	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
 	    laminar_lane_replenish, le, best_cpu, C_ABSOLUTE | C_DIRECT_EXEC);
 	LAMINAR_TDQ_UNLOCK(tdq);
+	laminar_lane_band_apply(target, le);	/* K-a inheritance band */
 	laminar_lane_sponsors++;
 	return (0);
+}
+
+/*
+ * K-a deadline inheritance — the turnstile BAND (plan D11 stage K-a).
+ *
+ * A sponsored, in-budget lane entity surfaces at LANE_BAND priority
+ * (top of timeshare).  Inheritance then needs NO new propagation
+ * machinery: when a lane thread blocks on a kernel lock or a
+ * PTHREAD_PRIO_INHERIT umtx, the EXISTING turnstile / umtx PI lends
+ * the band to the holder, who then outranks every undeclared thread,
+ * runs promptly, and releases.  EDF dispatch is untouched: the band is
+ * still timeshare-class, so the RT path does not pick lane threads —
+ * the lane EDF scan still orders them by real deadline.
+ *
+ * Known K-a gap (documented, fixed by K-b accounting): a THROTTLED
+ * entity keeps the band until its next replenish (<= T away) — the
+ * statclock detector cannot take the remote thread lock to demote.
+ */
+/*
+ * The band must be BELOW PRI_MIN_TIMESHARE: laminar_is_timeshare routes
+ * priority >= PRI_MIN_TIMESHARE into the vruntime-ordered SoA, where
+ * lent priority is INVISIBLE (WFQ picks by vruntime); < PRI_MIN_TIMESHARE
+ * routes to the priority-bucket runq that tdq_choose's rt-path picks
+ * first.  Band = top of the kernel range, so a PI-boosted holder wins
+ * SELECTION, not just preemption checks.  (First attempt used
+ * PRI_MIN_TIMESHARE itself: the boosted holder stayed in WFQ and
+ * inheritance did nothing — measured as PI performing WORSE than the
+ * plain-mutex control.)
+ */
+#define	LAMINAR_LANE_BAND	(PRI_MIN_TIMESHARE - 1)
+
+static void
+laminar_lane_band_apply(struct thread *td, struct laminar_lane_entity *le)
+{
+
+	thread_lock(td);
+	le->le_saved_upri = td->td_base_user_pri;
+	le->le_banded = true;
+	if (td->td_base_user_pri > LAMINAR_LANE_BAND) {
+		td->td_base_user_pri = LAMINAR_LANE_BAND;
+		if (td->td_user_pri > LAMINAR_LANE_BAND)
+			td->td_user_pri = LAMINAR_LANE_BAND;
+	}
+	thread_unlock(td);
+}
+
+/*
+ * Restore the pre-band user priority after teardown.  The thread may
+ * be gone (client died — nothing to restore) or re-sponsored (a newer
+ * entity owns its priority now; leave it).
+ */
+static void
+laminar_lane_band_restore(pid_t pid, lwpid_t tid, u_char saved)
+{
+	struct thread *td;
+
+	td = tdfind(tid, pid);
+	if (td == NULL)
+		return;
+	if (td_get_sched(td)->ts_lane == NULL) {
+		thread_lock(td);
+		if (td->td_base_user_pri == LAMINAR_LANE_BAND)
+			td->td_base_user_pri = saved;
+		if (td->td_user_pri == LAMINAR_LANE_BAND &&
+		    td->td_lend_user_pri > saved)
+			td->td_user_pri = saved;
+		thread_unlock(td);
+	}
+	PROC_UNLOCK(td->td_proc);
 }
 
 /*
@@ -3967,10 +4060,15 @@ laminar_lane_get_priv(void)
  * (le_td cleared under the tdq lock, then the callout drained).
  */
 static void
-laminar_lane_teardown(struct laminar_lane_entity *le)
+laminar_lane_teardown_common(struct laminar_lane_entity *le,
+    bool restore_prio)
 {
 	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(le->le_cpu);
 	struct thread *otd;
+	pid_t opid = 0;
+	lwpid_t otid = 0;
+	u_char saved = 0;
+	bool banded = false;
 	int util;
 
 	LAMINAR_TDQ_LOCK(tdq);
@@ -3980,14 +4078,31 @@ laminar_lane_teardown(struct laminar_lane_entity *le)
 		return;
 	}
 	util = (int)((le->le_q_us * 1000) / le->le_t_us);
+	if (restore_prio && le->le_banded) {
+		/* capture identity while otd is still pinned by le_td */
+		opid = otd->td_proc->p_pid;
+		otid = otd->td_tid;
+		saved = le->le_saved_upri;
+		banded = true;
+	}
 	le->le_td = NULL;	/* pick + replenish stop touching it */
 	le->le_priv = NULL;
+	le->le_banded = false;
 	if (td_get_sched(otd)->ts_lane == le)
 		td_get_sched(otd)->ts_lane = NULL;
 	tdq->ltdq_lane_n--;
 	tdq->ltdq_lane_util -= util;
 	LAMINAR_TDQ_UNLOCK(tdq);
 	callout_drain(&le->le_callout);
+	if (banded)
+		laminar_lane_band_restore(opid, otid, saved);
+}
+
+static void
+laminar_lane_teardown(struct laminar_lane_entity *le)
+{
+
+	laminar_lane_teardown_common(le, true);
 }
 
 /*
@@ -4032,7 +4147,7 @@ laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
 
 	if (__predict_false(le != NULL) && le->le_td == td)
-		laminar_lane_teardown(le);
+		laminar_lane_teardown_common(le, false);
 }
 
 static int
@@ -4411,8 +4526,20 @@ sched_laminar_add(struct thread *td, int flags)
 		    td_get_sched(td)->ts_lane != NULL &&
 		    td_get_sched(td)->ts_lane->le_td == td &&
 		    !td_get_sched(td)->ts_lane->le_throttled) {
+			struct laminar_lane_entity *wle =
+			    td_get_sched(td)->ts_lane;
 			struct thread *ctd = tdq->ltdq_curthread;
 
+			/*
+			 * K-a: restore the inheritance band after a
+			 * throttle demotion (clean period, waking on the
+			 * grid; we hold the thread lock here).
+			 */
+			if (wle->le_banded &&
+			    td->td_base_user_pri > LAMINAR_LANE_BAND) {
+				td->td_base_user_pri = LAMINAR_LANE_BAND;
+				td->td_user_pri = LAMINAR_LANE_BAND;
+			}
 			laminar_lane_wakes++;
 			if (ctd != NULL && !TD_IS_IDLETHREAD(ctd) &&
 			    laminar_is_timeshare(ctd)) {
@@ -4599,6 +4726,20 @@ sched_laminar_clock(struct thread *td, int cnt)
 				le->le_throttled = true;
 				le->le_throttles++;
 				td->td_flags |= TDF_SLICEEND;
+				/*
+				 * K-a: drop the inheritance band for the
+				 * rest of the period — an overrunner at
+				 * kernel-range priority would beat all of
+				 * WFQ via the rt-path and the throttle
+				 * would not isolate.  Re-banded by the
+				 * lane wake path after a clean replenish.
+				 */
+				if (le->le_banded) {
+					td->td_base_user_pri =
+					    le->le_saved_upri;
+					td->td_user_pri = le->le_saved_upri;
+					td->td_priority = le->le_saved_upri;
+				}
 			}
 		}
 	}
