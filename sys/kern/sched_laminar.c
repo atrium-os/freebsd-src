@@ -2665,6 +2665,19 @@ static int laminar_dvfs_committed_idx;	/* atomic, read by taskqueue */
 static int laminar_dvfs_up_streak;
 static int laminar_dvfs_down_streak;
 static int laminar_dvfs_changes_total;	/* observability */
+/*
+ * P6: the energy-optimal frequency floor f* (federation plan; proven in
+ * gpusim dvfs.rs).  E(f) = k*W*f^2 + P_static*W/f is convex with its
+ * minimum at f* = (P_static/2k)^(1/3): BELOW f*, running slower WASTES
+ * energy — leakage over the longer runtime beats the dynamic saving,
+ * so race-to-idle at f* wins.  In-kernel f* needs no constants: energy
+ * per unit work at level i is (P_i - P_idle)/f_i straight from the
+ * cpufreq level table; f* = argmin.  dvfs_idle_mw is the platform idle
+ * power the table's active numbers exclude (raises f*; default 0 =
+ * conservative).  Levels without power data leave f* unconstrained.
+ */
+static int laminar_dvfs_idle_mw = 0;
+static int laminar_dvfs_fstar_idx = -1;	/* observability; -1 = none */
 
 static struct taskqueue *laminar_dvfs_tq;
 static struct task laminar_dvfs_task;
@@ -2794,6 +2807,14 @@ SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_target_headroom, CTLFLAG_RW,
     &laminar_dvfs_target_headroom, 0,
     "Laminar DVFS: percent capacity above current load_pct used as the "
     "frequency target (default 25)");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_idle_mw, CTLFLAG_RWTUN,
+    &laminar_dvfs_idle_mw, 0,
+    "Laminar P6: platform idle power (mW) excluded from cpufreq level "
+    "power; raises the energy-optimal floor f*");
+SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_fstar_idx, CTLFLAG_RD,
+    &laminar_dvfs_fstar_idx, 0,
+    "Laminar P6: computed energy-optimal frequency floor (level index; "
+    "-1 = no power data, unconstrained)");
 SYSCTL_INT(_kern_sched, OID_AUTO, dvfs_cur_idx, CTLFLAG_RD,
     &laminar_dvfs_cur_idx, 0,
     "Laminar DVFS: current P-state index (0 = fastest)");
@@ -2946,6 +2967,38 @@ laminar_dvfs_step(int load_lead, int load_bare)
 		down_freq = laminar_dvfs_max_freq * load_for_dn / 100;
 	}
 
+	/*
+	 * P6: compute the energy-optimal floor f* from the level table
+	 * (argmin (P_i - idle)/f_i, fixed-point x1024).  Cheap (<= a few
+	 * levels), recomputed every step so dvfs_idle_mw edits apply
+	 * immediately.  Indexes are sorted fastest-first, so "never run
+	 * slower than f*" is a clamp to idx <= fstar.
+	 */
+	{
+		int fstar = -1;
+		int64_t best = INT64_MAX;
+
+		for (i = 0; i < laminar_dvfs_n_levels; i++) {
+			int p = laminar_dvfs_levels[i].total_set.power;
+			int f = laminar_dvfs_levels[i].total_set.freq;
+			int64_t sc;
+
+			if (p <= 0 || f <= 0) {
+				fstar = -1;	/* incomplete data: no floor */
+				break;
+			}
+			p -= laminar_dvfs_idle_mw;
+			if (p < 1)
+				p = 1;
+			sc = ((int64_t)p << 10) / f;
+			if (sc < best) {
+				best = sc;
+				fstar = i;
+			}
+		}
+		laminar_dvfs_fstar_idx = fstar;
+	}
+
 	/* For commit purposes, derive ONE target_idx.  Use the up freq (eager). */
 	target_freq = up_freq;
 	target_idx = laminar_dvfs_n_levels - 1;
@@ -2957,6 +3010,11 @@ laminar_dvfs_step(int load_lead, int load_bare)
 			break;
 		}
 	}
+
+	/* P6: never slower than the energy-optimal floor. */
+	if (laminar_dvfs_fstar_idx >= 0 &&
+	    target_idx > laminar_dvfs_fstar_idx)
+		target_idx = laminar_dvfs_fstar_idx;
 
 	if (target_idx == laminar_dvfs_cur_idx) {
 		laminar_dvfs_up_streak = 0;
