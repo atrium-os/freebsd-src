@@ -359,6 +359,9 @@ static int laminar_deadline_enable = 0;		/* RWTUN master gate */
 static int laminar_deadline_util_max = 750;	/* per-mille per CPU */
 static u_long laminar_lane_sponsors = 0;
 static u_long laminar_lane_preempts = 0;
+static u_long laminar_lane_wakes = 0;	/* lane wakes seen at local sched_add */
+static u_long laminar_lane_wake_blocked = 0; /* incumbent not timeshare */
+static void laminar_lane_dtor(void *data);
 
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
@@ -1237,8 +1240,9 @@ tdq_choose(struct laminar_tdq *tdq)
 		for (i = 0; i < LAMINAR_LANE_MAX; i++) {
 			le = &tdq->ltdq_lane[i];
 			if (le->le_td == NULL || le->le_throttled ||
-			    le->le_yielded || !TD_ON_RUNQ(le->le_td))
-				continue;
+			    le->le_yielded || !TD_ON_RUNQ(le->le_td) ||
+			    td_get_sched(le->le_td)->ts_cpu != tdq->ltdq_id)
+				continue;	/* not queued here (migrated) */
 			if (best == NULL || le->le_deadline < best->le_deadline)
 				best = le;
 		}
@@ -2313,6 +2317,11 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_sponsors, CTLFLAG_RD,
     &laminar_lane_sponsors, 0, "Laminar: total lane sponsorships");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_preempts, CTLFLAG_RD,
     &laminar_lane_preempts, 0, "Laminar: lane wake-preempts sent");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_wakes, CTLFLAG_RD,
+    &laminar_lane_wakes, 0, "Laminar: lane wakes seen at local sched_add");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_wake_blocked, CTLFLAG_RD,
+    &laminar_lane_wake_blocked, 0,
+    "Laminar: lane wakes with non-timeshare incumbent");
 SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
     &sched_slice, 0,
     "Laminar: base time slice in stathz ticks (low-load posture)");
@@ -3730,7 +3739,7 @@ laminar_lane_replenish(void *arg)
 	le->le_budget_us = le->le_q_us;
 	le->le_deadline += le->le_t_sbt;
 	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
-	    laminar_lane_replenish, le, le->le_cpu, C_ABSOLUTE);
+	    laminar_lane_replenish, le, le->le_cpu, C_ABSOLUTE | C_DIRECT_EXEC);
 	LAMINAR_TDQ_UNLOCK(tdq);
 	if (was_yielded)
 		wakeup(le);
@@ -3798,30 +3807,52 @@ laminar_lane_sponsor(struct thread *td, uint64_t q_us, uint64_t t_us)
 	tdq->ltdq_lane_n++;
 	tdq->ltdq_lane_util += util;
 	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
-	    laminar_lane_replenish, le, best_cpu, C_ABSOLUTE);
+	    laminar_lane_replenish, le, best_cpu, C_ABSOLUTE | C_DIRECT_EXEC);
 	LAMINAR_TDQ_UNLOCK(tdq);
+	if (devfs_set_cdevpriv(le, laminar_lane_dtor) != 0) {
+		laminar_lane_dtor(le);	/* roll back */
+		return (EBUSY);
+	}
 	laminar_lane_sponsors++;
 	return (0);
+}
+
+/*
+ * Entity teardown — the cdevpriv destructor, so a process that dies (or
+ * closes the fd) without WITHDRAW cannot leave a stale entity whose
+ * le_td points at a freed thread (learned by a use-after-free panic in
+ * the lane pick: "ltdq_slot[i] == td failed").  Idempotent.
+ */
+static void
+laminar_lane_dtor(void *data)
+{
+	struct laminar_lane_entity *le = data;
+	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+	struct thread *otd;
+	int util;
+
+	LAMINAR_TDQ_LOCK(tdq);
+	otd = le->le_td;
+	if (otd == NULL) {		/* already torn down */
+		LAMINAR_TDQ_UNLOCK(tdq);
+		return;
+	}
+	util = (int)((le->le_q_us * 1000) / le->le_t_us);
+	le->le_td = NULL;	/* pick + replenish stop touching it */
+	if (td_get_sched(otd)->ts_lane == le)
+		td_get_sched(otd)->ts_lane = NULL;
+	tdq->ltdq_lane_n--;
+	tdq->ltdq_lane_util -= util;
+	LAMINAR_TDQ_UNLOCK(tdq);
+	callout_drain(&le->le_callout);
 }
 
 static int
 laminar_lane_withdraw(struct thread *td)
 {
-	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
-	struct laminar_tdq *tdq;
-	int util;
-
-	if (le == NULL)
+	if (td_get_sched(td)->ts_lane == NULL)
 		return (ENOENT);
-	tdq = LAMINAR_TDQ_CPU(le->le_cpu);
-	LAMINAR_TDQ_LOCK(tdq);
-	util = (int)((le->le_q_us * 1000) / le->le_t_us);
-	le->le_td = NULL;	/* pick + replenish stop touching it */
-	td_get_sched(td)->ts_lane = NULL;
-	tdq->ltdq_lane_n--;
-	tdq->ltdq_lane_util -= util;
-	LAMINAR_TDQ_UNLOCK(tdq);
-	callout_drain(&le->le_callout);
+	devfs_clear_cdevpriv();	/* runs laminar_lane_dtor */
 	return (0);
 }
 
@@ -3845,7 +3876,14 @@ laminar_lane_yield(struct thread *td)
 	le->le_yielded = true;
 	deadline = le->le_deadline;
 	LAMINAR_TDQ_UNLOCK(tdq);
-	(void)tsleep_sbt(le, 0, "lane", deadline, 0, C_ABSOLUTE);
+	/*
+	 * Backstop strictly PAST the deadline (T/8 late) so the replenish
+	 * callout's wakeup() — which has already cleared le_yielded and
+	 * reset the budget — is the normal waker; the timeout only saves
+	 * a lost wakeup.
+	 */
+	(void)tsleep_sbt(le, 0, "lane", deadline + (le->le_t_sbt >> 3), 0,
+	    C_ABSOLUTE);
 	return (0);
 }
 
@@ -3958,11 +3996,19 @@ sched_laminar_add(struct thread *td, int flags)
 		 * the wake-preempt the 15.39ms p99 plateau measured the
 		 * absence of, scoped to the lane).
 		 */
+		/*
+		 * NOTE: deliberately NOT gated on !le_yielded — the YIELD
+		 * sleep's backstop timeout and the replenish callout expire
+		 * at the same instant, and when the timeout path makes the
+		 * thread runnable first le_yielded is still true.  A waking
+		 * lane thread at period start must preempt either way
+		 * (found as "lane_preempts stuck at 1" + alternating
+		 * metronome misses).
+		 */
 		bool lane_wake = __predict_false(laminar_deadline_enable) &&
 		    td_get_sched(td)->ts_lane != NULL &&
 		    td_get_sched(td)->ts_lane->le_td == td &&
-		    !td_get_sched(td)->ts_lane->le_throttled &&
-		    !td_get_sched(td)->ts_lane->le_yielded;
+		    !td_get_sched(td)->ts_lane->le_throttled;
 		if (laminar_is_timeshare(td) &&
 		    (flags & SRQ_YIELDING) == 0) {
 			if (tdq->ltdq_curthread == NULL ||
@@ -4023,15 +4069,16 @@ sched_laminar_add(struct thread *td, int flags)
 		if (__predict_false(laminar_deadline_enable) &&
 		    td_get_sched(td)->ts_lane != NULL &&
 		    td_get_sched(td)->ts_lane->le_td == td &&
-		    !td_get_sched(td)->ts_lane->le_throttled &&
-		    !td_get_sched(td)->ts_lane->le_yielded) {
+		    !td_get_sched(td)->ts_lane->le_throttled) {
 			struct thread *ctd = tdq->ltdq_curthread;
 
+			laminar_lane_wakes++;
 			if (ctd != NULL && !TD_IS_IDLETHREAD(ctd) &&
 			    laminar_is_timeshare(ctd)) {
 				ast_sched_locked(ctd, TDA_SCHED);
 				laminar_lane_preempts++;
-			}
+			} else if (ctd != NULL && !TD_IS_IDLETHREAD(ctd))
+				laminar_lane_wake_blocked++;
 		}
 		sched_laminar_setpreempt(td->td_priority);
 	}
