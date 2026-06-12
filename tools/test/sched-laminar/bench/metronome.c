@@ -38,6 +38,14 @@ struct lam_lane_stats {
 #define	LAMIOC_YIELD	_IO('L', 3)
 #define	LAMIOC_STATS	_IOR('L', 4, struct lam_lane_stats)
 
+static int
+cmp_double(const void *a, const void *b)
+{
+	double da = *(const double *)a, db = *(const double *)b;
+
+	return ((da < db) ? -1 : (da > db) ? 1 : 0);
+}
+
 static double
 now_sec(void)
 {
@@ -92,8 +100,8 @@ main(int argc, char **argv)
 
 	/* one period of work + yield, n_periods times; track wake lateness
 	 * (YIELD-return vs the expected period grid). */
-	double t0 = now_sec(), wmax = 0, wsum = 0;
-	double first[8] = {0};
+	double *late = calloc(n_periods, sizeof(*late));
+	double t0 = 0;	/* grid anchor = FIRST wake (on the kernel grid) */
 	for (uint64_t p = 0; p < n_periods; p++) {
 		double until = now_sec() + work_us / 1e6;
 		volatile unsigned long acc = 0;
@@ -101,16 +109,28 @@ main(int argc, char **argv)
 			acc += p;
 		if (ioctl(fd, LAMIOC_YIELD) != 0)
 			err(1, "LAMIOC_YIELD");
-		double late = (now_sec() - t0) - (double)(p + 1) * req.t_us / 1e6;
-		if (p < 8)
-			first[p] = late * 1e6;
-		if (late > wmax)
-			wmax = late;
-		wsum += (late > 0 ? late : 0);
+		/*
+		 * Grid-RESIDUAL jitter: a missed period leaves the user loop
+		 * a whole number of periods behind the kernel grid forever
+		 * after, so raw (now - p*T) measures accumulated offset, not
+		 * wake quality.  Distance to the NEAREST grid point is the
+		 * per-wake jitter regardless of drift.
+		 */
+		double T = (double)req.t_us / 1e6;
+		if (p == 0) {
+			t0 = now_sec();	/* first wake defines the grid phase */
+			late[0] = 0;
+			continue;
+		}
+		double l = now_sec() - t0 - (double)p * T;
+		double r = l - (double)(long long)(l / T + (l < 0 ? -0.5 : 0.5)) * T;
+		late[p] = (r < 0 ? -r : r) * 1e6;
 	}
-	printf("wake_late_us max=%.0f mean=%.0f first8=[%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f]\n",
-	    wmax * 1e6, wsum / n_periods * 1e6, first[0], first[1], first[2],
-	    first[3], first[4], first[5], first[6], first[7]);
+	qsort(late, n_periods, sizeof(*late), cmp_double);
+	printf("wake_late_us p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f max=%.1f\n",
+	    late[n_periods / 2], late[(int)(n_periods * 0.90)],
+	    late[(int)(n_periods * 0.99)], late[(int)(n_periods * 0.999)],
+	    late[n_periods - 1]);
 
 	if (ioctl(fd, LAMIOC_STATS, &st) != 0)
 		err(1, "LAMIOC_STATS");
