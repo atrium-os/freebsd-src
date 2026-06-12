@@ -499,3 +499,16 @@ u64s for the grown td_sched.
 The kernel primitive for Aqueduct deadline-context propagation is now
 complete: a server handling a deadline client's request ADOPTs for the
 request's duration — the userspace protocol work rides this.
+
+## K-b in frescod — the first real deadline context (bsd 925c8e9)
+
+No wire change needed: frescod's broker ledger already knows which
+clients are sponsored, so on a successful lane request the client's
+READER thread adopts the client's entity (request dispatch at band
+priority on the client's budget) and its WRITER adopts lazily on first
+delivery (frame callbacks / input ride the client's reservation).
+Self-regulating: a heavy client throttles itself, never frescod.
+
+In-VM (venus, 16 spinners): sponsored client 603 frames 0 misses with
+both threads adopted. Explicit wire-level deadline context for
+cross-service chains (app -> lyrad -> driver) rides the same primitive.
