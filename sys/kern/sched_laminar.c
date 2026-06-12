@@ -290,6 +290,28 @@ static int laminar_ipc_slack = 2;
  */
 static int laminar_numa_alpha = 1;	/* extra cost per cross-domain hop */
 
+/*
+ * Above-timeshare occupancy penalty (phase I prerequisite, 2026-06-12).
+ *
+ * The placement signal (wload = sum of timeshare weights) sees an RT or
+ * interrupt-class thread as just its weight (~1 nice-0 unit), but a
+ * CPU-bound RT thread consumes the WHOLE cpu regardless of weight: for a
+ * timeshare candidate the CPU is effectively zero-capacity, not
+ * capacity-minus-one.  Untreated, the RT-hogged CPU looks LEAST loaded,
+ * pickcpu funnels every wake onto it, and the victims starve until the RT
+ * thread yields (measured: piperlat `rt` reproducer, p90 6.2s / max 8.2s
+ * timeshare wake latency with a single rtprio busy-looper on a 4-CPU box).
+ *
+ * Fix shape (cost, not exclusion, per the RLC theme): when the target
+ * CPU's *running* thread is above timeshare class, add a large cost so the
+ * CPU is avoided while any alternative exists — but remains placeable when
+ * everything is RT-occupied.  Read of the remote curthread is the same
+ * unlocked atomic pattern as laminar_v_fair(); staleness only mis-prices
+ * one decision.  Brief ithreads cause a transient penalty at worst (some
+ * other CPU is chosen — harmless).
+ */
+static int laminar_rt_occupied_cost = 64;	/* in nice-0 thread units */
+
 #define	LAMINAR_MAX_PRISONS	32
 struct laminar_prison {
 	int		lpr_id;		/* prison.pr_id, -1 = free */
@@ -1338,9 +1360,36 @@ laminar_placement_cost(const struct laminar_tdq *tdq)
 static __inline int
 laminar_thread_cost(struct thread *td, int cpu)
 {
+	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(cpu);
+	struct thread *ct;
+	int cost;
 
-	return (laminar_scaled_cost(LAMINAR_TDQ_CPU(cpu)) +
-	    laminar_numa_cost(td, cpu));
+	cost = laminar_scaled_cost(tdq) + laminar_numa_cost(td, cpu);
+	/*
+	 * Above-timeshare occupancy: if the CPU is currently running an
+	 * RT/interrupt-class thread that the candidate CANNOT preempt, the
+	 * candidate may not run there at all until the incumbent yields —
+	 * price the CPU accordingly (see laminar_rt_occupied_cost block
+	 * comment).
+	 *
+	 * Do NOT gate on the candidate being timeshare: pipe/socket wakers
+	 * run at *kernel sleep priority* (e.g. 43) until userret, so a
+	 * timeshare-only gate exempts exactly the threads that get trapped
+	 * (measured: 4 watchdogs runnable at pri 43 parked behind a pri-8 RT
+	 * ticker on the lowest-wload CPU, starving for the whole run while
+	 * the timeshare-only penalty looked on).  The preempt test
+	 * (ct->td_priority <= td->td_priority) keeps the penalty correct for
+	 * every class pairing — an RT candidate is also steered away from an
+	 * equal-or-better RT incumbent, spreading RT load.
+	 */
+	if (laminar_rt_occupied_cost > 0) {
+		ct = atomic_load_ptr(&tdq->ltdq_curthread);
+		if (ct != NULL && !TD_IS_IDLETHREAD(ct) &&
+		    ct->td_priority < PRI_MIN_TIMESHARE &&
+		    ct->td_priority <= td->td_priority)
+			cost += laminar_rt_occupied_cost;
+	}
+	return (cost);
 }
 
 /*
@@ -2157,6 +2206,10 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_thresh, CTLFLAG_RWTUN,
 SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_band_step, CTLFLAG_RWTUN,
     &laminar_ctrl_band_step, 0,
     "Laminar: load_pct per +1 unit of controller preempt R band");
+SYSCTL_INT(_kern_sched, OID_AUTO, rt_occupied_cost, CTLFLAG_RWTUN,
+    &laminar_rt_occupied_cost, 0,
+    "Laminar: placement cost added for a CPU currently running an "
+    "above-timeshare (RT/interrupt) thread (0 = disabled)");
 SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
     &sched_slice, 0,
     "Laminar: base time slice in stathz ticks (low-load posture)");
