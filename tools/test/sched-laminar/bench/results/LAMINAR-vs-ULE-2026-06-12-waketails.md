@@ -136,3 +136,36 @@ P2 (same instrumentation as plan risk R2). (ii) RT-blind placement → confirmed
 bug with a deterministic reproducer (`piperlat N M T 1000 rt`); fix scheduled as
 a P2 prerequisite. (iii) The 15.39 ms p99 plateau (finding 2 above) → wake
 preemption, addressed by P2's lane-preempt mechanism.
+
+## P0.3 round 4 — RT-occupancy placement fix: landed, verified, ~500x
+
+Live observation (procstat during starvation) found the precise mechanism and
+broke the first fix attempt open: the trapped threads are **pipe wakers at
+kernel sleep priority (43)** — not timeshare — so a timeshare-only penalty
+exempted exactly the victims. They funnel to the RT CPU because it has the
+lowest wload (the RT hog counts as ~1 unit), the IPC-affinity home points at
+their waker (the ticker, on that CPU), and once queued there the
+above-timeshare picker path correctly prefers the pri-8 incumbent forever.
+
+Fix (`kern.sched.rt_occupied_cost`, default 64, RWTUN): in
+`laminar_thread_cost()`, add the penalty when the target CPU's running thread
+is above timeshare class AND the candidate cannot preempt it
+(`ct->td_priority <= td->td_priority`) — no candidate-class gate. Same-boot
+A/B (piperlat 16 4 10 1000 rt):
+
+| | p50 | p90 | max |
+|---|---|---|---|
+| rt_occupied_cost=64 | 5.4–6.4 ms | 13 ms | 31–157 ms |
+| rt_occupied_cost=0  | 2.8–3.1 s  | 6.8–7.1 s | 8.19 s |
+
+~500x at p50/p90. No-RT regression: piperlat p50 2.6 µs unchanged; wakelat
+spin=8 clean. Residual ms-scale p50 under RT load is queue-drain skew + the
+known no-wake-preempt quantum — P2 territory, not starvation.
+
+Note for P2: the same penalty term is exactly where **deadline-lane occupancy**
+will plug in (lane threads run above timeshare), so the lane inherits this fix
+by construction.
+
+Remaining P0.3 thread: the bimodal multi-second *nanosleep* max (callout path)
+— unchanged by this fix, still closed via KTR in P2. Full bench_all regression
+sweep before P2 starts.
