@@ -50,8 +50,13 @@
 #include <sys/cpuset.h>
 #include <sys/callout.h>
 #include <sys/conf.h>
+#include <sys/event.h>
 #include <sys/eventhandler.h>
+#include <sys/fcntl.h>
+#include <sys/poll.h>
 #include <sys/priv.h>
+#include <sys/selinfo.h>
+#include <sys/uio.h>
 #include <sys/jail.h>
 #include <sys/limits.h>
 #include <sys/lock.h>
@@ -3720,6 +3725,54 @@ struct lam_lane_req_for {
 #define	LAMIOC_WITHDRAW_FOR	_IOW('L', 6, struct lam_lane_req_for)
 
 /*
+ * Miss event record, delivered to the owning fd via read(2); EVFILT_READ
+ * on the fd fires when the ring is non-empty.  This is the broker's miss
+ * feed (plan D6: "miss -> event to the broker"): frescod/lyrad kevent on
+ * their broker fd and react by policy (skip a frame, resize a buffer,
+ * withdraw a hopeless client).
+ */
+struct lam_miss_event {
+	int32_t		pid, tid;
+	uint64_t	periods;	/* entity period count at the miss */
+	uint64_t	misses;		/* entity total misses so far */
+};
+
+#define	LAM_MISS_RING	64
+
+/*
+ * The fd-owner cookie: one per /dev/laminar open that has sponsored
+ * anything.  Entities tag their owner via le_priv; the cdevpriv dtor
+ * sweeps every lane slot owned by the cookie, so a broker (frescod,
+ * lyrad) crashing or closing its fd reclaims ALL its clients' entities.
+ *
+ * Miss-event path: the replenish callout runs C_DIRECT_EXEC (interrupt
+ * context), so it only enqueues into lp_ring under the SPIN lock and
+ * fires lp_task; the task, in thread context, does the KNOTE + wakeup.
+ * The deadline machinery stays direct; only the notification rides a
+ * thread.
+ */
+struct laminar_lane_priv {
+	struct mtx	lp_ringlock;	/* SPIN: ring, shared w/ replenish */
+	struct mtx	lp_knlock;	/* DEF: knlist + read sleep */
+	struct lam_miss_event lp_ring[LAM_MISS_RING];
+	u_int		lp_head, lp_tail;	/* head = next write */
+	u_long		lp_dropped;
+	struct task	lp_task;
+	struct selinfo	lp_sel;
+};
+
+static void
+laminar_lane_miss_task(void *arg, int pending __unused)
+{
+	struct laminar_lane_priv *priv = arg;
+
+	mtx_lock(&priv->lp_knlock);
+	KNOTE_LOCKED(&priv->lp_sel.si_note, 0);
+	wakeup(priv);
+	mtx_unlock(&priv->lp_knlock);
+}
+
+/*
  * Period replenishment.  Runs as a callout pinned to the entity's CPU;
  * takes the tdq spin lock by hand (callout_init_mtx cannot carry a spin
  * mutex).  Scores the closing period (miss = the thread neither yielded
@@ -3733,6 +3786,7 @@ laminar_lane_replenish(void *arg)
 {
 	struct laminar_lane_entity *le = arg;
 	struct laminar_tdq *tdq = LAMINAR_TDQ_CPU(le->le_cpu);
+	struct laminar_lane_priv *notify = NULL;
 	sbintime_t now, late;
 	bool was_yielded;
 
@@ -3750,8 +3804,33 @@ laminar_lane_replenish(void *arg)
 			le->le_max_late_us = late_us;
 	}
 	le->le_periods++;
-	if (!le->le_yielded && !le->le_throttled)
+	if (!le->le_yielded && !le->le_throttled) {
 		le->le_misses++;
+		/*
+		 * Record the miss for the owning fd's feed.  Only the ring
+		 * write happens here — the taskqueue enqueue is deferred
+		 * past the tdq unlock below, because enqueue wakes the
+		 * taskqueue swi and that wake re-enters sched_add (panic:
+		 * "setcpu cross-CPU recursion" — learned the hard way).
+		 */
+		notify = le->le_priv;
+		if (notify != NULL) {
+			mtx_lock_spin(&notify->lp_ringlock);
+			if (notify->lp_head - notify->lp_tail <
+			    LAM_MISS_RING) {
+				struct lam_miss_event *ev =
+				    &notify->lp_ring[notify->lp_head %
+				    LAM_MISS_RING];
+				ev->pid = le->le_td->td_proc->p_pid;
+				ev->tid = le->le_td->td_tid;
+				ev->periods = le->le_periods;
+				ev->misses = le->le_misses;
+				notify->lp_head++;
+			} else
+				notify->lp_dropped++;
+			mtx_unlock_spin(&notify->lp_ringlock);
+		}
+	}
 	was_yielded = le->le_yielded;
 	le->le_yielded = false;
 	le->le_throttled = false;
@@ -3762,17 +3841,10 @@ laminar_lane_replenish(void *arg)
 	LAMINAR_TDQ_UNLOCK(tdq);
 	if (was_yielded)
 		wakeup(le);
+	if (notify != NULL)
+		taskqueue_enqueue(taskqueue_fast, &notify->lp_task);
 }
 
-/*
- * The fd-owner cookie: one per /dev/laminar open that has sponsored
- * anything.  Entities tag their owner via le_priv; the cdevpriv dtor
- * sweeps every lane slot owned by the cookie, so a broker (frescod,
- * lyrad) crashing or closing its fd reclaims ALL its clients' entities.
- */
-struct laminar_lane_priv {
-	int	lp_unused;
-};
 
 /*
  * Sponsor `target` as a lane entity owned by `priv`; picks the least
@@ -3875,7 +3947,15 @@ laminar_lane_get_priv(void)
 	if (devfs_get_cdevpriv((void **)&priv) == 0)
 		return (priv);
 	priv = malloc(sizeof(*priv), M_LAMINAR, M_WAITOK | M_ZERO);
+	mtx_init(&priv->lp_ringlock, "lam_ring", NULL, MTX_SPIN);
+	mtx_init(&priv->lp_knlock, "lam_knl", NULL, MTX_DEF);
+	TASK_INIT(&priv->lp_task, 0, laminar_lane_miss_task, priv);
+	knlist_init_mtx(&priv->lp_sel.si_note, &priv->lp_knlock);
 	if (devfs_set_cdevpriv(priv, laminar_lane_priv_dtor) != 0) {
+		taskqueue_drain(taskqueue_fast, &priv->lp_task);
+		knlist_destroy(&priv->lp_sel.si_note);
+		mtx_destroy(&priv->lp_ringlock);
+		mtx_destroy(&priv->lp_knlock);
 		free(priv, M_LAMINAR);
 		return (NULL);
 	}
@@ -3931,6 +4011,12 @@ laminar_lane_priv_dtor(void *data)
 				laminar_lane_teardown(&tdq->ltdq_lane[i]);
 		}
 	}
+	/* all owned callouts drained above; no new enqueues possible */
+	taskqueue_drain(taskqueue_fast, &priv->lp_task);
+	knlist_clear(&priv->lp_sel.si_note, 0);
+	knlist_destroy(&priv->lp_sel.si_note);
+	mtx_destroy(&priv->lp_ringlock);
+	mtx_destroy(&priv->lp_knlock);
 	free(priv, M_LAMINAR);
 }
 
@@ -4078,9 +4164,108 @@ laminar_lane_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	}
 }
 
+/*
+ * read(2) on the fd drains pending miss events (struct lam_miss_event
+ * records).  Blocks unless O_NONBLOCK; EVFILT_READ readiness matches.
+ */
+static int
+laminar_lane_read(struct cdev *dev, struct uio *uio, int ioflag)
+{
+	struct laminar_lane_priv *priv;
+	struct lam_miss_event ev;
+	int error = 0, copied = 0;
+
+	if (devfs_get_cdevpriv((void **)&priv) != 0)
+		return (ENXIO);
+	if (uio->uio_resid < (ssize_t)sizeof(ev))
+		return (EINVAL);
+	for (;;) {
+		bool have = false;
+
+		mtx_lock_spin(&priv->lp_ringlock);
+		if (priv->lp_tail != priv->lp_head) {
+			ev = priv->lp_ring[priv->lp_tail % LAM_MISS_RING];
+			priv->lp_tail++;
+			have = true;
+		}
+		mtx_unlock_spin(&priv->lp_ringlock);
+		if (have) {
+			error = uiomove(&ev, sizeof(ev), uio);
+			if (error != 0)
+				return (error);
+			copied++;
+			if (uio->uio_resid < (ssize_t)sizeof(ev))
+				return (0);
+			continue;
+		}
+		if (copied > 0)
+			return (0);
+		if ((ioflag & O_NONBLOCK) != 0)
+			return (EWOULDBLOCK);
+		mtx_lock(&priv->lp_knlock);
+		/* re-check under the sleep lock to not miss a wakeup */
+		mtx_lock_spin(&priv->lp_ringlock);
+		have = (priv->lp_tail != priv->lp_head);
+		mtx_unlock_spin(&priv->lp_ringlock);
+		if (have) {
+			mtx_unlock(&priv->lp_knlock);
+			continue;
+		}
+		error = msleep(priv, &priv->lp_knlock, PCATCH, "lammiss", 0);
+		mtx_unlock(&priv->lp_knlock);
+		if (error != 0)
+			return (error);
+	}
+}
+
+static void
+filt_laminar_detach(struct knote *kn)
+{
+	struct laminar_lane_priv *priv = kn->kn_hook;
+
+	knlist_remove(&priv->lp_sel.si_note, kn, 0);
+}
+
+static int
+filt_laminar_read(struct knote *kn, long hint __unused)
+{
+	struct laminar_lane_priv *priv = kn->kn_hook;
+	u_int n;
+
+	mtx_lock_spin(&priv->lp_ringlock);
+	n = priv->lp_head - priv->lp_tail;
+	mtx_unlock_spin(&priv->lp_ringlock);
+	kn->kn_data = (int64_t)n * sizeof(struct lam_miss_event);
+	return (n > 0);
+}
+
+static const struct filterops laminar_read_filtops = {
+	.f_isfd = 1,
+	.f_detach = filt_laminar_detach,
+	.f_event = filt_laminar_read,
+};
+
+static int
+laminar_lane_kqfilter(struct cdev *dev, struct knote *kn)
+{
+	struct laminar_lane_priv *priv;
+
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+	priv = laminar_lane_get_priv();
+	if (priv == NULL)
+		return (EBUSY);
+	kn->kn_fop = &laminar_read_filtops;
+	kn->kn_hook = priv;
+	knlist_add(&priv->lp_sel.si_note, kn, 0);
+	return (0);
+}
+
 static struct cdevsw laminar_lane_cdevsw = {
 	.d_version =	D_VERSION,
+	.d_read =	laminar_lane_read,
 	.d_ioctl =	laminar_lane_ioctl,
+	.d_kqfilter =	laminar_lane_kqfilter,
 	.d_name =	"laminar",
 };
 

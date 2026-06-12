@@ -19,6 +19,7 @@
  */
 
 #include <sys/types.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
@@ -45,6 +46,10 @@ struct lam_lane_req_for {
 	int32_t pid, tid;
 	uint64_t q_us, t_us;
 	uint64_t anchor_ns;
+};
+struct lam_miss_event {
+	int32_t pid, tid;
+	uint64_t periods, misses;
 };
 #define	LAMIOC_SPONSOR		_IOW('L', 1, struct lam_lane_req)
 #define	LAMIOC_WITHDRAW		_IO('L', 2)
@@ -75,6 +80,8 @@ spinner_loop(double deadline)
 	}
 	_exit(0);
 }
+
+static int client_stall;	/* set in the forked child for miss mode */
 
 static void
 client_loop(int idx, int tid_w, uint64_t work_us, uint64_t n_periods)
@@ -110,6 +117,8 @@ client_loop(int idx, int tid_w, uint64_t work_us, uint64_t n_periods)
 		base_misses = st.misses;	/* pre-sync partial period */
 
 	for (uint64_t p = 0; p < n_periods; p++) {
+		if (client_stall && p == n_periods / 2)
+			usleep(100000);	/* stall ~6 frames: deliberate misses */
 		double until = now_sec() + work_us / 1e6;
 		volatile unsigned long acc = 0;
 		while (now_sec() < until)
@@ -148,6 +157,7 @@ main(int argc, char **argv)
 		n_spin = atoi(argv[6]);
 	if (argc == 8 && strcmp(argv[7], "kill") == 0)
 		do_kill = 1;
+	int do_miss = (argc == 8 && strcmp(argv[7], "miss") == 0);
 	if (n_clients < 1 || n_clients > 16)
 		errx(1, "n_clients 1..16");
 
@@ -171,6 +181,7 @@ main(int argc, char **argv)
 			for (int j = 0; j < i; j++)
 				close(tid_r[j]);
 			close(tp[0]);
+			client_stall = (do_miss && i == 0);
 			client_loop(i, tp[1], work_us, n_periods);
 		}
 		close(tp[1]);
@@ -179,7 +190,7 @@ main(int argc, char **argv)
 	}
 
 	/* the broker: one fd owns all sponsorships */
-	int bfd = open("/dev/laminar", O_RDWR);
+	int bfd = open("/dev/laminar", O_RDWR | O_NONBLOCK);
 	if (bfd < 0)
 		err(1, "broker open /dev/laminar");
 
@@ -204,6 +215,47 @@ main(int argc, char **argv)
 	}
 	fflush(stdout);
 
+	if (do_miss) {
+		/*
+		 * The broker's miss feed: kevent on the broker fd
+		 * (EVFILT_READ), read() drains lam_miss_event records.
+		 * Client 0 stalls mid-run, so its pid/tid must appear.
+		 */
+		int kq = kqueue();
+		struct kevent kev;
+		EV_SET(&kev, bfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		if (kq < 0 || kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+			err(1, "kqueue/kevent on broker fd");
+		struct timespec to = { 2 + (time_t)(n_periods * t_us / 1e6),
+		    0 };
+		int got = 0, from_c0 = 0;
+		while (kevent(kq, NULL, 0, &kev, 1, &to) > 0) {
+			struct lam_miss_event mev;
+			while (read(bfd, &mev, sizeof(mev)) ==
+			    (ssize_t)sizeof(mev)) {
+				got++;
+				if (mev.pid == (int32_t)cpid[0] &&
+				    mev.tid == ctid[0])
+					from_c0++;
+				if (got <= 3)
+					printf("broker: MISS event pid=%d "
+					    "tid=%d periods=%llu "
+					    "misses=%llu\n", (int)mev.pid,
+					    (int)mev.tid,
+					    (unsigned long long)mev.periods,
+					    (unsigned long long)mev.misses);
+			}
+			if (from_c0 >= 3)
+				break;	/* proven */
+			to.tv_sec = 2;
+		}
+		close(kq);
+		printf("broker: miss feed => %d events, %d from client 0 "
+		    "=> %s\n", got, from_c0,
+		    from_c0 > 0 ? "MISS FEED OK" : "NO EVENTS (FAIL)");
+		fflush(stdout);
+	}
+
 	if (do_kill) {
 		/* mid-run SIGKILL: entity must be reclaimed by thread-dtor */
 		usleep((useconds_t)(n_periods * t_us / 2));
@@ -224,16 +276,16 @@ main(int argc, char **argv)
 	for (i = 0; i < n_clients; i++) {
 		int wst;
 		waitpid(cpid[i], &wst, 0);
-		if (do_kill && i == 0)
-			continue;	/* killed by design */
+		if ((do_kill || do_miss) && i == 0)
+			continue;	/* killed / stalled by design */
 		if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
 			fails++;
 	}
 	close(bfd);	/* priv dtor sweeps any leftovers */
 	while (wait(NULL) > 0)
 		;
-	printf("vbroker: clients=%d spin=%d%s => %s\n", n_clients, n_spin,
-	    do_kill ? " kill-test" : "",
+	printf("vbroker: clients=%d spin=%d%s%s => %s\n", n_clients, n_spin,
+	    do_kill ? " kill-test" : "", do_miss ? " miss-test" : "",
 	    fails == 0 ? "ALL CLIENTS CLEAN" : "FAILURES");
 	return (fails == 0 ? 0 : 1);
 }
