@@ -194,3 +194,27 @@ envelope, with burst improved and the RT-starvation pathology eliminated
 (~500x).** One bench-harness note: scripts lose +x over 9p (run from a guest
 copy) and spin-based benches need `../spin` next to the bench dir — the first
 sweep silently produced garbage iters without it.
+
+## Phase I first landing — the deadline lane core (same day)
+
+The lane is in (`kern.sched.deadline_enable`, default 0): per-CPU entity array,
+EDF-before-WFQ pick (behind POSIX RT), CBS budgets with **precise switch-boundary
+charging** (the statclock-quantum version mis-throttled 15% on an idle box —
+7.9ms ticks vs ms budgets), absolute per-entity replenishment callouts pinned to
+the entity's CPU with **in-kernel lateness instrumentation**, lane wake-preempt
+(vruntime-gate + cooldown bypass), forced pickcpu placement (NOT sched_bind —
+"userret: Returning with pinned thread", learned by panic), /dev/laminar
+ioctls (SPONSOR/WITHDRAW/YIELD/STATS), `metronome` gate test.
+
+Gate status (metronome, audio shape 1.2/2.7ms + frame shape 4.8/16.2ms):
+- **idle: PERFECT** — 0 misses, 0 throttles, max replenish lateness 23 µs.
+- under 16 spinners: misses correlate 1:1 with replenish-callout lateness
+  (227ms late → 274 misses; 8.8ms → 7; 11.9ms → 1). Throttles 0 — the lane
+  scheduling itself is correct; **the sole remaining blocker is callout
+  latency under load, i.e. the P0.3 artifact, now measured in-kernel**
+  (a C_ABSOLUTE callout firing 8–227ms late while spinners run).
+
+Next: instrument WHERE the callout latency lives (hardclock→swi-enqueue vs
+swi-enqueue→handler) — the swi wake path through setpreempt looks correct on
+inspection, pointing at eventtimer reprogramming / callout-wheel processing
+under load on ARM/HVF. Lane disabled (default): bench numbers unchanged.
