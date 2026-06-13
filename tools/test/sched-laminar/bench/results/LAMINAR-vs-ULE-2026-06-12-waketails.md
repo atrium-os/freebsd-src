@@ -540,3 +540,43 @@ metronome dirty with phaseh OFF too, so the noise is the episodic
 host-stall class, not P6 (which is inert when disabled). Re-gate lanes
 in a clean window. The across-member half of P6 (watt-budget
 water_fill) awaits the GPU member integration.
+
+## P6 (across-member half) — the energy-budget federation (2026-06-13)
+
+The across-member layer of the federation (doc §4): heterogeneous
+members coordinate ONLY through the shared power cap, allocated max-min
+fair in WATTS — the one commensurable currency. New: sys/sys/energy_budget.h
+(energy_member_register/unregister + demand/budget fn types) and the
+in-kernel allocator (sched_laminar.c): every Laminar control tick with
+kern.sched.energy_cap_mw set, water_fill (the same algorithm as gpusim
+federation.rs / MST link-BW) splits the cap by weight and pushes each
+member a budget. "Coordinated, not coupled": members see only their own
+budget, never another's internals.
+
+Two members registered end to end:
+ - CPU (weight 2): demand = load% x current cpufreq level power; budget
+   actuated as a DVFS level CEILING (slowest-fitting index). The ceiling
+   is a HARD constraint: when over budget it jumps straight down,
+   bypassing down-patience and the bare-EWMA "load wants speed" hold
+   (a power cap must override what the load wants).
+ - GPU (weight 1, atrium-gpu-amd kmod): demand from the gpusim cost
+   model (regSCHED_POWER_DEMAND_MW); budget throttles execution rounds
+   to the budgeted fraction (regSCHED_POWER_BUDGET_MW; gpusim
+   sched_regs.rs, engine unit test).
+
+Gate (in-VM, gpusim profile, GPU loaded via energy_member_load):
+ - split: cap 1500 mW, cpu demand 224 (fits) gets 224, gpu demand 50000
+   (saturated) gets the remaining 1276; sum = 1500 exactly, the cpu's
+   slack flowing to the gpu (work-conserving, weighted max-min fair).
+ - ceiling hard-override: uncapped perf-policy+load -> cur_idx 0
+   (fastest); cap 1000 (cpu budget 666 mW) -> cur_idx 4 (slowest) — the
+   power cap overrides BOTH the perf policy and the load; uncap ->
+   cur_idx 0 again (the release path lifts the ceiling: when cap goes
+   to 0 the federation pushes budget=0 to every member once, fixing an
+   earlier leak where a capped member stayed throttled forever).
+
+This closes P6: the energy-RLC federation proven in gpusim now runs in
+the kernel, splitting a real watt budget across a real CPU scheduler
+and a real (modeled) GPU. The federation thesis — "coordinated not
+coupled, same water_fill for power and for display link-BW" — is now
+executable on both sides of the model/silicon boundary.
