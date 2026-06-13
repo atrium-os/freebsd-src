@@ -72,6 +72,7 @@
 #include <sys/turnstile.h>
 #include <sys/bus.h>
 #include <sys/cpu.h>
+#include <sys/energy_budget.h>
 #include <sys/taskqueue.h>
 #include <machine/smp.h>
 
@@ -2435,6 +2436,206 @@ SYSCTL_INT(_kern_sched, OID_AUTO, ctrl_emergency, CTLFLAG_RW,
     "(bypasses EWMA + patience for cold-start bursts)");
 
 static void
+laminar_ctrl_cb_federation(void);
+
+/*
+ * Energy-budget federation (P6 across-member half; federation doc §4).
+ * Members register (demand probe, budget actuator, weight); every ctrl
+ * tick with a cap set, water_fill allocates the cap max-min fair by
+ * weight and pushes budgets.  Laminar itself registers the CPU member
+ * (demand = load x current level power; actuator = a DVFS level
+ * ceiling); the GPU kmod registers its device (demand/budget regs).
+ */
+#define	ENERGY_MAX_MEMBERS	4
+static struct energy_member {
+	char		em_name[16];
+	energy_demand_fn *em_demand;
+	energy_budget_fn *em_budget;
+	void		*em_arg;
+	uint64_t	em_weight;
+	uint64_t	em_demand_last;	/* observability */
+	uint64_t	em_budget_last;	/* observability */
+	bool		em_used;
+} energy_members[ENERGY_MAX_MEMBERS];
+static struct mtx energy_lock;
+MTX_SYSINIT(energy_lock, &energy_lock, "energy_budget", MTX_DEF);
+static uint64_t energy_cap_mw = 0;	/* 0 = federation off */
+
+SYSCTL_U64(_kern_sched, OID_AUTO, energy_cap_mw, CTLFLAG_RWTUN,
+    &energy_cap_mw, 0,
+    "Energy federation: shared power cap (mW) split max-min fair "
+    "across members; 0 disables (members uncapped)");
+
+int
+energy_member_register(const char *name, energy_demand_fn *demand,
+    energy_budget_fn *budget, void *arg, uint64_t weight)
+{
+	int i;
+
+	mtx_lock(&energy_lock);
+	for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
+		if (!energy_members[i].em_used) {
+			strlcpy(energy_members[i].em_name, name,
+			    sizeof(energy_members[i].em_name));
+			energy_members[i].em_demand = demand;
+			energy_members[i].em_budget = budget;
+			energy_members[i].em_arg = arg;
+			energy_members[i].em_weight = weight == 0 ? 1 : weight;
+			energy_members[i].em_demand_last = 0;
+			energy_members[i].em_budget_last = 0;
+			energy_members[i].em_used = true;
+			mtx_unlock(&energy_lock);
+			return (i);
+		}
+	}
+	mtx_unlock(&energy_lock);
+	return (-1);
+}
+
+void
+energy_member_unregister(int id)
+{
+
+	if (id < 0 || id >= ENERGY_MAX_MEMBERS)
+		return;
+	mtx_lock(&energy_lock);
+	if (energy_members[id].em_used && energy_members[id].em_budget != NULL)
+		energy_members[id].em_budget(energy_members[id].em_arg, 0);
+	energy_members[id].em_used = false;
+	mtx_unlock(&energy_lock);
+}
+
+/*
+ * Max-min fair split of cap_mw across demands by weight (the same
+ * water_fill as gpusim federation.rs / MST link-BW): grant each active
+ * member min(demand, weighted share of the remainder); members whose
+ * demand fits drop out and their slack redistributes; work-conserving.
+ */
+static void
+energy_water_fill(uint64_t cap_mw, const uint64_t *demand, uint64_t *grant,
+    const uint64_t *weight, bool *active, int n)
+{
+	uint64_t remaining = cap_mw, wsum;
+	bool progress = true;
+	int i;
+
+	for (i = 0; i < n; i++)
+		grant[i] = 0;
+	while (progress) {
+		progress = false;
+		wsum = 0;
+		for (i = 0; i < n; i++)
+			if (active[i])
+				wsum += weight[i];
+		if (wsum == 0)
+			break;
+		for (i = 0; i < n; i++) {
+			uint64_t share;
+
+			if (!active[i])
+				continue;
+			share = remaining * weight[i] / wsum;
+			if (demand[i] <= share) {
+				/* fits: grant fully, redistribute slack */
+				grant[i] = demand[i];
+				remaining -= demand[i];
+				active[i] = false;
+				progress = true;
+				break;	/* recompute shares */
+			}
+		}
+		if (!progress) {
+			/* all remaining members are saturated: weighted */
+			for (i = 0; i < n; i++) {
+				if (active[i]) {
+					grant[i] = remaining * weight[i] /
+					    wsum;
+					active[i] = false;
+				}
+			}
+		}
+	}
+}
+
+static void
+laminar_ctrl_cb_federation(void)
+{
+	uint64_t demand[ENERGY_MAX_MEMBERS], grant[ENERGY_MAX_MEMBERS];
+	uint64_t weight[ENERGY_MAX_MEMBERS];
+	bool active[ENERGY_MAX_MEMBERS];
+	uint64_t cap = energy_cap_mw;
+	int i;
+
+	mtx_lock(&energy_lock);
+	if (cap == 0) {
+		/*
+		 * Federation disabled: release every member's actuator
+		 * (budget 0 = uncapped) ONCE, so a member that was capped
+		 * on the previous tick does not stay throttled forever.
+		 * Idempotent — actuators tolerate repeated 0.
+		 */
+		for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
+			if (energy_members[i].em_used &&
+			    energy_members[i].em_budget != NULL &&
+			    energy_members[i].em_budget_last != 0) {
+				energy_members[i].em_budget(
+				    energy_members[i].em_arg, 0);
+				energy_members[i].em_budget_last = 0;
+			}
+		}
+		mtx_unlock(&energy_lock);
+		return;
+	}
+	for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
+		active[i] = energy_members[i].em_used &&
+		    energy_members[i].em_demand != NULL;
+		demand[i] = active[i] ?
+		    energy_members[i].em_demand(energy_members[i].em_arg) : 0;
+		weight[i] = energy_members[i].em_weight;
+		if (active[i])
+			energy_members[i].em_demand_last = demand[i];
+	}
+	energy_water_fill(cap, demand, grant, weight, active,
+	    ENERGY_MAX_MEMBERS);
+	for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
+		if (energy_members[i].em_used &&
+		    energy_members[i].em_budget != NULL) {
+			energy_members[i].em_budget(energy_members[i].em_arg,
+			    grant[i]);
+			energy_members[i].em_budget_last = grant[i];
+		}
+	}
+	mtx_unlock(&energy_lock);
+}
+
+static int
+energy_members_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	int error, i;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	mtx_lock(&energy_lock);
+	for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
+		if (!energy_members[i].em_used)
+			continue;
+		sbuf_printf(&sb, "%s demand=%ju budget=%ju weight=%ju\n",
+		    energy_members[i].em_name,
+		    (uintmax_t)energy_members[i].em_demand_last,
+		    (uintmax_t)energy_members[i].em_budget_last,
+		    (uintmax_t)energy_members[i].em_weight);
+	}
+	mtx_unlock(&energy_lock);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_sched, OID_AUTO, energy_members,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    energy_members_sysctl, "A",
+    "Energy federation members: name demand(mW) budget(mW) weight");
+
+static void
 laminar_ctrl_cb(void *arg __unused)
 {
 	struct laminar_tdq *tdq;
@@ -2607,6 +2808,7 @@ laminar_ctrl_cb(void *arg __unused)
 	 *   laminar_ctrl_load_ewma -- patient (downshift decisions)
 	 */
 	laminar_dvfs_step(load_lead_compensated, laminar_ctrl_load_ewma);
+	laminar_ctrl_cb_federation();
 
 reschedule:
 	callout_reset(&laminar_ctrl_callout,
@@ -2678,6 +2880,49 @@ static int laminar_dvfs_changes_total;	/* observability */
  */
 static int laminar_dvfs_idle_mw = 0;
 static int laminar_dvfs_fstar_idx = -1;	/* observability; -1 = none */
+/*
+ * P6 federation: the CPU member's budget arrives as a DVFS level
+ * CEILING (slowest-compatible index; -1 = uncapped).  Demand = load%% x
+ * the current level's power.
+ */
+static int laminar_dvfs_budget_idx = -1;
+
+static uint64_t
+laminar_cpu_demand_mw(void *arg __unused)
+{
+	int idx = laminar_dvfs_cur_idx;
+	int load = laminar_ctrl_load_ewma;
+
+	if (laminar_dvfs_n_levels == 0 || idx < 0 ||
+	    idx >= laminar_dvfs_n_levels)
+		return (0);
+	if (load < 0)
+		load = 0;
+	if (load > 100)
+		load = 100;
+	return ((uint64_t)laminar_dvfs_levels[idx].total_set.power *
+	    load / 100);
+}
+
+static void
+laminar_cpu_budget_mw(void *arg __unused, uint64_t mw)
+{
+	int i;
+
+	if (mw == 0 || laminar_dvfs_n_levels == 0) {
+		laminar_dvfs_budget_idx = -1;	/* uncapped */
+		return;
+	}
+	/* fastest level whose full power fits the budget; levels are
+	 * sorted fastest-first, so scan forward to the first that fits */
+	for (i = 0; i < laminar_dvfs_n_levels; i++) {
+		if ((uint64_t)laminar_dvfs_levels[i].total_set.power <= mw)
+			break;
+	}
+	if (i >= laminar_dvfs_n_levels)
+		i = laminar_dvfs_n_levels - 1;	/* even the floor exceeds */
+	laminar_dvfs_budget_idx = i;
+}
 
 static struct taskqueue *laminar_dvfs_tq;
 static struct task laminar_dvfs_task;
@@ -2880,6 +3125,16 @@ laminar_dvfs_apply(void *ctx __unused, int pending __unused)
 			return;	/* will retry on next enqueue */
 		}
 		laminar_dvfs_n_levels = count;
+		{
+			static bool cpu_member_registered = false;
+
+			if (!cpu_member_registered && count > 0) {
+				cpu_member_registered = true;
+				(void)energy_member_register("cpu",
+				    laminar_cpu_demand_mw,
+				    laminar_cpu_budget_mw, NULL, 2);
+			}
+		}
 		laminar_dvfs_max_freq = laminar_dvfs_levels[0].total_set.freq;
 		/* Seed cur to whatever cpufreq is at now. */
 		if (CPUFREQ_GET(cf, &cur_level) == 0) {
@@ -3011,9 +3266,36 @@ laminar_dvfs_step(int load_lead, int load_bare)
 		}
 	}
 
-	/* P6: never slower than the energy-optimal floor. */
+	/*
+	 * P6 federation: the budget ceiling is a HARD power constraint,
+	 * not a load preference.  If we are running faster than the cap
+	 * allows (cur_idx < budget_idx), jump straight down to it NOW —
+	 * bypassing the down-patience and the bare-EWMA "load wants
+	 * speed" hold below, which would otherwise let a busy CPU sit
+	 * over its power budget indefinitely (the cap exists precisely
+	 * to override what the load wants).
+	 */
+	if (laminar_dvfs_budget_idx >= 0 &&
+	    laminar_dvfs_cur_idx < laminar_dvfs_budget_idx) {
+		laminar_dvfs_up_streak = 0;
+		laminar_dvfs_down_streak = 0;
+		atomic_store_int(&laminar_dvfs_committed_idx,
+		    laminar_dvfs_budget_idx);
+		if (atomic_cmpset_int(&laminar_dvfs_task_inflight, 0, 1))
+			taskqueue_enqueue(laminar_dvfs_tq,
+			    &laminar_dvfs_task);
+		return;
+	}
+	/* Below the cap: clamp the load-driven target up to the ceiling. */
+	if (laminar_dvfs_budget_idx >= 0 &&
+	    target_idx < laminar_dvfs_budget_idx)
+		target_idx = laminar_dvfs_budget_idx;
+	/* P6: never slower than the energy-optimal floor (the ceiling
+	 * wins when they conflict — the cap is a hard constraint). */
 	if (laminar_dvfs_fstar_idx >= 0 &&
-	    target_idx > laminar_dvfs_fstar_idx)
+	    target_idx > laminar_dvfs_fstar_idx &&
+	    (laminar_dvfs_budget_idx < 0 ||
+	    laminar_dvfs_fstar_idx >= laminar_dvfs_budget_idx))
 		target_idx = laminar_dvfs_fstar_idx;
 
 	if (target_idx == laminar_dvfs_cur_idx) {
