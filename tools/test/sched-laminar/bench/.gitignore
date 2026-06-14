@@ -1,2 +1,12 @@
+# Compiled bench binaries (built from the .c sources by the Makefile).
+gapdet
+lane-adopt
+lane-pi
+metronome
+metronome-posix
 pingpong
+piperlat
+vbroker
 wakelat
+# Raw sweep output dumps — the curated *.md results (PACE-RESULTS.md) are tracked.
+*-results.txt
