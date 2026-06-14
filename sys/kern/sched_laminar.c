@@ -339,8 +339,15 @@ static int laminar_rt_occupied_cost = 64;	/* in nice-0 thread units */
  * The callout also measures its own lateness (the plan's R2 / the
  * wakelat bimodal artifact instrumentation).
  *
- * Everything is gated by laminar_deadline_enable (default 0):
- * disabled, no behavior changes anywhere.
+ * Gated by laminar_deadline_enable.  It shipped 0 (inert) through
+ * phase-I bring-up; now ON BY DEFAULT (1) -- the lane is proven
+ * (gpusim L6: 0 underruns at the 5.3ms hardware-minimum buffer under
+ * load where plain timeshare needs 128ms; crash isolation + K-b
+ * adoption verified in-VM) and safe to enable: admission caps lane
+ * util at laminar_deadline_util_max (75%/CPU), POSIX RT stays above
+ * it as the escape hatch, overrun isolation throttles a liar, and
+ * /dev/laminar is root-only (0600) so sponsorship is privileged.
+ * Set to 0 to restore pure-timeshare behavior everywhere.
  */
 #define	LAMINAR_LANE_MAX	8	/* entities per CPU */
 
@@ -367,7 +374,7 @@ struct laminar_lane_entity {
 	uint64_t	le_max_late_us;	/* worst replenish-callout lateness */
 };
 
-static int laminar_deadline_enable = 0;		/* RWTUN master gate */
+static int laminar_deadline_enable = 1;		/* RWTUN master gate (on by default) */
 static int laminar_deadline_util_max = 750;	/* per-mille per CPU */
 static u_long laminar_lane_sponsors = 0;
 static u_long laminar_lane_preempts = 0;
@@ -2398,7 +2405,7 @@ SYSCTL_INT(_kern_sched, OID_AUTO, rt_occupied_cost, CTLFLAG_RWTUN,
     "above-timeshare (RT/interrupt) thread (0 = disabled)");
 SYSCTL_INT(_kern_sched, OID_AUTO, deadline_enable, CTLFLAG_RWTUN,
     &laminar_deadline_enable, 0,
-    "Laminar phase I: enable the declared real-deadline lane (EDF+CBS)");
+    "Laminar: enable the declared real-deadline lane (EDF+CBS); on by default");
 SYSCTL_INT(_kern_sched, OID_AUTO, deadline_util_max, CTLFLAG_RWTUN,
     &laminar_deadline_util_max, 0,
     "Laminar: per-CPU deadline-lane utilization admission cap (per-mille)");
