@@ -2,3 +2,12 @@ include GENERIC
 ident   LAMINAR-DEV
 options SCHED_LAMINAR
 device cpufreq_mock
+
+# Atrium boot splash: vt(4)'s DEV_SPLASH framework draws a loader-preloaded
+# RGBA PNG (loader `splash="..."`) and suppresses video console text until a
+# keypress. Patched in vt_core.c so a preloaded image enables it WITHOUT
+# RB_MUTE, keeping the serial console verbose for debugging.
+# `device splash` (NOT `options DEV_SPLASH`): config(8)'s DEV_<dev> convention
+# both defines the DEV_SPLASH macro AND makes `splash` true in conf/files, so
+# vt_cpulogos.c + the logo images (vt_logo_*, vtterm_draw_cpu_logos) link in.
+device splash
