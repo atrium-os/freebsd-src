@@ -1500,6 +1500,61 @@ vt_draw_decorations(struct vt_device *vd)
 		vtterm_draw_cpu_logos(vd);
 }
 
+#ifdef DEV_SPLASH
+/*
+ * Atrium: a small animated indicator drawn over the boot splash so the
+ * screen is never static (like Windows/Linux boot). Driven by the vt
+ * flush timer — the same clock as the cpu-logo animation: while the
+ * splash is up, vt_flush() calls this and returns "changed" so the timer
+ * keeps rescheduling. A yellow ball ping-pongs along a horizontal track
+ * below the wordmark, drawn with vd_drawrect in the 16-colour console
+ * palette. kern.vt.splash_anim=0 disables it.
+ */
+VT_SYSCTL_INT(splash_anim, 1, "Animate the Atrium boot splash");
+
+static void
+vt_splash_animate(struct vt_device *vd)
+{
+	int w, h, track_y, x0, x1, span, period, p, bx;
+	const int bw = 16, bh = 10;	/* indicator size, px */
+	const int pps = 160;		/* sweep speed, px/sec */
+	long pos;
+
+	if (vd->vd_driver->vd_drawrect == NULL)
+		return;
+
+	w = vd->vd_width;
+	h = vd->vd_height;
+	track_y = h * 62 / 100;		/* just below the centered wordmark */
+	x0 = w / 2 - 160;
+	x1 = w / 2 + 160;
+	span = x1 - x0;
+	if (span <= 0)
+		return;
+
+	/*
+	 * Time-based ping-pong: derive the position from `ticks`, NOT from a
+	 * per-call frame counter. vt_flush() runs far more often during the
+	 * verbose early boot (every suppressed console write schedules a
+	 * flush) than once the console quiets, so a frame counter looked
+	 * frantic at first then slowed down. Keying off ticks/hz gives a
+	 * constant px/sec sweep regardless of redraw frequency.
+	 */
+	period = 2 * span;
+	pos = ((long)ticks * pps) / hz;
+	p = (int)(pos % period);
+	bx = (p < span) ? (x0 + p) : (x1 - (p - span));
+
+	/* Erase the track band (splash background here is near-black), then
+	 * draw the indicator as a single rect — cleaner than a rounded shape
+	 * at this low resolution. */
+	vd->vd_driver->vd_drawrect(vd, x0, track_y, x1 + bw, track_y + bh,
+	    1, TC_BLACK);
+	vd->vd_driver->vd_drawrect(vd, bx, track_y, bx + bw, track_y + bh,
+	    1, TC_YELLOW);
+}
+#endif
+
 static int
 vt_flush(struct vt_device *vd)
 {
@@ -1532,6 +1587,13 @@ vt_flush(struct vt_device *vd)
 	if (vd->vd_flags & VDF_SPLASH) {
 		vtbuf_unlock(&vw->vw_buf);
 		VT_FLUSH_UNLOCK(vd);
+#ifdef DEV_SPLASH
+		/* Atrium: animate the boot splash instead of drawing text. */
+		if (vt_splash_anim) {
+			vt_splash_animate(vd);
+			return (1);	/* keep the flush timer running */
+		}
+#endif
 		return (0);
 	}
 
@@ -1781,6 +1843,24 @@ vtterm_splash(struct vt_device *vd)
 		    left, top);
 	}
 }
+
+/*
+ * Atrium: once async flushing is up, arm the flush timer if the boot
+ * splash is showing, so the animation runs even if the console is
+ * otherwise quiet. vt_flush() then keeps it going (returns "changed"
+ * while the splash is up). Console activity during boot also arms it.
+ */
+static void
+vt_splash_anim_kick(void *unused __unused)
+{
+	struct vt_device *vd = &vt_consdev;
+
+	if (!vt_splash_anim || !(vd->vd_flags & VDF_SPLASH))
+		return;
+	if (vd->vd_curwindow != NULL)
+		vt_resume_flush_timer(vd->vd_curwindow, 0);
+}
+SYSINIT(vt_splash_anim, SI_SUB_LAST, SI_ORDER_ANY, vt_splash_anim_kick, NULL);
 #endif
 
 static struct vt_font *
