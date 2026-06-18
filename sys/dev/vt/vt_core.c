@@ -905,6 +905,22 @@ vt_processkey(keyboard_t *kbd, struct vt_device *vd, int c)
 		return (0);
 #endif
 
+	/*
+	 * Atrium: any keypress dismisses the boot splash and reveals the
+	 * console. vt_processkey() runs for every interactive key (via
+	 * vt_kbdevent), whereas the stock splash-dismiss lives only in the
+	 * polled vtterm_cngetc() path — so once vtterm_opened() no longer
+	 * clears VDF_SPLASH (Atrium persistent-splash patch), a real keypress
+	 * would never reveal the console without this. Swallow the key that
+	 * dismisses it.
+	 */
+	if (vd->vd_flags & VDF_SPLASH) {
+		vd->vd_flags &= ~VDF_SPLASH;
+		vd->vd_flags |= VDF_INVALID;
+		vt_resume_flush_timer(vd->vd_curwindow, 0);
+		return (0);
+	}
+
 	if (vt_machine_kbdevent(vd, c))
 		return (0);
 
@@ -1684,12 +1700,24 @@ vtterm_splash(struct vt_device *vd)
 	uintptr_t image;
 	vt_axis_t top, left;
 
-	if ((vd->vd_flags & VDF_TEXTMODE) != 0 || (boothowto & RB_MUTE) == 0)
+	if ((vd->vd_flags & VDF_TEXTMODE) != 0)
 		return;
 
 	si = MD_FETCH(preload_kmdp, rebooting == 1 ? MODINFOMD_SHTDWNSPLASH :
 	    MODINFOMD_SPLASH, struct splash_info *);
+	/*
+	 * Atrium: a loader-preloaded splash image (loader `splash="..."`)
+	 * enables the boot splash on its own, WITHOUT requiring RB_MUTE
+	 * (boot_mute). This decouples hiding the *video* console — done purely
+	 * via VDF_SPLASH, which only gates vt_flush (the video terminal draw) —
+	 * from RB_MUTE, which mutes *every* console. The serial console thus
+	 * stays fully verbose for live debugging while the video shows the
+	 * splash. The built-in-logo fallback (no preloaded image) keeps the
+	 * stock behaviour of appearing only on a muted boot.
+	 */
 	if (si == NULL) {
+		if ((boothowto & RB_MUTE) == 0)
+			return;
 		if (vd->vd_driver->vd_bitblt_bmp == NULL)
 			return;
 	} else if (vd->vd_driver->vd_bitblt_argb == NULL)
@@ -1698,6 +1726,14 @@ vtterm_splash(struct vt_device *vd)
 	if (rebooting == 1) {
 		if (vd->vd_driver->vd_blank == NULL)
 			return;
+		vd->vd_driver->vd_blank(vd, TC_BLACK);
+	} else if (si != NULL && vd->vd_driver->vd_blank != NULL) {
+		/*
+		 * Atrium: blank to black before drawing the startup image so no
+		 * early console text peeks out from behind it (on a non-muted
+		 * boot the video console may have printed a few lines before we
+		 * ran).
+		 */
 		vd->vd_driver->vd_blank(vd, TC_BLACK);
 	}
 
@@ -2127,7 +2163,15 @@ vtterm_opened(struct terminal *tm, int opened)
 	struct vt_device *vd = vw->vw_device;
 
 	VT_LOCK(vd);
-	vd->vd_flags &= ~VDF_SPLASH;
+	/*
+	 * Atrium: do NOT dismiss the boot splash merely because a console tty
+	 * was opened. init opens /dev/console early (and the video vtys have
+	 * no getty), so the stock `vd_flags &= ~VDF_SPLASH` here would clear
+	 * the splash before any of the boot is hidden. The Atrium splash is a
+	 * persistent boot splash: it stays up for the whole boot, hiding the
+	 * video console, and is dismissed only by a keypress (vt_processkey)
+	 * or when the GUI / a real fb driver takes over the framebuffer.
+	 */
 	if (opened)
 		vw->vw_flags |= VWF_OPENED;
 	else {
