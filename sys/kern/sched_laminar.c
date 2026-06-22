@@ -2446,18 +2446,29 @@ static void
 laminar_ctrl_cb_federation(void);
 
 /*
+ * The system power posture, 0..10 (0 powersave .. 5 balanced .. 10 perf).
+ * Defined below (with its sysctl); forward-declared here as a tentative
+ * definition so the federation loop can thread it to every member's
+ * demand()/actuate() as the soft preference (atrium-power-posture.md §3).
+ */
+static int laminar_power_policy;
+static void laminar_apply_power_policy(int level);
+
+/*
  * Energy-budget federation (P6 across-member half; federation doc §4).
- * Members register (demand probe, budget actuator, weight); every ctrl
- * tick with a cap set, water_fill allocates the cap max-min fair by
- * weight and pushes budgets.  Laminar itself registers the CPU member
- * (demand = load x current level power; actuator = a DVFS level
- * ceiling); the GPU kmod registers its device (demand/budget regs).
+ * Members register (demand probe, actuator, weight); every ctrl tick with
+ * a cap set, water_fill allocates the cap max-min fair by weight and pushes
+ * each grant + the system posture to the member's actuator.  Laminar itself
+ * registers the CPU member (demand = load x current level power; actuator =
+ * posture knobs + a DVFS level ceiling); the GPU/display kmods register their
+ * devices (demand/actuate regs).  Posture is threaded so "performance" drives
+ * all members coherently without a second control path (invariant #2).
  */
 #define	ENERGY_MAX_MEMBERS	4
 static struct energy_member {
 	char		em_name[16];
 	energy_demand_fn *em_demand;
-	energy_budget_fn *em_budget;
+	energy_actuate_fn *em_actuate;
 	void		*em_arg;
 	uint64_t	em_weight;
 	uint64_t	em_demand_last;	/* observability */
@@ -2467,6 +2478,7 @@ static struct energy_member {
 static struct mtx energy_lock;
 MTX_SYSINIT(energy_lock, &energy_lock, "energy_budget", MTX_DEF);
 static uint64_t energy_cap_mw = 0;	/* 0 = federation off */
+static int energy_posture_last = -1;	/* last posture broadcast (-1 = none) */
 
 SYSCTL_U64(_kern_sched, OID_AUTO, energy_cap_mw, CTLFLAG_RWTUN,
     &energy_cap_mw, 0,
@@ -2475,7 +2487,7 @@ SYSCTL_U64(_kern_sched, OID_AUTO, energy_cap_mw, CTLFLAG_RWTUN,
 
 int
 energy_member_register(const char *name, energy_demand_fn *demand,
-    energy_budget_fn *budget, void *arg, uint64_t weight)
+    energy_actuate_fn *actuate, void *arg, uint64_t weight)
 {
 	int i;
 
@@ -2485,7 +2497,7 @@ energy_member_register(const char *name, energy_demand_fn *demand,
 			strlcpy(energy_members[i].em_name, name,
 			    sizeof(energy_members[i].em_name));
 			energy_members[i].em_demand = demand;
-			energy_members[i].em_budget = budget;
+			energy_members[i].em_actuate = actuate;
 			energy_members[i].em_arg = arg;
 			energy_members[i].em_weight = weight == 0 ? 1 : weight;
 			energy_members[i].em_demand_last = 0;
@@ -2506,8 +2518,9 @@ energy_member_unregister(int id)
 	if (id < 0 || id >= ENERGY_MAX_MEMBERS)
 		return;
 	mtx_lock(&energy_lock);
-	if (energy_members[id].em_used && energy_members[id].em_budget != NULL)
-		energy_members[id].em_budget(energy_members[id].em_arg, 0);
+	if (energy_members[id].em_used && energy_members[id].em_actuate != NULL)
+		energy_members[id].em_actuate(energy_members[id].em_arg, 0,
+		    laminar_power_policy);
 	energy_members[id].em_used = false;
 	mtx_unlock(&energy_lock);
 }
@@ -2571,25 +2584,29 @@ laminar_ctrl_cb_federation(void)
 	uint64_t weight[ENERGY_MAX_MEMBERS];
 	bool active[ENERGY_MAX_MEMBERS];
 	uint64_t cap = energy_cap_mw;
+	int posture = laminar_power_policy;
 	int i;
 
 	mtx_lock(&energy_lock);
 	if (cap == 0) {
 		/*
-		 * Federation disabled: release every member's actuator
-		 * (budget 0 = uncapped) ONCE, so a member that was capped
-		 * on the previous tick does not stay throttled forever.
-		 * Idempotent — actuators tolerate repeated 0.
+		 * Federation off: grant is unbounded (mw = 0 = uncapped), but
+		 * the posture is STILL live (invariant #4: actuate(inf, P)).  So
+		 * re-actuate a member when it was capped on a previous tick OR
+		 * the posture changed — its actuator seeks the pure posture
+		 * target.  Idempotent: actuators tolerate repeated (0, P).
 		 */
 		for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
 			if (energy_members[i].em_used &&
-			    energy_members[i].em_budget != NULL &&
-			    energy_members[i].em_budget_last != 0) {
-				energy_members[i].em_budget(
-				    energy_members[i].em_arg, 0);
+			    energy_members[i].em_actuate != NULL &&
+			    (energy_members[i].em_budget_last != 0 ||
+			    posture != energy_posture_last)) {
+				energy_members[i].em_actuate(
+				    energy_members[i].em_arg, 0, posture);
 				energy_members[i].em_budget_last = 0;
 			}
 		}
+		energy_posture_last = posture;
 		mtx_unlock(&energy_lock);
 		return;
 	}
@@ -2597,7 +2614,8 @@ laminar_ctrl_cb_federation(void)
 		active[i] = energy_members[i].em_used &&
 		    energy_members[i].em_demand != NULL;
 		demand[i] = active[i] ?
-		    energy_members[i].em_demand(energy_members[i].em_arg) : 0;
+		    energy_members[i].em_demand(energy_members[i].em_arg,
+		    posture) : 0;
 		weight[i] = energy_members[i].em_weight;
 		if (active[i])
 			energy_members[i].em_demand_last = demand[i];
@@ -2606,12 +2624,13 @@ laminar_ctrl_cb_federation(void)
 	    ENERGY_MAX_MEMBERS);
 	for (i = 0; i < ENERGY_MAX_MEMBERS; i++) {
 		if (energy_members[i].em_used &&
-		    energy_members[i].em_budget != NULL) {
-			energy_members[i].em_budget(energy_members[i].em_arg,
-			    grant[i]);
+		    energy_members[i].em_actuate != NULL) {
+			energy_members[i].em_actuate(energy_members[i].em_arg,
+			    grant[i], posture);
 			energy_members[i].em_budget_last = grant[i];
 		}
 	}
+	energy_posture_last = posture;
 	mtx_unlock(&energy_lock);
 }
 
@@ -2895,7 +2914,7 @@ static int laminar_dvfs_fstar_idx = -1;	/* observability; -1 = none */
 static int laminar_dvfs_budget_idx = -1;
 
 static uint64_t
-laminar_cpu_demand_mw(void *arg __unused)
+laminar_cpu_demand_mw(void *arg __unused, int posture __unused)
 {
 	int idx = laminar_dvfs_cur_idx;
 	int load = laminar_ctrl_load_ewma;
@@ -2907,14 +2926,29 @@ laminar_cpu_demand_mw(void *arg __unused)
 		load = 0;
 	if (load > 100)
 		load = 100;
+	/*
+	 * posture could scale the ask (performance -> demand more so the cap
+	 * binds sooner); for now the CPU demand is the measured load x level
+	 * power, and posture shapes only the actuator (headroom/ceiling).
+	 */
 	return ((uint64_t)laminar_dvfs_levels[idx].total_set.power *
 	    load / 100);
 }
 
+/*
+ * The CPU energy actuator (invariant #2: ONE controller).  It seeks the
+ * posture target (parking + DVFS knobs, via laminar_apply_power_policy) AND
+ * clamps to the granted budget (a DVFS level ceiling).  Threading posture
+ * here folds the old standalone power-policy application into the same path,
+ * so the cap-clamp and the posture set-point cannot diverge.
+ */
 static void
-laminar_cpu_budget_mw(void *arg __unused, uint64_t mw)
+laminar_cpu_actuate(void *arg __unused, uint64_t mw, int posture)
 {
 	int i;
+
+	/* Posture set-point: re-assert the policy knobs for this posture. */
+	laminar_apply_power_policy(posture);
 
 	if (mw == 0 || laminar_dvfs_n_levels == 0) {
 		laminar_dvfs_budget_idx = -1;	/* uncapped */
@@ -3139,7 +3173,7 @@ laminar_dvfs_apply(void *ctx __unused, int pending __unused)
 				cpu_member_registered = true;
 				(void)energy_member_register("cpu",
 				    laminar_cpu_demand_mw,
-				    laminar_cpu_budget_mw, NULL, 2);
+				    laminar_cpu_actuate, NULL, 2);
 			}
 		}
 		laminar_dvfs_max_freq = laminar_dvfs_levels[0].total_set.freq;
