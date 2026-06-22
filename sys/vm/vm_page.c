@@ -79,6 +79,7 @@
 #include <sys/mman.h>
 #include <sys/msgbuf.h>
 #include <sys/mutex.h>
+#include <sys/pressure.h>
 #include <sys/proc.h>
 #include <sys/rwlock.h>
 #include <sys/sleepqueue.h>
@@ -3500,8 +3501,12 @@ vm_wait_doms(const domainset_t *wdoms, int mflags)
 			if (pageproc == NULL)
 				panic("vm_wait in early boot");
 			vm_min_waiters++;
+			/* A non-pageproc thread blocked on a memory shortage: a
+			 * memory stall (atrium-memory-pressure.md PSI 'some'). */
+			pressure_mem_enter();
 			error = msleep(&vm_min_domains, &vm_domainset_lock,
 			    PVM | PDROP | mflags, "vmwait", 0);
+			pressure_mem_exit();
 		} else
 			mtx_unlock(&vm_domainset_lock);
 	}
@@ -3630,8 +3635,11 @@ vm_waitpfault(struct domainset *dset, int timo)
 	mtx_lock(&vm_domainset_lock);
 	if (vm_page_count_min_set(&dset->ds_mask)) {
 		vm_min_waiters++;
+		/* Page-fault thread blocked on a memory shortage: a stall. */
+		pressure_mem_enter();
 		msleep(&vm_min_domains, &vm_domainset_lock, PUSER | PDROP,
 		    "pfault", timo);
+		pressure_mem_exit();
 	} else
 		mtx_unlock(&vm_domainset_lock);
 }
