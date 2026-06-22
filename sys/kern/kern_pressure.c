@@ -11,6 +11,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/callout.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
@@ -59,25 +60,115 @@ pressure_mem_exit(void)
 }
 
 /*
- * Read the banked `some` total, plus any in-flight interval so the counter is
- * live even while a stall is ongoing (otherwise a sustained stall would read as
- * flat until it ends).
+ * The banked `some` total plus any in-flight interval, so the counter is live
+ * even while a stall is ongoing (otherwise a sustained stall reads flat until it
+ * ends). Caller must hold pressure_mtx.
  */
-static int
-pressure_some_ns_sysctl(SYSCTL_HANDLER_ARGS)
+static uint64_t
+pressure_some_ns_locked(void)
 {
-	uint64_t v;
+	uint64_t v = pressure_some_ns;
 	sbintime_t now;
 
-	mtx_lock(&pressure_mtx);
-	v = pressure_some_ns;
 	if (pressure_nstalled > 0) {
 		now = sbinuptime();
 		if (now > pressure_some_since)
 			v += (uint64_t)sbttons(now - pressure_some_since);
 	}
+	return (v);
+}
+
+static int
+pressure_some_ns_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t v;
+
+	mtx_lock(&pressure_mtx);
+	v = pressure_some_ns_locked();
 	mtx_unlock(&pressure_mtx);
 	return (sysctl_handle_64(oidp, &v, 0, req));
+}
+
+/*
+ * PSI-style decaying averages: the % of recent wall-time spent in `some` stall,
+ * over 10/60/300 s, so the signal is a directly-consumable RATE (not a raw
+ * counter). A 1 s callout samples the `some` delta, forms the instantaneous
+ * fraction, and folds it into three fixed-point EWMAs. Fixed point (no kernel
+ * FPU): FIXED_1 = 1<<16; decay_W = exp(-period/W) for a 1 s period, so a window
+ * loses 1/W of its weight per second. Exposed as fraction x10000 (100% = 10000).
+ */
+#define	PRESSURE_FIXED_1	65536u
+#define	PRESSURE_DECAY_10	59303u	/* exp(-1/10)  * 65536 */
+#define	PRESSURE_DECAY_60	64453u	/* exp(-1/60)  * 65536 */
+#define	PRESSURE_DECAY_300	65318u	/* exp(-1/300) * 65536 */
+
+static uint32_t	pressure_avg10;		/* fixed-point EWMAs, 0..FIXED_1 */
+static uint32_t	pressure_avg60;
+static uint32_t	pressure_avg300;
+static uint64_t	pressure_last_some_ns;	/* `some_ns` at the previous sample */
+static sbintime_t pressure_last_sbt;	/* sbinuptime at the previous sample */
+static struct callout pressure_callout;
+
+static uint32_t
+pressure_ewma(uint32_t avg, uint32_t frac, uint32_t decay)
+{
+	/* avg = avg*decay + frac*(1-decay), all in FIXED_1 units. */
+	uint64_t a = (uint64_t)avg * decay +
+	    (uint64_t)frac * (PRESSURE_FIXED_1 - decay);
+	return ((uint32_t)(a / PRESSURE_FIXED_1));
+}
+
+static void
+pressure_aggregate(void *arg __unused)
+{
+	uint64_t some, delta, period_ns;
+	sbintime_t now;
+	uint32_t frac;
+
+	mtx_lock(&pressure_mtx);
+	some = pressure_some_ns_locked();
+	now = sbinuptime();
+	delta = some - pressure_last_some_ns;
+	period_ns = (now > pressure_last_sbt) ?
+	    (uint64_t)sbttons(now - pressure_last_sbt) : 1;
+	pressure_last_some_ns = some;
+	pressure_last_sbt = now;
+
+	/* instantaneous stalled fraction this period, clamped to [0, 1]. */
+	if (period_ns == 0)
+		frac = 0;
+	else if (delta >= period_ns)
+		frac = PRESSURE_FIXED_1;
+	else
+		frac = (uint32_t)(delta * PRESSURE_FIXED_1 / period_ns);
+
+	pressure_avg10 = pressure_ewma(pressure_avg10, frac, PRESSURE_DECAY_10);
+	pressure_avg60 = pressure_ewma(pressure_avg60, frac, PRESSURE_DECAY_60);
+	pressure_avg300 = pressure_ewma(pressure_avg300, frac, PRESSURE_DECAY_300);
+	mtx_unlock(&pressure_mtx);
+
+	callout_reset(&pressure_callout, hz, pressure_aggregate, NULL);
+}
+
+static void
+pressure_init(void *arg __unused)
+{
+
+	pressure_last_sbt = sbinuptime();
+	callout_init(&pressure_callout, 1);
+	callout_reset(&pressure_callout, hz, pressure_aggregate, NULL);
+}
+SYSINIT(pressure, SI_SUB_KICK_SCHEDULER, SI_ORDER_ANY, pressure_init, NULL);
+
+/* fraction x10000 (100.00% = 10000) of an EWMA, for the sysctl. */
+static int
+pressure_avg_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t *avgp = arg1;
+	int pct;
+
+	pct = (int)((uint64_t)*avgp * 10000 / PRESSURE_FIXED_1);
+	return (sysctl_handle_int(oidp, &pct, 0, req));
 }
 
 static SYSCTL_NODE(_kern, OID_AUTO, pressure, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
@@ -93,3 +184,16 @@ SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, some_ns,
 SYSCTL_INT(_kern_pressure_memory, OID_AUTO, nstalled, CTLFLAG_RD,
     &pressure_nstalled, 0,
     "Threads currently blocked on memory");
+
+SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, avg10,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, &pressure_avg10, 0,
+    pressure_avg_sysctl, "I",
+    "Memory stall 'some' over 10s, fraction x10000 (PSI avg10)");
+SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, avg60,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, &pressure_avg60, 0,
+    pressure_avg_sysctl, "I",
+    "Memory stall 'some' over 60s, fraction x10000 (PSI avg60)");
+SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, avg300,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, &pressure_avg300, 0,
+    pressure_avg_sysctl, "I",
+    "Memory stall 'some' over 300s, fraction x10000 (PSI avg300)");
