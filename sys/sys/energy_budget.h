@@ -14,11 +14,20 @@
 
 #include <sys/types.h>
 
-typedef uint64_t (energy_demand_fn)(void *arg);	/* current demand, mW */
-typedef void (energy_budget_fn)(void *arg, uint64_t mw); /* 0 = uncapped */
+/*
+ * posture is the system power posture, 0..10 (0 = powersave, 5 = balanced,
+ * 10 = performance): the SOFT preference for how eagerly available headroom
+ * is spent on speed (atrium-power-posture.md).  It is orthogonal to the cap
+ * (the HARD ceiling): demand() sizes the ask AT a posture, actuate() seeks the
+ * posture target clamped to the granted budget.  Both are threaded through the
+ * one federation loop so there is no second control path (invariant #2).
+ */
+typedef uint64_t (energy_demand_fn)(void *arg, int posture);	/* demand, mW */
+typedef void (energy_actuate_fn)(void *arg, uint64_t mw, int posture);
+						/* mw: 0 = uncapped; + posture */
 
 int	energy_member_register(const char *name, energy_demand_fn *demand,
-	    energy_budget_fn *budget, void *arg, uint64_t weight);
+	    energy_actuate_fn *actuate, void *arg, uint64_t weight);
 void	energy_member_unregister(int id);
 
 #endif /* !_SYS_ENERGY_BUDGET_H_ */
