@@ -9,10 +9,12 @@
  * vm_waitpfault); bracketing them measures the faithful PSI `some` signal with no
  * refault/shadow-entry surgery.
  *
- * Phase 1a: the GLOBAL signal. `some` = wall-time with >=1 thread blocked on
- * memory (tracked by the 0->1 / 1->0 transitions of the stalled count, NOT a sum
- * of per-thread stall times). Per-jail attribution and the kqueue edge-trigger are
- * Phase 1b.
+ * `some` = wall-time with >=1 thread blocked on memory (tracked by the 0->1 /
+ * 1->0 transitions of the stalled count, NOT a sum of per-thread stall times);
+ * `full` adds "and nothing is progressing"; per-jail attribution gives the
+ * federation-member granularity; and /dev/pressure exposes a kqueue edge-trigger
+ * (EVFILT_READ with a threshold) so a controller waits on a pushed pressure edge
+ * instead of polling. See kern_pressure.c.
  */
 #ifndef _SYS_PRESSURE_H_
 #define	_SYS_PRESSURE_H_
