@@ -12,14 +12,17 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/callout.h>
+#include <sys/jail.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
+#include <sys/sbuf.h>
 #include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/ucred.h>
 #include <sys/pressure.h>
 
 
@@ -47,19 +50,71 @@ static uint64_t		pressure_some_ns;	/* banked wall-ns with >=1 stalled */
 static sbintime_t	pressure_full_last;	/* sbinuptime at the previous sample */
 static uint64_t		pressure_full_ns;	/* banked wall-ns fully stalled */
 
+/*
+ * Per-jail `some` attribution — the federation-member granularity (jails are the
+ * Atrium app/member unit). A fixed table (the energy_members pattern: no pr_osd
+ * lifecycle, no malloc in the stall path), claimed on a jail's first stall and
+ * updated under pressure_mtx. Bounded; a full table silently drops attribution
+ * (global `some` is unaffected). Slots are not reclaimed on jail destroy — fine for
+ * the active-set; a production version would sweep dead jails.
+ */
+#define	PRESSURE_MAX_JAILS	16
+static struct pressure_jail {
+	int		jid;
+	bool		used;
+	int		nstalled;
+	sbintime_t	some_since;
+	uint64_t	some_ns;
+} pressure_jails[PRESSURE_MAX_JAILS];
+
+/* The current thread's jail id (0 = host/prison0). */
+static int
+pressure_curjid(void)
+{
+	struct prison *pr = curthread->td_ucred->cr_prison;
+
+	return (pr != NULL ? pr->pr_id : 0);
+}
+
+/* Find or claim the slot for `jid`; caller holds pressure_mtx. NULL if full. */
+static struct pressure_jail *
+pressure_jail_slot(int jid)
+{
+	int i, free = -1;
+
+	for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+		if (pressure_jails[i].used && pressure_jails[i].jid == jid)
+			return (&pressure_jails[i]);
+		if (!pressure_jails[i].used && free < 0)
+			free = i;
+	}
+	if (free < 0)
+		return (NULL);
+	pressure_jails[free].used = true;
+	pressure_jails[free].jid = jid;
+	pressure_jails[free].nstalled = 0;
+	pressure_jails[free].some_ns = 0;
+	return (&pressure_jails[free]);
+}
+
 void
 pressure_mem_enter(void)
 {
+	struct pressure_jail *pj;
 
 	mtx_lock(&pressure_mtx);
 	if (pressure_nstalled++ == 0)
 		pressure_some_since = sbinuptime();
+	pj = pressure_jail_slot(pressure_curjid());
+	if (pj != NULL && pj->nstalled++ == 0)
+		pj->some_since = sbinuptime();
 	mtx_unlock(&pressure_mtx);
 }
 
 void
 pressure_mem_exit(void)
 {
+	struct pressure_jail *pj;
 	sbintime_t now;
 
 	mtx_lock(&pressure_mtx);
@@ -70,6 +125,12 @@ pressure_mem_exit(void)
 			    sbttons(now - pressure_some_since);
 	}
 	KASSERT(pressure_nstalled >= 0, ("pressure_nstalled underflow"));
+	pj = pressure_jail_slot(pressure_curjid());
+	if (pj != NULL && pj->nstalled > 0 && --pj->nstalled == 0) {
+		now = sbinuptime();
+		if (now > pj->some_since)
+			pj->some_ns += (uint64_t)sbttons(now - pj->some_since);
+	}
 	mtx_unlock(&pressure_mtx);
 }
 
@@ -269,6 +330,41 @@ SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, some_ns,
 SYSCTL_INT(_kern_pressure_memory, OID_AUTO, nstalled, CTLFLAG_RD,
     &pressure_nstalled, 0,
     "Threads currently blocked on memory");
+
+/* Per-jail `some` (the federation-member granularity): one line per jail that has
+ * stalled, "jail <jid> some_ns=<ns>" (jid 0 = host). Includes any in-flight stall. */
+static int
+pressure_jails_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	uint64_t v;
+	sbintime_t now;
+	int i, error;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	mtx_lock(&pressure_mtx);
+	for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+		if (!pressure_jails[i].used)
+			continue;
+		v = pressure_jails[i].some_ns;
+		if (pressure_jails[i].nstalled > 0) {
+			now = sbinuptime();
+			if (now > pressure_jails[i].some_since)
+				v += (uint64_t)
+				    sbttons(now - pressure_jails[i].some_since);
+		}
+		sbuf_printf(&sb, "jail %d some_ns=%ju\n",
+		    pressure_jails[i].jid, (uintmax_t)v);
+	}
+	mtx_unlock(&pressure_mtx);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, jails,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    pressure_jails_sysctl, "A",
+    "Per-jail memory stall 'some' (jid some_ns) — federation-member granularity");
 
 SYSCTL_PROC(_kern_pressure_memory, OID_AUTO, full_ns,
     CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
