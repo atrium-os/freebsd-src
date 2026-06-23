@@ -64,6 +64,7 @@
 #include <sys/mutex.h>
 #include <sys/sbuf.h>
 #include <sys/pcpu.h>
+#include <sys/pressure.h>
 #include <sys/proc.h>
 #include <sys/runq.h>
 #include <sys/sched.h>
@@ -2687,6 +2688,12 @@ laminar_ctrl_cb(void *arg __unused)
 			min_cpu = cpu;
 		}
 	}
+	/*
+	 * Sample the memory-pressure `full` signal: a thread blocked on memory and
+	 * no CPU doing productive work (pagedaemon excluded). Driven from this
+	 * existing periodic control loop — no scheduler hot-path hook.
+	 */
+	pressure_sample_cpus();
 	int n_unparked = n_total - n_parked;
 	if (n_unparked <= 0)
 		goto reschedule;
