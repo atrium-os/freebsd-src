@@ -12,6 +12,8 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/callout.h>
+#include <sys/conf.h>
+#include <sys/event.h>
 #include <sys/jail.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
@@ -250,6 +252,72 @@ pressure_ewma(uint32_t avg, uint32_t frac, uint32_t decay)
 	return ((uint32_t)(a / PRESSURE_FIXED_1));
 }
 
+/*
+ * kqueue edge-trigger — the BSD-native realization of PSI's poll/trigger (Linux
+ * exposes this via poll() on /proc/pressure/memory with a written threshold). A
+ * userspace controller (memoryd) opens /dev/pressure and registers an EVFILT_READ
+ * knote whose `data` field carries a `full` threshold in basis points (fraction
+ * x10000, the same unit as the sysctls — 40% = 4000). The 1 s aggregation callout
+ * KNOTEs the list; a knote is active while full_avg10 >= its threshold. So the
+ * controller sleeps in kevent() with ZERO wakeups until the kernel pushes a
+ * pressure edge — no 1 Hz poll, no idle CPU ([[feedback_kqueue_native]]).
+ */
+static struct mtx	pressure_knl_mtx;
+static struct knlist	pressure_knl;
+static struct cdev	*pressure_cdev;
+
+/* full_avg10 in basis points (fraction x10000), matching the sysctl unit. */
+static int
+pressure_full_avg10_bp(void)
+{
+	return ((int)((uint64_t)pressure_full_avg10 * 10000 / PRESSURE_FIXED_1));
+}
+
+static int
+pressure_kqf_event(struct knote *kn, long hint __unused)
+{
+	int bp = pressure_full_avg10_bp();
+
+	kn->kn_data = bp;
+	return (bp >= (int)kn->kn_sdata);
+}
+
+static void
+pressure_kqf_detach(struct knote *kn)
+{
+	knlist_remove(&pressure_knl, kn, 0);
+}
+
+static const struct filterops pressure_filterops = {
+	.f_isfd = 1,
+	.f_detach = pressure_kqf_detach,
+	.f_event = pressure_kqf_event,
+};
+
+static int
+pressure_dev_kqfilter(struct cdev *dev __unused, struct knote *kn)
+{
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+	kn->kn_fop = &pressure_filterops;
+	knlist_add(&pressure_knl, kn, 0);
+	return (0);
+}
+
+static int
+pressure_dev_open(struct cdev *dev __unused, int oflags __unused,
+    int devtype __unused, struct thread *td __unused)
+{
+	return (0);
+}
+
+static struct cdevsw pressure_cdevsw = {
+	.d_version = D_VERSION,
+	.d_open = pressure_dev_open,
+	.d_kqfilter = pressure_dev_kqfilter,
+	.d_name = "pressure",
+};
+
 static void
 pressure_aggregate(void *arg __unused)
 {
@@ -293,12 +361,24 @@ pressure_aggregate(void *arg __unused)
 	pressure_last_sbt = now;
 	mtx_unlock(&pressure_mtx);
 
+	/*
+	 * Push the pressure edge to any kevent() waiter. Each knote re-evaluates
+	 * full_avg10 against its own threshold; KNOTE_UNLOCKED takes the knlist
+	 * lock itself (we hold no lock here, dodging any pressure_mtx ordering).
+	 */
+	KNOTE_UNLOCKED(&pressure_knl, 0);
+
 	callout_reset(&pressure_callout, hz, pressure_aggregate, NULL);
 }
 
 static void
 pressure_init(void *arg __unused)
 {
+
+	mtx_init(&pressure_knl_mtx, "mem pressure knote", NULL, MTX_DEF);
+	knlist_init_mtx(&pressure_knl, &pressure_knl_mtx);
+	pressure_cdev = make_dev(&pressure_cdevsw, 0, UID_ROOT, GID_WHEEL, 0640,
+	    "pressure");
 
 	pressure_last_sbt = sbinuptime();
 	callout_init(&pressure_callout, 1);
