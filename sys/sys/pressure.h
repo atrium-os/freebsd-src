@@ -28,6 +28,13 @@
 void	pressure_mem_enter(void);
 void	pressure_mem_exit(void);
 
+/*
+ * Sample whether the system is fully memory-stalled (a thread blocked on memory
+ * and no CPU doing productive work). Called from the scheduler's periodic control
+ * loop — no hot-path hook. Derives PSI `full`.
+ */
+void	pressure_sample_cpus(void);
+
 #endif /* _KERNEL */
 
 #endif /* !_SYS_PRESSURE_H_ */
