@@ -68,6 +68,11 @@ static struct pressure_jail {
 	sbintime_t	some_since;
 	uint64_t	some_ns;
 	uint64_t	full_ns;	/* wall-ns this jail was fully stalled */
+	/* decaying `full` averages (fixed-point, like the global ones) so a per-jail
+	 * consumer gets a directly-usable RATE, not a raw counter — the Linux PSI
+	 * per-cgroup avg10/60/300 analog. Folded by the 1 s aggregation callout. */
+	uint32_t	full_avg10, full_avg60, full_avg300;
+	uint64_t	last_full_ns;	/* clamped full_ns at the previous sample */
 } pressure_jails[PRESSURE_MAX_JAILS];
 
 /* The current thread's jail id (0 = host/prison0). */
@@ -98,6 +103,10 @@ pressure_jail_slot(int jid)
 	pressure_jails[free].nstalled = 0;
 	pressure_jails[free].some_ns = 0;
 	pressure_jails[free].full_ns = 0;
+	pressure_jails[free].full_avg10 = 0;
+	pressure_jails[free].full_avg60 = 0;
+	pressure_jails[free].full_avg300 = 0;
+	pressure_jails[free].last_full_ns = 0;
 	return (&pressure_jails[free]);
 }
 
@@ -364,6 +373,7 @@ pressure_aggregate(void *arg __unused)
 	uint64_t some, full, delta, period_ns;
 	sbintime_t now;
 	uint32_t frac;
+	int i;
 
 	mtx_lock(&pressure_mtx);
 	some = pressure_some_ns_locked();
@@ -395,6 +405,37 @@ pressure_aggregate(void *arg __unused)
 	pressure_full_avg10 = pressure_ewma(pressure_full_avg10, frac, PRESSURE_DECAY_10);
 	pressure_full_avg60 = pressure_ewma(pressure_full_avg60, frac, PRESSURE_DECAY_60);
 	pressure_full_avg300 = pressure_ewma(pressure_full_avg300, frac, PRESSURE_DECAY_300);
+
+	/*
+	 * Per-jail `full` EWMAs: same fold, per member. Clamp each jail's full to its
+	 * live `some` (full ⊆ some) before differencing — both are monotonic so the
+	 * clamped delta stays non-negative, and the per-jail rate never exceeds the
+	 * jail's degraded rate.
+	 */
+	for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+		struct pressure_jail *pj = &pressure_jails[i];
+		uint64_t js, jf;
+
+		if (!pj->used)
+			continue;
+		js = pj->some_ns;
+		if (pj->nstalled > 0 && now > pj->some_since)
+			js += (uint64_t)sbttons(now - pj->some_since);
+		jf = pj->full_ns;
+		if (jf > js)
+			jf = js;
+		delta = jf - pj->last_full_ns;
+		if (period_ns == 0)
+			frac = 0;
+		else if (delta >= period_ns)
+			frac = PRESSURE_FIXED_1;
+		else
+			frac = (uint32_t)(delta * PRESSURE_FIXED_1 / period_ns);
+		pj->full_avg10 = pressure_ewma(pj->full_avg10, frac, PRESSURE_DECAY_10);
+		pj->full_avg60 = pressure_ewma(pj->full_avg60, frac, PRESSURE_DECAY_60);
+		pj->full_avg300 = pressure_ewma(pj->full_avg300, frac, PRESSURE_DECAY_300);
+		pj->last_full_ns = jf;
+	}
 
 	pressure_last_some_ns = some;
 	pressure_last_full_ns = full;
@@ -484,8 +525,12 @@ pressure_jails_sysctl(SYSCTL_HANDLER_ARGS)
 		fv = pressure_jails[i].full_ns;
 		if (fv > v)
 			fv = v;
-		sbuf_printf(&sb, "jail %d some_ns=%ju full_ns=%ju\n",
-		    pressure_jails[i].jid, (uintmax_t)v, (uintmax_t)fv);
+		sbuf_printf(&sb,
+		    "jail %d some_ns=%ju full_ns=%ju full_avg10=%d full_avg60=%d full_avg300=%d\n",
+		    pressure_jails[i].jid, (uintmax_t)v, (uintmax_t)fv,
+		    (int)((uint64_t)pressure_jails[i].full_avg10 * 10000 / PRESSURE_FIXED_1),
+		    (int)((uint64_t)pressure_jails[i].full_avg60 * 10000 / PRESSURE_FIXED_1),
+		    (int)((uint64_t)pressure_jails[i].full_avg300 * 10000 / PRESSURE_FIXED_1));
 	}
 	mtx_unlock(&pressure_mtx);
 	error = sbuf_finish(&sb);
