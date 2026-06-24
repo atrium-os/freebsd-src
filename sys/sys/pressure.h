@@ -15,9 +15,49 @@
  * federation-member granularity; and /dev/pressure exposes a kqueue edge-trigger
  * (EVFILT_READ with a threshold) so a controller waits on a pushed pressure edge
  * instead of polling. See kern_pressure.c.
+ *
+ * /dev/pressure is the SINGLE grantable capability a memory governor needs: the
+ * EVFILT_READ edge (above) + the PRESSURE_GET ioctl (below) deliver the complete
+ * state — global and per-jail — so a *jailed* governor reads everything from one
+ * device in its devfs ruleset, with no host sysctl access (the cross-jail detail
+ * is TCB-sensitive; granting the device node is the access decision).
  */
 #ifndef _SYS_PRESSURE_H_
 #define	_SYS_PRESSURE_H_
+
+#include <sys/types.h>
+#include <sys/ioccom.h>
+
+/* Bound on per-jail slots reported in a snapshot (matches kern_pressure.c). */
+#define	PRESSURE_MAX_JAILS	16
+
+/* Decaying averages are reported in basis points: fraction x10000 (100% = 10000),
+ * the same unit as the kern.pressure.memory.* sysctls. */
+struct pressure_jail_stat {
+	int32_t		pjs_jid;
+	uint32_t	pjs_full_avg10;		/* basis points */
+	uint32_t	pjs_full_avg60;
+	uint32_t	pjs_full_avg300;
+	uint64_t	pjs_some_ns;
+	uint64_t	pjs_full_ns;		/* clamped <= some_ns */
+};
+
+/* Complete pressure state, read in one PRESSURE_GET ioctl on /dev/pressure. */
+struct pressure_snapshot {
+	uint64_t	ps_some_ns;		/* global cumulative stall ns */
+	uint64_t	ps_full_ns;
+	uint32_t	ps_some_avg10;		/* global averages, basis points */
+	uint32_t	ps_some_avg60;
+	uint32_t	ps_some_avg300;
+	uint32_t	ps_full_avg10;
+	uint32_t	ps_full_avg60;
+	uint32_t	ps_full_avg300;
+	int32_t		ps_nstalled;		/* threads blocked on memory right now */
+	uint32_t	ps_njails;		/* valid entries in ps_jails[] */
+	struct pressure_jail_stat ps_jails[PRESSURE_MAX_JAILS];
+};
+
+#define	PRESSURE_GET	_IOR('P', 1, struct pressure_snapshot)
 
 #ifdef _KERNEL
 
