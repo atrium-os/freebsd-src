@@ -59,8 +59,8 @@ static uint64_t		pressure_full_ns;	/* banked wall-ns fully stalled */
  * updated under pressure_mtx. Bounded; a full table silently drops attribution
  * (global `some` is unaffected). Slots are not reclaimed on jail destroy — fine for
  * the active-set; a production version would sweep dead jails.
+ * PRESSURE_MAX_JAILS comes from <sys/pressure.h> (shared with the ioctl ABI).
  */
-#define	PRESSURE_MAX_JAILS	16
 static struct pressure_jail {
 	int		jid;
 	bool		used;
@@ -360,9 +360,78 @@ pressure_dev_open(struct cdev *dev __unused, int oflags __unused,
 	return (0);
 }
 
+/* fixed-point EWMA -> basis points (fraction x10000), the snapshot/sysctl unit. */
+static uint32_t
+pressure_bp(uint32_t avg)
+{
+	return ((uint32_t)((uint64_t)avg * 10000 / PRESSURE_FIXED_1));
+}
+
+/*
+ * PRESSURE_GET: copy the complete pressure state (global + per-jail) out in one
+ * call, so a jailed governor reads everything from this one granted device — no
+ * host sysctl. The device node in the governor's devfs ruleset IS the access
+ * grant; there is no per-jail filtering here (the governor is cross-jail by
+ * design, like frescod seeing every app's pixels).
+ */
+static int
+pressure_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
+    int fflag __unused, struct thread *td __unused)
+{
+	struct pressure_snapshot *s;
+	struct pressure_jail *pj;
+	sbintime_t now;
+	uint64_t v, fv;
+	int i, n;
+
+	switch (cmd) {
+	case PRESSURE_GET:
+		s = (struct pressure_snapshot *)data;
+		bzero(s, sizeof(*s));
+		mtx_lock(&pressure_mtx);
+		s->ps_some_ns = pressure_some_ns_locked();
+		s->ps_full_ns = pressure_full_ns;
+		s->ps_some_avg10 = pressure_bp(pressure_avg10);
+		s->ps_some_avg60 = pressure_bp(pressure_avg60);
+		s->ps_some_avg300 = pressure_bp(pressure_avg300);
+		s->ps_full_avg10 = pressure_bp(pressure_full_avg10);
+		s->ps_full_avg60 = pressure_bp(pressure_full_avg60);
+		s->ps_full_avg300 = pressure_bp(pressure_full_avg300);
+		s->ps_nstalled = pressure_nstalled;
+		n = 0;
+		for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+			pj = &pressure_jails[i];
+			if (!pj->used)
+				continue;
+			v = pj->some_ns;
+			if (pj->nstalled > 0) {
+				now = sbinuptime();
+				if (now > pj->some_since)
+					v += (uint64_t)sbttons(now - pj->some_since);
+			}
+			fv = pj->full_ns;
+			if (fv > v)	/* full subset of some */
+				fv = v;
+			s->ps_jails[n].pjs_jid = pj->jid;
+			s->ps_jails[n].pjs_some_ns = v;
+			s->ps_jails[n].pjs_full_ns = fv;
+			s->ps_jails[n].pjs_full_avg10 = pressure_bp(pj->full_avg10);
+			s->ps_jails[n].pjs_full_avg60 = pressure_bp(pj->full_avg60);
+			s->ps_jails[n].pjs_full_avg300 = pressure_bp(pj->full_avg300);
+			n++;
+		}
+		s->ps_njails = n;
+		mtx_unlock(&pressure_mtx);
+		return (0);
+	default:
+		return (ENOTTY);
+	}
+}
+
 static struct cdevsw pressure_cdevsw = {
 	.d_version = D_VERSION,
 	.d_open = pressure_dev_open,
+	.d_ioctl = pressure_dev_ioctl,
 	.d_kqfilter = pressure_dev_kqfilter,
 	.d_name = "pressure",
 };
