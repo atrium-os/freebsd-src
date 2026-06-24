@@ -67,6 +67,7 @@ static struct pressure_jail {
 	int		nstalled;
 	sbintime_t	some_since;
 	uint64_t	some_ns;
+	uint64_t	full_ns;	/* wall-ns this jail was fully stalled */
 } pressure_jails[PRESSURE_MAX_JAILS];
 
 /* The current thread's jail id (0 = host/prison0). */
@@ -96,6 +97,7 @@ pressure_jail_slot(int jid)
 	pressure_jails[free].jid = jid;
 	pressure_jails[free].nstalled = 0;
 	pressure_jails[free].some_ns = 0;
+	pressure_jails[free].full_ns = 0;
 	return (&pressure_jails[free]);
 }
 
@@ -151,16 +153,41 @@ pressure_sample_cpus(void)
 {
 	struct thread *td;
 	struct proc *p;
+	struct ucred *cr;
 	sbintime_t now;
-	int cpu, productive = 0;
+	uint64_t dt;
+	bool jail_prod[PRESSURE_MAX_JAILS];
+	int cpu, i, jid, productive = 0;
 
+	/*
+	 * Walk the CPUs under the lock so the same pass feeds both the global
+	 * `full` (any productive thread anywhere) and per-jail `full` (a productive
+	 * thread OF THAT JAIL). For each running user thread, mark its jail's slot
+	 * productive. Reading other CPUs' pc_curthread (and its cred) is racy by
+	 * design — a sampled signal tolerates the occasional miss.
+	 */
+	for (i = 0; i < PRESSURE_MAX_JAILS; i++)
+		jail_prod[i] = false;
+
+	mtx_lock(&pressure_mtx);
 	CPU_FOREACH(cpu) {
 		td = pcpu_find(cpu)->pc_curthread;
 		if (td == NULL || TD_IS_IDLETHREAD(td))
 			continue;
 		p = td->td_proc;
-		if (p != NULL && (p->p_flag & P_KPROC) == 0)
-			productive++;	/* a user thread is making progress */
+		if (p == NULL || (p->p_flag & P_KPROC) != 0)
+			continue;
+		productive++;		/* a user thread is making progress */
+		cr = td->td_ucred;
+		jid = (cr != NULL && cr->cr_prison != NULL) ?
+		    cr->cr_prison->pr_id : 0;
+		for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+			if (pressure_jails[i].used &&
+			    pressure_jails[i].jid == jid) {
+				jail_prod[i] = true;
+				break;
+			}
+		}
 	}
 
 	/*
@@ -169,11 +196,24 @@ pressure_sample_cpus(void)
 	 * once → `full_ns` can never exceed wall-clock (the interval-tracking version
 	 * could double-count against the precise some-exit path).
 	 */
-	mtx_lock(&pressure_mtx);
 	now = sbinuptime();
-	if (pressure_full_last != 0 && now > pressure_full_last &&
-	    pressure_nstalled > 0 && productive == 0)
-		pressure_full_ns += (uint64_t)sbttons(now - pressure_full_last);
+	if (pressure_full_last != 0 && now > pressure_full_last) {
+		dt = (uint64_t)sbttons(now - pressure_full_last);
+		if (pressure_nstalled > 0 && productive == 0)
+			pressure_full_ns += dt;
+		/*
+		 * Per-jail `full`: the jail has a thread blocked on memory and
+		 * none of its own threads ran this sample — it is locally
+		 * thrashing, possibly while the system overall progresses via a
+		 * different jail. (global full ⊆ every jail's full, never the
+		 * reverse.)
+		 */
+		for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
+			if (pressure_jails[i].used &&
+			    pressure_jails[i].nstalled > 0 && !jail_prod[i])
+				pressure_jails[i].full_ns += dt;
+		}
+	}
 	pressure_full_last = now;
 	mtx_unlock(&pressure_mtx);
 }
@@ -417,7 +457,7 @@ static int
 pressure_jails_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	struct sbuf sb;
-	uint64_t v;
+	uint64_t v, fv;
 	sbintime_t now;
 	int i, error;
 
@@ -433,8 +473,19 @@ pressure_jails_sysctl(SYSCTL_HANDLER_ARGS)
 				v += (uint64_t)
 				    sbttons(now - pressure_jails[i].some_since);
 		}
-		sbuf_printf(&sb, "jail %d some_ns=%ju\n",
-		    pressure_jails[i].jid, (uintmax_t)v);
+		/*
+		 * `full` is definitionally a subset of `some` (both need a
+		 * staller; full adds "nothing of this jail ran"). But `some` is
+		 * measured precisely at the stall transitions while `full` is
+		 * Riemann-sampled at the sched cadence, so a single-threaded jail
+		 * whose stalls are shorter than a sample can push the sampled
+		 * full_ns a tick past some_ns. Clamp to keep full <= some.
+		 */
+		fv = pressure_jails[i].full_ns;
+		if (fv > v)
+			fv = v;
+		sbuf_printf(&sb, "jail %d some_ns=%ju full_ns=%ju\n",
+		    pressure_jails[i].jid, (uintmax_t)v, (uintmax_t)fv);
 	}
 	mtx_unlock(&pressure_mtx);
 	error = sbuf_finish(&sb);
