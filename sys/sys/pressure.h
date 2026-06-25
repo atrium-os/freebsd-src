@@ -31,6 +31,12 @@
 /* Bound on per-jail slots reported in a snapshot (matches kern_pressure.c). */
 #define	PRESSURE_MAX_JAILS	16
 
+/* Bytes of jail name reported per slot (NUL-terminated, truncated). Lets the
+ * jailed memfed budgeter match snapshot entries to its by-name config without
+ * resolving sibling jids (which jail isolation forbids). Atrium jail names
+ * (atrium-/app-/...) are short; 64 is ample and keeps the snapshot < 8 KiB. */
+#define	PRESSURE_JAIL_NAME	64
+
 /* Decaying averages are reported in basis points: fraction x10000 (100% = 10000),
  * the same unit as the kern.pressure.memory.* sysctls. */
 struct pressure_jail_stat {
@@ -40,6 +46,12 @@ struct pressure_jail_stat {
 	uint32_t	pjs_full_avg300;
 	uint64_t	pjs_some_ns;
 	uint64_t	pjs_full_ns;		/* clamped <= some_ns */
+	uint64_t	pjs_memoryuse;		/* per-jail RSS bytes (RACCT_RSS);
+					 * 0 if racct disabled. The jailed
+					 * memfed budgeter reads RSS here so
+					 * /dev/pressure is the single jailed
+					 * per-jail telemetry source. */
+	char		pjs_name[PRESSURE_JAIL_NAME];	/* jail name, NUL-term */
 };
 
 /* Complete pressure state, read in one PRESSURE_GET ioctl on /dev/pressure. */
