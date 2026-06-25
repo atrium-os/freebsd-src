@@ -20,8 +20,10 @@
 #include <sys/mutex.h>
 #include <sys/pcpu.h>
 #include <sys/proc.h>
+#include <sys/racct.h>
 #include <sys/sbuf.h>
 #include <sys/smp.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/ucred.h>
@@ -380,9 +382,17 @@ pressure_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 {
 	struct pressure_snapshot *s;
 	struct pressure_jail *pj;
+	struct prison *pr;
 	sbintime_t now;
 	uint64_t v, fv;
-	int i, n;
+	int i, j, n, npsi;
+	/* PSI for the active jails, captured under pressure_mtx, then merged
+	 * into the all-jails enumeration done under allprison_lock. */
+	struct {
+		int		jid;
+		uint64_t	some_ns, full_ns;
+		uint32_t	a10, a60, a300;
+	} psi[PRESSURE_MAX_JAILS];
 
 	switch (cmd) {
 	case PRESSURE_GET:
@@ -398,7 +408,11 @@ pressure_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		s->ps_full_avg60 = pressure_bp(pressure_full_avg60);
 		s->ps_full_avg300 = pressure_bp(pressure_full_avg300);
 		s->ps_nstalled = pressure_nstalled;
-		n = 0;
+		/*
+		 * Phase 1: capture PSI for the jails that have stalled (the
+		 * lazily-populated pressure_jails table), under pressure_mtx.
+		 */
+		npsi = 0;
 		for (i = 0; i < PRESSURE_MAX_JAILS; i++) {
 			pj = &pressure_jails[i];
 			if (!pj->used)
@@ -412,16 +426,58 @@ pressure_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 			fv = pj->full_ns;
 			if (fv > v)	/* full subset of some */
 				fv = v;
-			s->ps_jails[n].pjs_jid = pj->jid;
-			s->ps_jails[n].pjs_some_ns = v;
-			s->ps_jails[n].pjs_full_ns = fv;
-			s->ps_jails[n].pjs_full_avg10 = pressure_bp(pj->full_avg10);
-			s->ps_jails[n].pjs_full_avg60 = pressure_bp(pj->full_avg60);
-			s->ps_jails[n].pjs_full_avg300 = pressure_bp(pj->full_avg300);
+			psi[npsi].jid = pj->jid;
+			psi[npsi].some_ns = v;
+			psi[npsi].full_ns = fv;
+			psi[npsi].a10 = pressure_bp(pj->full_avg10);
+			psi[npsi].a60 = pressure_bp(pj->full_avg60);
+			psi[npsi].a300 = pressure_bp(pj->full_avg300);
+			npsi++;
+		}
+		mtx_unlock(&pressure_mtx);
+
+		/*
+		 * Phase 2: enumerate ALL jails (so memfed sees idle jails it
+		 * must still budget, by name — a jailed governor can't resolve
+		 * sibling jids), filling name + RSS (RACCT_RSS bytes) and
+		 * merging the phase-1 PSI; jails with no stall get PSI 0. The
+		 * host (pr_id 0) is not a budgetable jail and is skipped.
+		 *
+		 * Done AFTER dropping pressure_mtx: the prison walk takes the
+		 * sleepable allprison_lock, which must not be held under a
+		 * mutex. Shared allprison_lock keeps the prisons alive; we walk
+		 * the list (no pr_mtx, so no lock-order reversal with
+		 * racct_lock) and read RSS under RACCT_LOCK. racct disabled →
+		 * RSS reads 0, which is fine (advisory).
+		 */
+		n = 0;
+		sx_slock(&allprison_lock);
+		TAILQ_FOREACH(pr, &allprison, pr_list) {
+			if (n >= PRESSURE_MAX_JAILS)
+				break;
+			if (pr->pr_id == 0)	/* host, not a budgetable jail */
+				continue;
+			s->ps_jails[n].pjs_jid = pr->pr_id;
+			strlcpy(s->ps_jails[n].pjs_name, pr->pr_name,
+			    sizeof(s->ps_jails[n].pjs_name));
+			RACCT_LOCK();
+			s->ps_jails[n].pjs_memoryuse = (uint64_t)
+			    pr->pr_prison_racct->prr_racct->r_resources[RACCT_RSS];
+			RACCT_UNLOCK();
+			for (j = 0; j < npsi; j++) {
+				if (psi[j].jid != pr->pr_id)
+					continue;
+				s->ps_jails[n].pjs_some_ns = psi[j].some_ns;
+				s->ps_jails[n].pjs_full_ns = psi[j].full_ns;
+				s->ps_jails[n].pjs_full_avg10 = psi[j].a10;
+				s->ps_jails[n].pjs_full_avg60 = psi[j].a60;
+				s->ps_jails[n].pjs_full_avg300 = psi[j].a300;
+				break;
+			}
 			n++;
 		}
+		sx_sunlock(&allprison_lock);
 		s->ps_njails = n;
-		mtx_unlock(&pressure_mtx);
 		return (0);
 	default:
 		return (ENOTTY);
