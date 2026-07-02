@@ -389,6 +389,9 @@ static u_long laminar_lane_sponsors = 0;
 static u_long laminar_lane_preempts = 0;
 static u_long laminar_lane_wakes = 0;	/* lane wakes seen at local sched_add */
 static u_long laminar_lane_wake_blocked = 0; /* incumbent not timeshare */
+static u_long laminar_lane_misses_total = 0;	/* summed le_misses across entities */
+static u_long laminar_lane_max_late_us = 0;	/* worst replenish-callout lateness */
+static u_long laminar_lane_repl_retries = 0;	/* replenish trylock deferrals */
 static void laminar_lane_priv_dtor(void *data);
 static void laminar_lane_teardown(struct laminar_lane_entity *le);
 static void laminar_lane_band_apply(struct thread *td,
@@ -2428,6 +2431,15 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_wakes, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_wake_blocked, CTLFLAG_RD,
     &laminar_lane_wake_blocked, 0,
     "Laminar: lane wakes with non-timeshare incumbent");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_misses_total, CTLFLAG_RD,
+    &laminar_lane_misses_total, 0,
+    "Laminar: total lane deadline misses (period ended, work not yielded)");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_max_late_us, CTLFLAG_RD,
+    &laminar_lane_max_late_us, 0,
+    "Laminar: worst replenish-callout lateness seen (us)");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_repl_retries, CTLFLAG_RD,
+    &laminar_lane_repl_retries, 0,
+    "Laminar: replenish trylock deferrals (tdq momentarily held)");
 SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
     &sched_slice, 0,
     "Laminar: base time slice in stathz ticks (low-load posture)");
@@ -4285,6 +4297,7 @@ laminar_lane_replenish(void *arg)
 	 * (the tdq lock is only ever held for a few microseconds at a time).
 	 */
 	if (!LAMINAR_TDQ_TRYLOCK(tdq)) {
+		laminar_lane_repl_retries++;
 		callout_reset_sbt_on(&le->le_callout, LAM_REPLENISH_RETRY_SBT, 0,
 		    laminar_lane_replenish, le, le->le_cpu, C_DIRECT_EXEC);
 		return;
@@ -4300,10 +4313,13 @@ laminar_lane_replenish(void *arg)
 
 		if (late_us > le->le_max_late_us)
 			le->le_max_late_us = late_us;
+		if (late_us > laminar_lane_max_late_us)
+			laminar_lane_max_late_us = late_us;
 	}
 	le->le_periods++;
 	if (!le->le_yielded && !le->le_throttled) {
 		le->le_misses++;
+		laminar_lane_misses_total++;
 		/*
 		 * Record the miss for the owning fd's feed.  Only the ring
 		 * write happens here — the taskqueue enqueue is deferred
