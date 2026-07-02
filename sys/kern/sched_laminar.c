@@ -352,6 +352,14 @@ static int laminar_rt_occupied_cost = 64;	/* in nice-0 thread units */
  */
 #define	LAMINAR_LANE_MAX	8	/* entities per CPU */
 
+/*
+ * Retry delay when the direct-exec replenish handler can't trylock the tdq
+ * (the tdq lock was momentarily held by a scheduler op).  Small so the
+ * deferred replenish still lands close to the deadline; the tdq lock is only
+ * ever held for a few microseconds, so one retry almost always suffices.
+ */
+#define	LAM_REPLENISH_RETRY_SBT	(20 * SBT_1US)
+
 struct laminar_lane_entity {
 	struct thread	*le_td;		/* sponsored thread; NULL = free */
 	int		le_cpu;
@@ -773,6 +781,7 @@ static struct laminar_tdq laminar_tdq_cpu;
 
 #define	LAMINAR_TDQ_LOCKPTR(t)	((struct mtx *)(&(t)->ltdq_lock))
 #define	LAMINAR_TDQ_LOCK(t)	mtx_lock_spin(LAMINAR_TDQ_LOCKPTR((t)))
+#define	LAMINAR_TDQ_TRYLOCK(t)	mtx_trylock_spin(LAMINAR_TDQ_LOCKPTR((t)))
 #define	LAMINAR_TDQ_UNLOCK(t)	mtx_unlock_spin(LAMINAR_TDQ_LOCKPTR((t)))
 #define	LAMINAR_TDQ_LOCK_ASSERT(t, type)				\
     mtx_assert(LAMINAR_TDQ_LOCKPTR((t)), (type))
@@ -4215,10 +4224,11 @@ struct lam_miss_event {
  * lyrad) crashing or closing its fd reclaims ALL its clients' entities.
  *
  * Miss-event path: the replenish callout runs C_DIRECT_EXEC (interrupt
- * context), so it only enqueues into lp_ring under the SPIN lock and
- * fires lp_task; the task, in thread context, does the KNOTE + wakeup.
- * The deadline machinery stays direct; only the notification rides a
- * thread.
+ * context; it acquires the tdq lock by trylock to stay LOR-safe -- see
+ * laminar_lane_replenish), so it only enqueues into lp_ring under the SPIN
+ * lock and fires lp_task; the task, in thread context, does the KNOTE +
+ * wakeup.  The deadline machinery stays direct; only the notification
+ * rides a thread.
  */
 struct laminar_lane_priv {
 	struct mtx	lp_ringlock;	/* SPIN: ring, shared w/ replenish */
@@ -4259,7 +4269,26 @@ laminar_lane_replenish(void *arg)
 	sbintime_t now, late;
 	bool was_yielded;
 
-	LAMINAR_TDQ_LOCK(tdq);
+	/*
+	 * Runs C_DIRECT_EXEC (timer interrupt, per-CPU callout wheel spinlock
+	 * cc_lock held) so replenishment lands within microseconds of the
+	 * deadline -- the softclock path was 8-227 ms late under load and drove
+	 * 27% lane misses (commit 0c537d3502ea).  BUT since cc_lock is held
+	 * here we must NOT spin for the tdq lock: arm/cancel paths hold the tdq
+	 * lock and then take cc_lock inside callout_reset (tdq_lock -> cc_lock),
+	 * so a blocking tdq acquire here (cc_lock -> tdq_lock) closes a
+	 * lock-order cycle that deadlocks the box (cp spins for cc_lock in
+	 * sswitch at critnest 3; the callout cascade panics on the stuck
+	 * cc_lock).  Use a non-blocking trylock instead: if the tdq is
+	 * momentarily held, re-arm a hair later and retry.  No circular wait,
+	 * and direct-exec latency is preserved in the common uncontended case
+	 * (the tdq lock is only ever held for a few microseconds at a time).
+	 */
+	if (!LAMINAR_TDQ_TRYLOCK(tdq)) {
+		callout_reset_sbt_on(&le->le_callout, LAM_REPLENISH_RETRY_SBT, 0,
+		    laminar_lane_replenish, le, le->le_cpu, C_DIRECT_EXEC);
+		return;
+	}
 	if (le->le_td == NULL) {	/* withdrawn while in flight */
 		LAMINAR_TDQ_UNLOCK(tdq);
 		return;
@@ -4305,6 +4334,10 @@ laminar_lane_replenish(void *arg)
 	le->le_throttled = false;
 	le->le_budget_us = le->le_q_us;
 	le->le_deadline += le->le_t_sbt;
+	/*
+	 * Re-arm direct-exec for the next period (the trylock at entry, not a
+	 * softclock demotion, is what makes this LOR-safe -- see above).
+	 */
 	callout_reset_sbt_on(&le->le_callout, le->le_deadline, 0,
 	    laminar_lane_replenish, le, le->le_cpu, C_ABSOLUTE | C_DIRECT_EXEC);
 	LAMINAR_TDQ_UNLOCK(tdq);
