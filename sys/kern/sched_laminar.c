@@ -77,6 +77,9 @@
 #include <sys/taskqueue.h>
 #include <machine/smp.h>
 
+#include <vm/vm.h>
+#include <vm/vm_param.h>	/* VM_{MIN,MAX}_KERNEL_ADDRESS — thread_dtor guard */
+
 #include "cpufreq_if.h"
 
 #ifdef SMP
@@ -4644,8 +4647,26 @@ laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 {
 	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
 
-	if (__predict_false(le != NULL) && le->le_td == td)
+	/*
+	 * ts_lane is always either NULL or a pointer into a per-CPU tdq's
+	 * (never-freed) lane array, EXCEPT for a thread that is destroyed
+	 * before it was ever scheduled: an aborted creation whose td_sched
+	 * was allocated but never passed through sched_fork_thread's bzero.
+	 * Such a thread reaches thread_dtor with an uninitialized td_sched,
+	 * so ts_lane can be arbitrary garbage (observed: (void *)-1 from a
+	 * fresh UMA slab). It never owned a lane — there is nothing to
+	 * reclaim — so range-check the pointer before the le_td deref and
+	 * skip anything that can't be a real entity, rather than faulting
+	 * the reaper (proc_reap -> thread_dtor). Valid entities live in the
+	 * kernel map, so a simple VA-range test rejects the garbage.
+	 */
+	if (__predict_false(le != NULL) &&
+	    (vm_offset_t)le >= VM_MIN_KERNEL_ADDRESS &&
+	    (vm_offset_t)le < VM_MAX_KERNEL_ADDRESS &&
+	    le->le_td == td) {
 		laminar_lane_teardown_common(le, false);
+		td_get_sched(td)->ts_lane = NULL;
+	}
 	td_get_sched(td)->ts_adopted = NULL;	/* K-b: dying adopter */
 }
 
@@ -5898,6 +5919,8 @@ sched_laminar_init(void)
 	ts0->ts_home_node_conf = 0;
 	ts0->ts_home_node = -1;
 	ts0->ts_mem_bw = false;
+	ts0->ts_lane = NULL;		/* no deadline lane / adoption yet */
+	ts0->ts_adopted = NULL;
 }
 
 /*
