@@ -50,7 +50,14 @@ struct devsw *devsw[] = {
 	NULL
 };
 
+#ifdef LOADER_TESSERA_SUPPORT
+extern struct fs_ops tessera_fsops;	/* Atrium Tessera CAS-FS (read-only) */
+#endif
+
 struct fs_ops *file_system[] = {
+#ifdef LOADER_TESSERA_SUPPORT
+	&tessera_fsops,
+#endif
 #ifdef EFI_ZFS_BOOT
 	&zfs_fsops,
 	&zstdfs_fsops,
