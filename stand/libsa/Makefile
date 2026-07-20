@@ -227,4 +227,26 @@ beforedepend:
 CLEANDIRS+=${FAKE_DIRS}
 CLEANFILES+= ${SAFE_INCS} ${STAND_H_INC} ${OTHER_INC}
 
+# ── Atrium Tessera CAS-FS read-only support (loader) ──────────────────
+# Opt-in via LOADER_TESSERA_SUPPORT=yes (matches the LOADER_*_SUPPORT
+# convention; default off, so a stock loader build is unaffected). When
+# enabled, pull the hash-free read subset of libtessera_core plus the
+# loader fs_ops adapter into libsa so the EFI loader can read a Tessera
+# root (vfs.root.mountfrom=tessera:... and loading the kernel from
+# Tessera). The Tessera sources live outside the FreeBSD tree;
+# TESSERA_SRCTOP points at the atrium-tessera checkout — default is the
+# 9p host share used by the in-VM build; override for other layouts.
+# Compiled read-only + hash-free (-DTESSERA_STAND) so it links no
+# SHA/BLAKE3. Pass both vars on the command line so they reach this
+# sub-make: make LOADER_TESSERA_SUPPORT=yes TESSERA_SRCTOP=...
+LOADER_TESSERA_SUPPORT?=	no
+TESSERA_SRCTOP?=	/mnt/host/atrium-tessera
+.if ${LOADER_TESSERA_SUPPORT} == "yes"
+.PATH:		${TESSERA_SRCTOP}/core/src ${TESSERA_SRCTOP}/loader
+SRCS+=		error.c crc.c codec.c btree.c manifest.c pack.c volume.c \
+		extent.c tessera_reader.c tessera.c
+CFLAGS+=	-I${TESSERA_SRCTOP}/core/include -I${TESSERA_SRCTOP}/core/src \
+		-DTESSERA_STAND
+.endif
+
 .include <bsd.lib.mk>

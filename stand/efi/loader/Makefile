@@ -4,6 +4,14 @@ LOADER_UFS_SUPPORT?=	yes
 LOADER_CD9660_SUPPORT?=	no
 LOADER_EXT2FS_SUPPORT?=	no
 
+# Atrium Tessera CAS-FS read-only support: register tessera_fsops in conf.c
+# when LOADER_TESSERA_SUPPORT=yes (opt-in; see libsa/Makefile for the
+# source pull-in). Kept in sync with the libsa gate via the same knob.
+LOADER_TESSERA_SUPPORT?=	no
+.if ${LOADER_TESSERA_SUPPORT} == "yes"
+CFLAGS+=	-DLOADER_TESSERA_SUPPORT
+.endif
+
 .include <bsd.init.mk>
 
 .if ${MACHINE} == "amd64" && ${DO32:U0} == 1
