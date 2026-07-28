@@ -1066,6 +1066,90 @@ thread_wait(struct proc *p)
 	thread_reap();	/* check for zombie threads etc. */
 }
 
+#ifdef INVARIANTS
+/*
+ * Atrium diagnostic (Laminar thread_unlink corruption hunt): validate the
+ * whole p_threads linkage and dump it on the first inconsistency, so the
+ * panic identifies WHICH node's linkage is trash — a recycled thread shows
+ * a foreign td_proc/td_tid; a double-remove shows poisoned tqe pointers.
+ * Called at link/unlink; O(nthreads) but only on thread create/exit.
+ */
+static bool
+thread_va_ok(const void *pp)
+{
+	vm_offset_t v = (vm_offset_t)pp;
+
+	/* Accept either the KVA kernel map or the direct map (arm64). */
+	return ((v >= VM_MIN_KERNEL_ADDRESS && v < VM_MAX_KERNEL_ADDRESS) ||
+	    (v >= DMAP_MIN_ADDRESS && v < DMAP_MAX_ADDRESS));
+}
+
+static void
+thread_list_audit(struct proc *p, struct thread *act, const char *who)
+{
+	struct thread *td, *prev;
+	int i, bad, found;
+
+	bad = -1;
+	found = -1;
+	prev = NULL;
+	i = 0;
+	TAILQ_FOREACH(td, &p->p_threads, td_plist) {
+		if (td == act)
+			found = i;
+		if ((prev == NULL &&
+		    td->td_plist.tqe_prev != &TAILQ_FIRST(&p->p_threads)) ||
+		    (prev != NULL &&
+		    td->td_plist.tqe_prev != &prev->td_plist.tqe_next)) {
+			bad = i;
+			break;
+		}
+		prev = td;
+		if (++i > 100000) {		/* cycle guard */
+			bad = i;
+			break;
+		}
+	}
+	/*
+	 * On the unlink path the list is expected to still contain act; if the
+	 * forward chain is self-consistent but act is missing, act is a stale /
+	 * half-spliced node (its own tqe_prev points at a slot that no longer
+	 * references it) -- dump act directly, since it won't appear above.
+	 */
+	if (bad < 0 && (strcmp(who, "unlink") != 0 || found >= 0))
+		return;
+
+	printf("thread_list_audit(%s): p %p (%s pid %d) nthr %d walked %d "
+	    "act %p found_at %d chain_bad_at %d\n", who, p, p->p_comm,
+	    p->p_pid, p->p_numthreads, i, act, found, bad);
+	printf("  ACT td %p tid %d proc %p(%s) state %d flags %#x name '%s'\n",
+	    act, act->td_tid, act->td_proc,
+	    (act->td_proc != NULL && thread_va_ok(act->td_proc)) ?
+	    act->td_proc->p_comm : "?", (int)TD_GET_STATE(act),
+	    act->td_flags, act->td_name);
+	printf("  ACT tqe_prev %p tqe_next %p\n",
+	    (void *)act->td_plist.tqe_prev, (void *)act->td_plist.tqe_next);
+	if (act->td_plist.tqe_prev != NULL &&
+	    act->td_plist.tqe_prev != (void *)-1 &&
+	    thread_va_ok(act->td_plist.tqe_prev))
+		printf("  *ACT.tqe_prev = %p (expected == ACT %p; %s)\n",
+		    (void *)*act->td_plist.tqe_prev, act,
+		    *act->td_plist.tqe_prev == act ? "MATCH" : "STALE");
+	else
+		printf("  ACT.tqe_prev not deref-safe (trashed/garbage)\n");
+	i = 0;
+	TAILQ_FOREACH(td, &p->p_threads, td_plist) {
+		printf("  [%d] td %p tid %d state %d name '%s' prev %p next %p\n",
+		    i, td, td->td_tid, (int)TD_GET_STATE(td), td->td_name,
+		    (void *)td->td_plist.tqe_prev,
+		    (void *)td->td_plist.tqe_next);
+		if (++i > (bad >= 0 ? bad + 3 : 64))
+			break;
+	}
+	panic("thread_list_audit(%s): p_threads corrupt (see dump above)", who);
+}
+#endif
+
 /*
  * Link a thread to a process.
  * set up anything that needs to be initialized for it to
@@ -1092,6 +1176,9 @@ thread_link(struct thread *td, struct proc *p)
 #endif
 	sigqueue_init(&td->td_sigqueue, p);
 	callout_init(&td->td_slpcallout, 1);
+#ifdef INVARIANTS
+	thread_list_audit(p, td, "link");
+#endif
 	TAILQ_INSERT_TAIL(&p->p_threads, td, td_plist);
 	p->p_numthreads++;
 }
@@ -1108,6 +1195,9 @@ thread_unlink(struct thread *td)
 	PROC_LOCK_ASSERT(p, MA_OWNED);
 #ifdef EPOCH_TRACE
 	MPASS(SLIST_EMPTY(&td->td_epochs));
+#endif
+#ifdef INVARIANTS
+	thread_list_audit(p, td, "unlink");
 #endif
 
 	TAILQ_REMOVE(&p->p_threads, td, td_plist);
