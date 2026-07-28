@@ -336,6 +336,10 @@ struct sched_selection {
 	DATA_SET(sched_instance_set, xsel_name);
 
 void sched_instance_select(void);
+/* Largest sizeof_thread() across all compiled-in schedulers; thread_zone is
+ * sized from this so an inactive scheduler touching its own td_sched fields
+ * cannot run off the end of the item (see sched_shim.c). */
+int sched_sizeof_thread_max(void);
 
 #endif /* _KERNEL */
 

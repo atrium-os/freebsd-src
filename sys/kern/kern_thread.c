@@ -575,7 +575,7 @@ threadinit(void)
 	 * are used by synchronization primitives to store flags in pointers to
 	 * such structures.
 	 */
-	thread_zone = uma_zcreate("THREAD", sched_sizeof_thread(),
+	thread_zone = uma_zcreate("THREAD", sched_sizeof_thread_max(),
 	    thread_ctor, thread_dtor, thread_init, thread_fini,
 	    UMA_ALIGN_CACHE_AND_MASK(32 - 1), UMA_ZONE_NOFREE);
 	tidhashtbl = hashinit(maxproc / 2, M_TIDHASH, &tidhash);

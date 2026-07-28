@@ -122,6 +122,41 @@ static char sched_name[32] = "ULE";
 
 SET_DECLARE(sched_instance_set, struct sched_selection);
 
+/*
+ * The largest sizeof_thread() over EVERY compiled-in scheduler.
+ *
+ * struct thread's per-scheduler tail (td_get_sched(td) == &td[1]) is part of
+ * the same UMA item as the thread, and thread_zone used to be sized from the
+ * ACTIVE scheduler alone. But a scheduler that is compiled in and NOT active
+ * can still run code — SYSINITs, eventhandlers, callouts — and any such code
+ * reaching for its own td_sched fields indexes past the end of a slot sized
+ * for a smaller scheduler, landing in the NEXT thread. That is not
+ * hypothetical: it is the p_threads corruption fixed in e8e022164f46, where
+ * Laminar's thread_dtor eventhandler ran under ULE and its
+ * `ts_adopted = NULL` store truncated a neighbouring thread's td_plist.
+ *
+ * Gating each such entry point works but has to be got right every time.
+ * Sizing the slot for the largest compiled-in scheduler makes the whole class
+ * unreachable instead, at a cost of a few tens of bytes per thread on kernels
+ * that compile in more than one. Cheap insurance against a memory-corruption
+ * bug that took a week to find.
+ */
+int
+sched_sizeof_thread_max(void)
+{
+	struct sched_selection *s, **ss;
+	int max, n;
+
+	max = 0;
+	SET_FOREACH(ss, sched_instance_set) {
+		s = *ss;
+		n = s->instance->sizeof_thread();
+		if (n > max)
+			max = n;
+	}
+	return (max);
+}
+
 void
 sched_instance_select(void)
 {
