@@ -395,6 +395,12 @@ static u_long laminar_lane_wake_blocked = 0; /* incumbent not timeshare */
 static u_long laminar_lane_misses_total = 0;	/* summed le_misses across entities */
 static u_long laminar_lane_max_late_us = 0;	/* worst replenish-callout lateness */
 static u_long laminar_lane_repl_retries = 0;	/* replenish trylock deferrals */
+/*
+ * Lane entities reclaimed by the thread-exit path. Before the guard fix this
+ * was structurally pinned at 0 on arm64 (see laminar_lane_entity_valid), and
+ * nothing said so — a dead reclaim path is invisible without a counter.
+ */
+static u_long laminar_lane_dtor_reclaims = 0;
 static void laminar_lane_priv_dtor(void *data);
 static void laminar_lane_teardown(struct laminar_lane_entity *le);
 static void laminar_lane_band_apply(struct thread *td,
@@ -892,6 +898,13 @@ tdq_setup(struct laminar_tdq *tdq, int id)
 	    sizeof(*tdq->ltdq_lane), M_LAMINAR, M_WAITOK | M_ZERO);
 	for (int _i = 0; _i < LAMINAR_LANE_MAX; _i++)
 		callout_init(&tdq->ltdq_lane[_i].le_callout, 1);
+	if (bootverbose)
+		printf("laminar: cpu %d lane array %p (%zu bytes) — %s\n",
+		    tdq->ltdq_id, tdq->ltdq_lane,
+		    LAMINAR_LANE_MAX * sizeof(*tdq->ltdq_lane),
+		    ((vm_offset_t)tdq->ltdq_lane >= VM_MIN_KERNEL_ADDRESS &&
+		     (vm_offset_t)tdq->ltdq_lane < VM_MAX_KERNEL_ADDRESS) ?
+		    "kernel map" : "NOT in the kernel map (direct map)");
 	tdq->ltdq_lane_n = 0;
 	tdq->ltdq_lane_util = 0;
 	tdq->ltdq_vtime = 0;
@@ -987,11 +1000,24 @@ laminar_slot_insert(struct laminar_tdq *tdq, struct thread *td)
 	uint32_t i, s;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
+	ts = td_get_sched(td);
+	/*
+	 * Atrium diag (#65 wild-write hunt): a double-insert would overwrite
+	 * ts_slot and ORPHAN the thread's previous SoA slot — that orphaned
+	 * slot keeps a raw struct thread* which, after this td exits and its
+	 * thread-zone memory is recycled, tdq_choose can hand back and the
+	 * dispatch path then writes through (into a LIVE, recycled thread) —
+	 * exactly the stray pointer-sized write onto td_plist we're hunting.
+	 * Catch it AT the cause instead of at the eventual thread_unlink.
+	 */
+	KASSERT((ts->ts_flags & TSF_INSOA) == 0,
+	    ("laminar_slot_insert: cpu %d td %p (tid %d) ALREADY in SoA "
+	     "(slot %u, ts_n %u) — double insert",
+	     tdq->ltdq_id, td, td->td_tid, ts->ts_slot, tdq->ltdq_ts_n));
 	if (__predict_false(tdq->ltdq_ts_n == tdq->ltdq_ts_cap))
 		panic("laminar_slot_insert: cpu %d SoA cap %u exhausted "
 		    "(raise LAMINAR_TS_CAP)", tdq->ltdq_id, tdq->ltdq_ts_cap);
 	i = tdq->ltdq_ts_n++;
-	ts = td_get_sched(td);
 	tdq->ltdq_vruntime[i] = ts->ts_vruntime;
 	tdq->ltdq_slot[i] = td;
 	ts->ts_slot = i;
@@ -1320,7 +1346,25 @@ tdq_choose(struct laminar_tdq *tdq)
 		 * lag-cap rebase) tolerate slightly stale values.
 		 */
 		atomic_store_64(&tdq->ltdq_vtime, tdq->ltdq_vruntime[i]);
-		return (tdq->ltdq_slot[i]);
+		/*
+		 * Atrium diag (#65): validate the picked slot points at a
+		 * thread genuinely queued HERE. An orphaned/recycled slot
+		 * (see laminar_slot_insert double-insert note) would return a
+		 * stale struct thread* the dispatch path then writes through,
+		 * scribbling a live recycled thread. Catch it at the pick.
+		 */
+		struct thread *_wtd = tdq->ltdq_slot[i];
+		KASSERT(_wtd != NULL &&
+		    (td_get_sched(_wtd)->ts_flags & TSF_INSOA) != 0 &&
+		    td_get_sched(_wtd)->ts_slot == i &&
+		    td_get_sched(_wtd)->ts_cpu == tdq->ltdq_id,
+		    ("laminar pick: cpu %d slot %u stale td %p (ts_slot %u "
+		     "ts_cpu %d flags %#x) — orphaned/recycled SoA slot",
+		     tdq->ltdq_id, i, _wtd,
+		     _wtd ? td_get_sched(_wtd)->ts_slot : 0,
+		     _wtd ? td_get_sched(_wtd)->ts_cpu : -1,
+		     _wtd ? td_get_sched(_wtd)->ts_flags : 0));
+		return (_wtd);
 	}
 	return (rt);	/* IDLE or NULL */
 }
@@ -2443,6 +2487,10 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_max_late_us, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_repl_retries, CTLFLAG_RD,
     &laminar_lane_repl_retries, 0,
     "Laminar: replenish trylock deferrals (tdq momentarily held)");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, lane_dtor_reclaims, CTLFLAG_RD,
+    &laminar_lane_dtor_reclaims, 0,
+    "Laminar: lane entities reclaimed at thread exit (0 while a sponsored "
+    "thread has exited means the thread_dtor reclaim path is dead)");
 SYSCTL_INT(_kern_sched, OID_AUTO, slice, CTLFLAG_RW,
     &sched_slice, 0,
     "Laminar: base time slice in stathz ticks (low-load posture)");
@@ -4642,10 +4690,85 @@ laminar_lane_priv_dtor(void *data)
  * must reclaim its entity.  thread_dtor runs in sleepable context with
  * the (type-stable) thread struct still intact.
  */
+/*
+ * Is `le` genuinely one of the per-CPU lane slots?
+ *
+ * This replaces a VA-range test that was WRONG on arm64 and silently
+ * disabled the whole reclaim path below. The lane arrays are
+ * malloc(LAMINAR_LANE_MAX * ~192, M_LAMINAR) — about 1.5 KiB, i.e.
+ * sub-page, so on any platform with UMA_MD_SMALL_ALLOC (arm64 included)
+ * they come from the DIRECT MAP, [0xffffa000.., 0xffffff00..). The old
+ * test accepted only [VM_MIN_KERNEL_ADDRESS, VM_MAX_KERNEL_ADDRESS) =
+ * [0xffff0000.., 0xffff0080..), which is disjoint from the direct map.
+ * It therefore rejected EVERY real entity, and the teardown it guards
+ * had never once executed on arm64.
+ *
+ * So don't guess from the address. The valid set is small, enumerable,
+ * and never freed: check membership directly. That is exact, cannot
+ * drift when an allocation size crosses the page boundary, and needs no
+ * per-platform knowledge.
+ */
+static bool
+laminar_lane_entity_valid(const struct laminar_lane_entity *le)
+{
+	const struct laminar_lane_entity *base;
+	struct laminar_tdq *tdq;
+	int cpu;
+
+	CPU_FOREACH(cpu) {
+		tdq = LAMINAR_TDQ_CPU(cpu);
+		base = tdq->ltdq_lane;
+		if (base == NULL)		/* pre-init CPU */
+			continue;
+		if (le < base || le >= base + LAMINAR_LANE_MAX)
+			continue;
+		/* In range — also require exact slot alignment, so a
+		 * garbage pointer that merely lands inside the array is
+		 * still rejected. */
+		return ((((uintptr_t)le - (uintptr_t)base) %
+		    sizeof(*le)) == 0);
+	}
+	return (false);
+}
+
+/* Defined at the bottom of this file; needed by the #65 gate below. */
+extern struct sched_instance sched_laminar_instance;
+
 static void
 laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 {
-	struct laminar_lane_entity *le = td_get_sched(td)->ts_lane;
+	struct laminar_lane_entity *le;
+
+	/*
+	 * ★ #65: DO NOTHING unless Laminar is the ACTIVE scheduler.
+	 *
+	 * This handler is registered from a SYSINIT that runs whenever this
+	 * file is compiled in — which, because std.arm64 sets
+	 * `options SCHED_LAMINAR`, is every arm64 kernel including ones
+	 * running ULE. But `td_get_sched(td)` is just `&td[1]`, and the
+	 * thread UMA zone is sized by the ACTIVE scheduler's
+	 * sched_sizeof_thread() via the sched_shim. Under ULE the slot is
+	 * ULE-sized; Laminar's struct td_sched is larger (it is why
+	 * thread0_storage.t0st_sched had to grow 10 -> 14 uint64_t), and
+	 * ts_adopted sits near its end. Writing it therefore ran off the end
+	 * of the thread's slot and into the NEXT UMA item — another struct
+	 * thread — and an 8-byte NULL landing on that thread's
+	 * td_plist.tqe_next truncates its proc's p_threads forward chain
+	 * while every tqe_prev back-link stays intact.
+	 *
+	 * That is exactly the corruption signature chased since 2026-07-22:
+	 * `nthr N walked M<N, chain_bad_at -1, *ACT.tqe_prev == ACT`, always
+	 * in a proc creating and destroying many kthreads at once (zfskern).
+	 * Measured: GENERIC with this file compiled in panicked 5 of 6 boots;
+	 * the identical kernel without it, 0 of 6; pristine upstream, 0 of 10.
+	 *
+	 * A thread that Laminar never scheduled has no lane to reclaim, so
+	 * returning early is also correct on its own terms.
+	 */
+	if (active_sched != &sched_laminar_instance)
+		return;
+
+	le = td_get_sched(td)->ts_lane;
 
 	/*
 	 * ts_lane is always either NULL or a pointer into a per-CPU tdq's
@@ -4655,15 +4778,14 @@ laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 	 * Such a thread reaches thread_dtor with an uninitialized td_sched,
 	 * so ts_lane can be arbitrary garbage (observed: (void *)-1 from a
 	 * fresh UMA slab). It never owned a lane — there is nothing to
-	 * reclaim — so range-check the pointer before the le_td deref and
+	 * reclaim — so validate the pointer before the le_td deref and
 	 * skip anything that can't be a real entity, rather than faulting
-	 * the reaper (proc_reap -> thread_dtor). Valid entities live in the
-	 * kernel map, so a simple VA-range test rejects the garbage.
+	 * the reaper (proc_reap -> thread_dtor).
 	 */
 	if (__predict_false(le != NULL) &&
-	    (vm_offset_t)le >= VM_MIN_KERNEL_ADDRESS &&
-	    (vm_offset_t)le < VM_MAX_KERNEL_ADDRESS &&
+	    laminar_lane_entity_valid(le) &&
 	    le->le_td == td) {
+		laminar_lane_dtor_reclaims++;
 		laminar_lane_teardown_common(le, false);
 		td_get_sched(td)->ts_lane = NULL;
 	}
