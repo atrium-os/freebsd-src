@@ -386,6 +386,28 @@ struct laminar_lane_entity {
 	uint64_t	le_max_late_us;	/* worst replenish-callout lateness */
 };
 
+/*
+ * ★ #65: is Laminar the scheduler actually running?
+ *
+ * This file is compiled into every arm64 kernel (std.arm64 sets
+ * options SCHED_LAMINAR) but only SCHEDULES when kern.sched.name selects it.
+ * Everything below that runs off a SYSINIT, an eventhandler or a callout
+ * would otherwise execute under ULE as well — touching per-thread scheduler
+ * state that ULE laid out differently, actuating DVFS, and publishing a
+ * control interface for a scheduler that is not running. One such path
+ * (the lane thread_dtor) corrupted p_threads; see e8e022164f46.
+ *
+ * active_sched is chosen in machdep.c's early init, long before any SYSINIT
+ * runs, so this is safe to call from all of them.
+ */
+extern struct sched_instance sched_laminar_instance;
+
+static bool
+laminar_is_active(void)
+{
+	return (active_sched == &sched_laminar_instance);
+}
+
 static int laminar_deadline_enable = 1;		/* RWTUN master gate (on by default) */
 static int laminar_deadline_util_max = 750;	/* per-mille per CPU */
 static u_long laminar_lane_sponsors = 0;
@@ -423,6 +445,10 @@ static struct laminar_prison laminar_prisons[LAMINAR_MAX_PRISONS];
 static void
 laminar_prisons_init(void *arg __unused)
 {
+	/* ★ #65: per-jail scheduling state is meaningless under another
+	 * scheduler. */
+	if (!laminar_is_active())
+		return;
 	int i;
 
 	for (i = 0; i < LAMINAR_MAX_PRISONS; i++) {
@@ -1144,6 +1170,10 @@ sched_setup_smp(void)
 static void
 laminar_sysctl_register(void *arg __unused)
 {
+	/* ★ #65: don't publish a control surface for a scheduler that is not
+	 * running — the knobs would silently do nothing. */
+	if (!laminar_is_active())
+		return;
 	struct sysctl_oid *root, *cpu_node;
 	struct laminar_tdq *tdq;
 	char name[16];
@@ -3482,6 +3512,10 @@ laminar_dvfs_step(int load_lead, int load_bare)
 static void
 laminar_phaseh_init(void *arg __unused)
 {
+	/* ★ #65: never actuate DVFS when another scheduler owns the CPUs.
+	 * This used to print its banner and arm itself under ULE. */
+	if (!laminar_is_active())
+		return;
 	device_t cpu_dev, cf_dev;
 	int cpu, found = 0;
 
@@ -4731,9 +4765,6 @@ laminar_lane_entity_valid(const struct laminar_lane_entity *le)
 	return (false);
 }
 
-/* Defined at the bottom of this file; needed by the #65 gate below. */
-extern struct sched_instance sched_laminar_instance;
-
 static void
 laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 {
@@ -4765,7 +4796,7 @@ laminar_lane_thread_dtor(void *arg __unused, struct thread *td)
 	 * A thread that Laminar never scheduled has no lane to reclaim, so
 	 * returning early is also correct on its own terms.
 	 */
-	if (active_sched != &sched_laminar_instance)
+	if (!laminar_is_active())
 		return;
 
 	le = td_get_sched(td)->ts_lane;
@@ -5136,6 +5167,12 @@ static struct cdevsw laminar_lane_cdevsw = {
 static void
 laminar_lane_dev_init(void *arg __unused)
 {
+	/* ★ #65: no /dev/laminar and NO thread_dtor eventhandler unless
+	 * Laminar is scheduling. Registering that handler unconditionally is
+	 * what corrupted p_threads under ULE (e8e022164f46); the per-call
+	 * guard there stays as defence in depth. */
+	if (!laminar_is_active())
+		return;
 	struct make_dev_args mda;
 	struct cdev *dev;
 
