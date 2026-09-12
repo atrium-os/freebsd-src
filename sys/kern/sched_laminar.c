@@ -899,6 +899,8 @@ extern u_long laminar_cp_skip_idle;
 extern u_long laminar_cp_skip_owe;
 extern u_long laminar_notify_ipi;
 extern u_long laminar_notify_skip;
+extern u_long laminar_notify_skip_owe;
+extern u_long laminar_owe_clears;
 #define	LAMINAR_WAKE_LONG_US	100000ULL
 static void sched_laminar_rem(struct thread *);
 static int laminar_transferable(struct laminar_tdq *);
@@ -1925,8 +1927,12 @@ tdq_notify(struct laminar_tdq *tdq, int oldpri)
 	int cpu, newpri;
 
 	LAMINAR_TDQ_LOCK_ASSERT(tdq, MA_OWNED);
-	if (tdq->ltdq_owepreempt)
+	if (tdq->ltdq_owepreempt) {
+		/* ★ was a SILENT return: it swallowed ~36k calls per run
+		 * while notify_skip read 0, hiding the latch completely. */
+		laminar_notify_skip_owe++;
 		return;
+	}
 	/*
 	 * Mirror ULE's sched_shouldpreempt: oldpri is the pre-add
 	 * lowest priority on tdq (i.e., the running thread's pri);
@@ -4035,6 +4041,34 @@ sched_laminar_sswitch(struct thread *td, int flags)
 	td->td_flags &= ~TDF_SLICEEND;
 	ast_unsched_locked(td, TDA_SCHED);
 	td->td_owepreempt = 0;
+	/*
+	 * ★ SETTLE THE TDQ'S PREEMPT DEBT TOO, not just the thread's.
+	 *
+	 * ULE's sched_switch clears BOTH td_owepreempt and
+	 * tdq_owepreempt here; this port dropped the second line, and
+	 * ltdq_owepreempt then had two set sites (tdq_notify and the
+	 * cost-IPI path in sched_laminar_add) and NO clear site anywhere
+	 * in the file. That makes it a one-way latch: the first
+	 * cross-CPU preempt IPI on a CPU sets it, and every subsequent
+	 * one takes the `else if (tdq->ltdq_owepreempt)` arm and is
+	 * skipped forever.
+	 *
+	 * Measured before this fix, 4 vCPUs: cp_ipi + notify_ipi = 4 in
+	 * total (exactly one per CPU, then latched) against
+	 * cp_skip_owe = 41906, with cp_skip_idle/v/cool all 0. The
+	 * consequence is that a woken thread is placed on a remote CPU
+	 * and that CPU is never told, so it waits for a clock tick:
+	 * 21% of wakes took >2ms (worst 33ms) while the machine sat
+	 * 76% IDLE, costing 3.4x on steady-state throughput and ~20x on
+	 * boot, which is one long serialized chain of wake->run
+	 * dependencies.
+	 *
+	 * atomic_store_char to match ULE: the flag is read locklessly by
+	 * tdq_notify and by the add path.
+	 */
+	if (tdq->ltdq_owepreempt != 0)
+		laminar_owe_clears++;	/* ★ did the clear actually fire? */
+	atomic_store_char(&tdq->ltdq_owepreempt, 0);
 	if (!TD_IS_IDLETHREAD(td))
 		tdq->ltdq_switchcnt++;
 
@@ -5739,6 +5773,8 @@ u_long laminar_cp_skip_cool = 0;	/* skipped: cooldown not expired */
 u_long laminar_cp_skip_idle = 0;	/* skipped: dst idle */
 u_long laminar_cp_skip_owe = 0;		/* skipped: owepreempt already set */
 u_long laminar_notify_ipi = 0;		/* tdq_notify IPIs sent */
+u_long laminar_notify_skip_owe = 0;	/* tdq_notify returns on the owe latch */
+u_long laminar_owe_clears = 0;		/* sswitch clears that found it SET */
 u_long laminar_notify_skip = 0;		/* tdq_notify decided no IPI */
 u_long laminar_wake_pick_long_threshold = LAMINAR_WAKE_LONG_US;
 /*
@@ -5831,6 +5867,10 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, cp_skip_owe, CTLFLAG_RW,
     &laminar_cp_skip_owe, 0, "Laminar: cost-preempt skipped (owe set).");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_ipi, CTLFLAG_RW,
     &laminar_notify_ipi, 0, "Laminar: tdq_notify IPIs sent.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_skip_owe, CTLFLAG_RW,
+    &laminar_notify_skip_owe, 0, "Laminar: tdq_notify early-returns on the owe latch.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, owe_clears, CTLFLAG_RW,
+    &laminar_owe_clears, 0, "Laminar: sswitch clears that found ltdq_owepreempt SET.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_skip, CTLFLAG_RW,
     &laminar_notify_skip, 0, "Laminar: tdq_notify decisions no-IPI.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_cooldown, CTLFLAG_RW,
