@@ -899,6 +899,7 @@ extern u_long laminar_cp_skip_idle;
 extern u_long laminar_cp_skip_owe;
 extern u_long laminar_notify_ipi;
 extern u_long laminar_notify_skip;
+extern u_long laminar_prio_requeues;
 extern u_long laminar_notify_skip_owe;
 extern u_long laminar_owe_clears;
 #define	LAMINAR_WAKE_LONG_US	100000ULL
@@ -3928,15 +3929,56 @@ sched_laminar_fork_thread(struct thread *td, struct thread *child)
 static void
 sched_priority(struct thread *td, u_char prio)
 {
+	struct laminar_tdq *tdq;
+	u_char oldlow;
 
 	THREAD_LOCK_ASSERT(td, MA_OWNED);
 	if (td->td_priority == prio)
 		return;
-	td->td_priority = prio;
 	/*
-	 * If the thread is on a runqueue, leave it where it is for now.
-	 * Re-insert on priority-bucket change is added in commit A.3d.
+	 * ★★★ A QUEUED THREAD MUST BE RE-QUEUED WHEN ITS PRIORITY CHANGES.
+	 *
+	 * Where a thread waits depends on td_priority: below PRI_MIN_TIMESHARE
+	 * it is in ltdq_runq (picked FIRST by tdq_choose), otherwise in the SoA
+	 * vruntime array (picked only when ltdq_runq is empty) — see
+	 * laminar_is_timeshare().  This used to only store the new priority
+	 * ("re-insert ... is added in commit A.3d", which never landed), so a
+	 * queued timeshare thread LENT a high priority stayed in the vruntime
+	 * array and was never considered ahead of the runq.
+	 *
+	 * That broke priority inheritance exactly where it is load-bearing.
+	 * epoch_wait_preempt (vnet_destroy -> if_detach) lends its priority to
+	 * the lock holder blocking the epoch; measured 2026-09-22: sshd-session
+	 * sat RUNQ at priority 1 on CPU 1 while the waiter (prio 45, in
+	 * ltdq_runq) was re-picked on every yield and three CPUs idled — the
+	 * net epoch never drained and all incoming traffic stopped. ULE, which
+	 * re-queues here (sched_thread_priority), survived the identical load.
+	 *
+	 * Re-queue on the SAME CPU (no migration: the thread's lock is this
+	 * tdq's), in both directions — an un-lent thread sitting in ltdq_runq
+	 * with a timeshare priority would otherwise run only when the vruntime
+	 * array was empty.  Load accounting is unchanged (still one thread).
 	 */
+	if (TD_ON_RUNQ(td)) {
+		tdq = LAMINAR_TDQ_CPU(td_get_sched(td)->ts_cpu);
+		MPASS(td->td_lock == LAMINAR_TDQ_LOCKPTR(tdq));
+		oldlow = tdq->ltdq_lowpri;
+		tdq_runq_rem(tdq, td);
+		td->td_priority = prio;
+		tdq_runq_add(tdq, td, 0);
+		if (prio < tdq->ltdq_lowpri)
+			tdq->ltdq_lowpri = prio;
+		laminar_prio_requeues++;
+		/* A more urgent thread queued behind a less urgent running one
+		 * must be able to preempt it, as on any add. */
+#ifdef SMP
+		tdq_notify(tdq, oldlow);
+#else
+		(void)oldlow;
+#endif
+		return;
+	}
+	td->td_priority = prio;
 }
 
 static void
@@ -5776,6 +5818,7 @@ u_long laminar_notify_ipi = 0;		/* tdq_notify IPIs sent */
 u_long laminar_notify_skip_owe = 0;	/* tdq_notify returns on the owe latch */
 u_long laminar_owe_clears = 0;		/* sswitch clears that found it SET */
 u_long laminar_notify_skip = 0;		/* tdq_notify decided no IPI */
+u_long laminar_prio_requeues = 0;	/* queued threads re-queued on a priority change */
 u_long laminar_wake_pick_long_threshold = LAMINAR_WAKE_LONG_US;
 /*
  * Per-CPU cooldown (in ticks) between cost-based preempt IPIs.
@@ -5873,6 +5916,10 @@ SYSCTL_ULONG(_kern_sched, OID_AUTO, owe_clears, CTLFLAG_RW,
     &laminar_owe_clears, 0, "Laminar: sswitch clears that found ltdq_owepreempt SET.");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, notify_skip, CTLFLAG_RW,
     &laminar_notify_skip, 0, "Laminar: tdq_notify decisions no-IPI.");
+SYSCTL_ULONG(_kern_sched, OID_AUTO, prio_requeues, CTLFLAG_RD,
+    &laminar_prio_requeues, 0,
+    "Laminar: queued threads re-queued because their priority changed "
+    "(priority lending to a runnable lock holder).");
 SYSCTL_ULONG(_kern_sched, OID_AUTO, local_preempt_cooldown, CTLFLAG_RW,
     &laminar_local_preempt_cooldown, 0,
     "Laminar: per-CPU ticks between same-CPU cost-based AST fires "
