@@ -6079,13 +6079,6 @@ sched_laminar_clear_tdname(struct thread *td)
 /*
  * Misc.
  */
-static bool
-sched_laminar_do_timer_accounting(void)
-{
-
-	return (true);
-}
-
 static int
 sched_laminar_find_l2_neighbor(int cpuid)
 {
@@ -6193,7 +6186,7 @@ sched_laminar_initticks(void)
  * needs no %CPU window decay.
  */
 static void
-sched_laminar_schedcpu(void)
+sched_laminar_sysinit(void)
 {
 
 }
@@ -6240,13 +6233,12 @@ struct sched_instance sched_laminar_instance = {
 	SLOT(sizeof_thread),
 	SLOT(tdname),
 	SLOT(clear_tdname),
-	SLOT(do_timer_accounting),
 	SLOT(find_l2_neighbor),
 	SLOT(init),
 	SLOT(init_ap),
 	SLOT(setup),
 	SLOT(initticks),
-	SLOT(schedcpu),
+	SLOT(sysinit),
 #undef	SLOT
 };
 DECLARE_SCHEDULER(laminar_sched_selector, "Laminar", &sched_laminar_instance);
