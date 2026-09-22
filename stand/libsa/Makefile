@@ -260,6 +260,16 @@ SRCS+=		error.c crc.c codec.c btree.c manifest.c pack.c volume.c \
 		extent.c tessera_reader.c tessera.c
 CFLAGS+=	-I${TESSERA_SRCTOP}/core/include -I${TESSERA_SRCTOP}/core/src \
 		-DTESSERA_STAND
+# Diagnostics for the loader's Tessera fs_ops: prints whether the volume
+# opened (reader != NULL) and the rc of every path lookup. The prints already
+# exist in atrium-tessera/loader/tessera.c behind this guard — without a way
+# to switch it on, a loader that cannot read a volume reports only the EFI
+# loader's generic "Failed to find bootable partition", which does not say
+# whether the superblock, the tree walk or the path was at fault.
+#   make ... LOADER_TESSERA_SUPPORT=yes TESSERA_LOADER_DEBUG=yes
+.if defined(TESSERA_LOADER_DEBUG) && ${TESSERA_LOADER_DEBUG} == "yes"
+CFLAGS+=	-DTESSERA_LOADER_DEBUG
+.endif
 .endif
 
 .include <bsd.lib.mk>
