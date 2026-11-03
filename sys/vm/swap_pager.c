@@ -70,6 +70,7 @@
 #define	EXTERR_CATEGORY		EXTERR_CAT_SWAP
 #include <sys/param.h>
 #include <sys/bio.h>
+#include <sys/bitstring.h>
 #include <sys/blist.h>
 #include <sys/buf.h>
 #include <sys/conf.h>
@@ -96,6 +97,7 @@
 #include <sys/sysproto.h>
 #include <sys/systm.h>
 #include <sys/sx.h>
+#include <sys/taskqueue.h>
 #include <sys/unistd.h>
 #include <sys/user.h>
 #include <sys/vmmeter.h>
@@ -646,6 +648,11 @@ swblk_iter_remove(struct pctrie_iter *blks)
  *	No restrictions on call
  *	This routine may not block.
  */
+/* Swap-free notification, defined with swp_pager_freeswapspace(). */
+static struct task swp_fn_task;
+static bool swp_fn_task_inited;
+static void swp_freenotify_run(void *arg, int pending);
+
 static void
 swp_sizecheck(void)
 {
@@ -680,6 +687,8 @@ swap_pager_init(void)
 	for (i = 0; i < NOBJLISTS; ++i)
 		TAILQ_INIT(&swap_pager_object_list[i]);
 	mtx_init(&sw_dev_mtx, "swapdev", NULL, MTX_DEF);
+	TASK_INIT(&swp_fn_task, 0, swp_freenotify_run, NULL);
+	swp_fn_task_inited = true;
 	sx_init(&sw_alloc_sx, "swspsx");
 	sx_init(&swdev_syscall_lock, "swsysc");
 
@@ -1006,6 +1015,160 @@ swp_pager_strategy(struct buf *bp)
 }
 
 /*
+ * Swap-free notification (Atrium; atrium-zram-v2.md §4.0).
+ *
+ * Upstream never tells a swap device that a block was freed, so a device
+ * that keeps state per block -- a compressed-RAM store such as atrium_zram,
+ * or an SSD that would like a TRIM -- holds dead data until the block is
+ * rewritten.  For GEOM swap devices whose provider reports GEOM::candelete,
+ * freed blocks are marked in a per-device bitmap (sw_delmap) instead of
+ * going back to the blist, and a taskqueue sends each marked run to the
+ * device as BIO_DELETE (the freeing context may hold object locks and must
+ * not sleep).
+ *
+ * The blocks go back to the blist only when the BIO_DELETE completes.
+ * Freeing them first would let a new page-out write a block and then have
+ * the late delete destroy it.  A bitmap rather than a queue because a
+ * process exit frees thousands of scattered ranges at once: measured in-VM,
+ * a 4096-entry ring dropped 8914 of them; marking a bit cannot overflow, and
+ * neighbouring frees coalesce into one delete for free.
+ */
+#define	SWP_FREENOTIFY_MAXRUN	1024	/* pages per BIO_DELETE */
+
+static int swap_free_notify = 1;
+SYSCTL_INT(_vm, OID_AUTO, swap_free_notify, CTLFLAG_RWTUN, &swap_free_notify, 0,
+    "Send BIO_DELETE to swap devices that accept it when swap blocks are freed");
+static u_long swp_fn_sent, swp_fn_pages;
+SYSCTL_ULONG(_vm, OID_AUTO, swap_free_notify_sent, CTLFLAG_RD, &swp_fn_sent, 0,
+    "BIO_DELETEs sent for freed swap ranges");
+SYSCTL_ULONG(_vm, OID_AUTO, swap_free_notify_pages, CTLFLAG_RD, &swp_fn_pages, 0,
+    "Swap pages covered by those BIO_DELETEs");
+
+static void swapgeom_acquire(struct g_consumer *cp);
+static void swapgeom_release(struct g_consumer *cp, struct swdevt *sp);
+
+/* Return a notified range to the allocator.  sw_dev_mtx held. */
+static void
+swp_freenotify_finish(struct swdevt *sp, daddr_t blk, daddr_t npages)
+{
+
+	mtx_assert(&sw_dev_mtx, MA_OWNED);
+	if ((sp->sw_flags & SW_CLOSING) == 0) {
+		blist_free(sp->sw_blist, blk - sp->sw_first, npages);
+		swap_pager_avail += npages;
+		swp_sizecheck();
+	}
+	sp->sw_delpending -= npages;
+}
+
+/*
+ * Mark a freed range for notification.  sw_dev_mtx held, may not sleep.
+ * Returns false if the caller must free the range itself.
+ */
+static bool
+swp_freenotify_queue(struct swdevt *sp, daddr_t blk, daddr_t npages)
+{
+
+	mtx_assert(&sw_dev_mtx, MA_OWNED);
+	if ((sp->sw_flags & SW_FREENOTIFY) == 0 || sp->sw_delmap == NULL ||
+	    swap_free_notify == 0 || !swp_fn_task_inited)
+		return (false);
+	bit_nset(sp->sw_delmap, blk - sp->sw_first, blk - sp->sw_first +
+	    npages - 1);
+	sp->sw_delmarked += npages;
+	sp->sw_delpending += npages;
+	taskqueue_enqueue(taskqueue_thread, &swp_fn_task);
+	return (true);
+}
+
+static void
+swp_freenotify_done(struct bio *bp)
+{
+	struct swdevt *sp;
+	struct g_consumer *cp;
+
+	sp = bp->bio_caller1;
+	cp = bp->bio_from;
+	mtx_lock(&sw_dev_mtx);
+	/* A provider that changed its mind about deletes: stop asking. */
+	if (bp->bio_error == EOPNOTSUPP)
+		sp->sw_flags &= ~SW_FREENOTIFY;
+	swp_freenotify_finish(sp,
+	    (daddr_t)(bp->bio_offset / PAGE_SIZE) + sp->sw_first,
+	    (daddr_t)(bp->bio_length / PAGE_SIZE));
+	swapgeom_release(cp, sp);
+	mtx_unlock(&sw_dev_mtx);
+	g_destroy_bio(bp);
+}
+
+/*
+ * Take the next marked run off some device's bitmap.  sw_dev_mtx held.
+ * Returns the device, or NULL when nothing is marked.
+ */
+static struct swdevt *
+swp_freenotify_next(daddr_t *blkp, daddr_t *np)
+{
+	struct swdevt *sp;
+	int first, end;
+
+	TAILQ_FOREACH(sp, &swtailq, sw_list) {
+		if (sp->sw_delmarked == 0)
+			continue;
+		bit_ffs(sp->sw_delmap, sp->sw_nblks, &first);
+		KASSERT(first >= 0, ("swap delmap: %d marked, none set",
+		    sp->sw_delmarked));
+		bit_ffc_at(sp->sw_delmap, first, sp->sw_nblks, &end);
+		if (end < 0)
+			end = sp->sw_nblks;
+		if (end - first > SWP_FREENOTIFY_MAXRUN)
+			end = first + SWP_FREENOTIFY_MAXRUN;
+		bit_nclear(sp->sw_delmap, first, end - 1);
+		sp->sw_delmarked -= end - first;
+		*blkp = sp->sw_first + first;
+		*np = end - first;
+		return (sp);
+	}
+	return (NULL);
+}
+
+static void
+swp_freenotify_run(void *arg __unused, int pending __unused)
+{
+	struct swdevt *sp;
+	struct g_consumer *cp;
+	struct bio *bio;
+	daddr_t blk, n;
+
+	for (;;) {
+		mtx_lock(&sw_dev_mtx);
+		sp = swp_freenotify_next(&blk, &n);
+		if (sp == NULL) {
+			mtx_unlock(&sw_dev_mtx);
+			return;
+		}
+		cp = sp->sw_id;
+		if (cp == NULL || (sp->sw_flags & SW_CLOSING) != 0) {
+			swp_freenotify_finish(sp, blk, n);
+			mtx_unlock(&sw_dev_mtx);
+			continue;
+		}
+		swapgeom_acquire(cp);
+		mtx_unlock(&sw_dev_mtx);
+
+		bio = g_alloc_bio();		/* M_WAITOK */
+		bio->bio_cmd = BIO_DELETE;
+		bio->bio_offset = (blk - sp->sw_first) * PAGE_SIZE;
+		bio->bio_length = n * PAGE_SIZE;
+		bio->bio_done = swp_freenotify_done;
+		bio->bio_caller1 = sp;
+		bio->bio_flags |= BIO_SWAP;
+		atomic_add_long(&swp_fn_sent, 1);
+		atomic_add_long(&swp_fn_pages, n);
+		g_io_request(bio, cp);
+	}
+}
+
+/*
  * SWP_PAGER_FREESWAPSPACE() -	free raw swap space
  *
  *	This routine returns the specified swap blocks back to the bitmap.
@@ -1031,7 +1194,8 @@ swp_pager_freeswapspace(const struct page_range *range)
 			 * this device, we don't want to mark any
 			 * blocks free lest they be reused.
 			 */
-			if ((sp->sw_flags & SW_CLOSING) == 0) {
+			if ((sp->sw_flags & SW_CLOSING) == 0 &&
+			    !swp_freenotify_queue(sp, blk, npages)) {
 				blist_free(sp->sw_blist, blk - sp->sw_first,
 				    npages);
 				swap_pager_avail += npages;
@@ -2889,6 +3053,18 @@ swapoff_one(struct swdevt *sp, struct ucred *cred, u_int flags)
 	 */
 	swap_pager_swapoff(sp);
 
+	/*
+	 * Freed ranges still queued or in flight reference sp; let them drain
+	 * (with SW_CLOSING set they no longer touch the blist).
+	 */
+	mtx_lock(&sw_dev_mtx);
+	while (sp->sw_delpending > 0) {
+		mtx_unlock(&sw_dev_mtx);
+		pause("swpdel", hz / 100 + 1);
+		mtx_lock(&sw_dev_mtx);
+	}
+	mtx_unlock(&sw_dev_mtx);
+
 	sp->sw_close(curthread, sp);
 	mtx_lock(&sw_dev_mtx);
 	sp->sw_id = NULL;
@@ -2900,6 +3076,8 @@ swapoff_one(struct swdevt *sp, struct ucred *cred, u_int flags)
 		swdevhd = NULL;
 	mtx_unlock(&sw_dev_mtx);
 	blist_destroy(sp->sw_blist);
+	if (sp->sw_delmap != NULL)
+		free(sp->sw_delmap, M_VMPGDATA);
 	free(sp, M_VMPGDATA);
 	return (0);
 }
@@ -3329,6 +3507,54 @@ swapongeom_locked(struct cdev *dev, struct vnode *vp)
 	return (error);
 }
 
+/*
+ * Enable swap-free notification on a just-added GEOM swap device if its
+ * provider accepts BIO_DELETE.  BIO_GETATTR sleeps, so this runs without the
+ * topology lock; the device is already live, and the flag only turns on.
+ */
+static void
+swapgeom_probe_delete(struct cdev *dev)
+{
+	struct g_provider *pp;
+	struct g_consumer *cp;
+	struct swdevt *sp;
+	bitstr_t *map;
+	int candelete, error;
+
+	g_topology_lock();
+	pp = g_dev_getprovider(dev);
+	g_topology_unlock();
+	if (pp == NULL)
+		return;
+	mtx_lock(&sw_dev_mtx);
+	TAILQ_FOREACH(sp, &swtailq, sw_list) {
+		cp = sp->sw_id;
+		if (sp->sw_strategy == swapgeom_strategy && cp != NULL &&
+		    cp->provider == pp && (sp->sw_flags & SW_CLOSING) == 0)
+			break;
+	}
+	if (sp == NULL) {
+		mtx_unlock(&sw_dev_mtx);
+		return;
+	}
+	swapgeom_acquire(cp);
+	mtx_unlock(&sw_dev_mtx);
+	candelete = 0;
+	error = g_getattr("GEOM::candelete", cp, &candelete);
+	map = NULL;
+	if (error == 0 && candelete != 0)
+		map = bit_alloc(sp->sw_nblks, M_VMPGDATA, M_WAITOK);
+	mtx_lock(&sw_dev_mtx);
+	if (map != NULL) {
+		sp->sw_delmap = map;
+		sp->sw_flags |= SW_FREENOTIFY;
+	}
+	swapgeom_release(cp, sp);
+	mtx_unlock(&sw_dev_mtx);
+	if (error == 0 && candelete != 0 && bootverbose)
+		printf("swap_pager: free notification on for %s\n", pp->name);
+}
+
 static int
 swapongeom(struct vnode *vp)
 {
@@ -3341,6 +3567,8 @@ swapongeom(struct vnode *vp)
 		g_topology_lock();
 		error = swapongeom_locked(vp->v_rdev, vp);
 		g_topology_unlock();
+		if (error == 0)
+			swapgeom_probe_delete(vp->v_rdev);
 	}
 	return (error);
 }

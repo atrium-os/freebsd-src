@@ -61,10 +61,14 @@ struct swdevt {
 	TAILQ_ENTRY(swdevt)	sw_list;
 	sw_strategy_t		*sw_strategy;
 	sw_close_t		*sw_close;
+	unsigned long		*sw_delmap;	/* bitstr_t: freed blocks awaiting BIO_DELETE */
+	int			sw_delmarked;	/* bits set in sw_delmap */
+	int			sw_delpending;	/* marked + in-flight BIO_DELETE pages */
 };
 
 #define	SW_UNMAPPED	0x01
 #define	SW_CLOSING	0x04
+#define	SW_FREENOTIFY	0x08	/* send BIO_DELETE for freed blocks */
 
 #ifdef _KERNEL
 
