@@ -79,6 +79,7 @@
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>	/* VM_{MIN,MAX}_KERNEL_ADDRESS — thread_dtor guard */
+#include <vm/pmap.h>	/* amd64: VM_{MIN,MAX}_KERNEL_ADDRESS expand to kva_layout */
 
 #include "cpufreq_if.h"
 
