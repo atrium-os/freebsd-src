@@ -1080,9 +1080,13 @@ thread_va_ok(const void *pp)
 {
 	vm_offset_t v = (vm_offset_t)pp;
 
-	/* Accept either the KVA kernel map or the direct map (arm64). */
+	/*
+	 * Accept either the KVA kernel map or the direct map. VIRT_IN_DMAP,
+	 * not DMAP_{MIN,MAX}_ADDRESS: amd64 has no such constants (its DMAP
+	 * base is runtime, kva_layout.dmap_low, for LA57).
+	 */
 	return ((v >= VM_MIN_KERNEL_ADDRESS && v < VM_MAX_KERNEL_ADDRESS) ||
-	    (v >= DMAP_MIN_ADDRESS && v < DMAP_MAX_ADDRESS));
+	    VIRT_IN_DMAP(v));
 }
 
 static void
