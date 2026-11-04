@@ -92,5 +92,25 @@ u_long swap_pager_swapped_pages(vm_object_t object);
 void swapoff_all(void);
 bool swap_pager_init_object(vm_object_t object, void *handle,
     struct ucred *cred, vm_ooffset_t size, vm_ooffset_t offset);
+
+/*
+ * Swap fast path (Atrium; atrium-zram-v2.md §6.1).  A RAM-backed swap
+ * provider such as atrium_zram may register a function that serves page-in
+ * and page-out directly from the pager's page array, skipping the KVA
+ * mapping and the GEOM round trip.  The function sees the whole request:
+ * blk is the first page's index on the device, ma[] holds npages pages,
+ * reads may contain bogus_page entries, which it must skip.  It returns 0
+ * once every page is done, or an error to have the request go through GEOM
+ * as usual; a partial result is fine because GEOM then redoes all of it.
+ * It runs in the pager's context with no VM object lock held, must not
+ * sleep, and must complete synchronously.
+ */
+#define	SWAP_FASTPATH_VERSION	1
+struct g_provider;
+typedef int swap_fastpath_t(void *arg, int cmd, __daddr_t blk,
+    vm_page_t *ma, int npages);
+int swap_fastpath_register(struct g_provider *pp, swap_fastpath_t *fn,
+    void *arg);
+void swap_fastpath_unregister(struct g_provider *pp);
 #endif				/* _KERNEL */
 #endif				/* _VM_SWAP_PAGER_H_ */

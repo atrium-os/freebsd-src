@@ -991,6 +991,102 @@ swp_pager_isondev(daddr_t blk, struct swdevt *sp)
 	return (blk >= sp->sw_first && blk < sp->sw_end);
 }
 
+/*
+ * Swap fast path (see swap_pager.h).  One provider at a time; the pager
+ * holds swap_fast_busy across a call so that unregistering can wait for
+ * calls in progress.
+ */
+static sw_strategy_t swapgeom_strategy;
+static struct g_provider *swap_fast_pp;
+static swap_fastpath_t *swap_fast_fn;
+static void *swap_fast_arg;
+static int swap_fast_busy;
+static COUNTER_U64_DEFINE_EARLY(swap_fast_hits);
+static COUNTER_U64_DEFINE_EARLY(swap_fast_miss);
+SYSCTL_COUNTER_U64(_vm_stats_swap, OID_AUTO, fast_hits, CTLFLAG_RD,
+    &swap_fast_hits, "Swap requests served by the fast path");
+SYSCTL_COUNTER_U64(_vm_stats_swap, OID_AUTO, fast_miss, CTLFLAG_RD,
+    &swap_fast_miss, "Swap requests the fast path handed back to GEOM");
+
+int
+swap_fastpath_register(struct g_provider *pp, swap_fastpath_t *fn, void *arg)
+{
+
+	if (pp == NULL || fn == NULL)
+		return (EINVAL);
+	mtx_lock(&sw_dev_mtx);
+	if (swap_fast_fn != NULL) {
+		mtx_unlock(&sw_dev_mtx);
+		return (EBUSY);
+	}
+	swap_fast_pp = pp;
+	swap_fast_arg = arg;
+	swap_fast_fn = fn;
+	mtx_unlock(&sw_dev_mtx);
+	return (0);
+}
+
+void
+swap_fastpath_unregister(struct g_provider *pp)
+{
+
+	mtx_lock(&sw_dev_mtx);
+	if (swap_fast_pp == pp) {
+		swap_fast_fn = NULL;
+		while (swap_fast_busy != 0)
+			msleep(&swap_fast_busy, &sw_dev_mtx, PVM, "swfast", 0);
+		swap_fast_pp = NULL;
+		swap_fast_arg = NULL;
+	}
+	mtx_unlock(&sw_dev_mtx);
+}
+
+/*
+ * Called with sw_dev_mtx held, which it drops.  Returns true if the fast
+ * path completed bp.
+ */
+static bool
+swp_pager_fastpath(struct buf *bp, struct swdevt *sp)
+{
+	struct g_consumer *cp;
+	swap_fastpath_t *fn;
+	void *arg;
+	int error;
+
+	mtx_assert(&sw_dev_mtx, MA_OWNED);
+	fn = swap_fast_fn;
+	cp = sp->sw_id;
+	if (fn == NULL || sp->sw_strategy != swapgeom_strategy || cp == NULL ||
+	    cp->provider != swap_fast_pp ||
+	    (bp->b_iocmd != BIO_READ && bp->b_iocmd != BIO_WRITE)) {
+		mtx_unlock(&sw_dev_mtx);
+		return (false);
+	}
+	arg = swap_fast_arg;
+	swap_fast_busy++;
+	mtx_unlock(&sw_dev_mtx);
+
+	error = fn(arg, bp->b_iocmd, bp->b_blkno - sp->sw_first, bp->b_pages,
+	    bp->b_npages);
+
+	mtx_lock(&sw_dev_mtx);
+	if (--swap_fast_busy == 0 && swap_fast_fn == NULL)
+		wakeup(&swap_fast_busy);
+	mtx_unlock(&sw_dev_mtx);
+	if (error != 0) {
+		counter_u64_add(swap_fast_miss, 1);
+		return (false);
+	}
+	counter_u64_add(swap_fast_hits, 1);
+	bp->b_data = unmapped_buf;
+	bp->b_offset = 0;
+	bp->b_ioflags = 0;
+	bp->b_error = 0;
+	bp->b_resid = 0;
+	bufdone(bp);
+	return (true);
+}
+
 static void
 swp_pager_strategy(struct buf *bp)
 {
@@ -999,7 +1095,8 @@ swp_pager_strategy(struct buf *bp)
 	mtx_lock(&sw_dev_mtx);
 	TAILQ_FOREACH(sp, &swtailq, sw_list) {
 		if (swp_pager_isondev(bp->b_blkno, sp)) {
-			mtx_unlock(&sw_dev_mtx);
+			if (swp_pager_fastpath(bp, sp))
+				return;
 			if ((sp->sw_flags & SW_UNMAPPED) != 0 &&
 			    unmapped_buf_allowed) {
 				bp->b_data = unmapped_buf;
