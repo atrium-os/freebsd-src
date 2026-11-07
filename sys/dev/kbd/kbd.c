@@ -705,8 +705,15 @@ genkbd_event(keyboard_t *kbd, int event, void *arg)
 	/* read all pending input */
 	while (kbdd_check_char(kbd)) {
 		c = kbdd_read_char(kbd, FALSE);
+		/*
+		 * NOKEY ends the loop, as in kbdmux: check_char can be true
+		 * for input that read_char does not return (atkbd's
+		 * kbdc_data_ready() also counts the PS/2 mouse's bytes), and
+		 * looping on it spins the keyboard's interrupt thread with
+		 * Giant held, so psm never runs to drain them.
+		 */
 		if (c == NOKEY)
-			continue;
+			break;
 		if (c == ERRKEY)	/* XXX: ring bell? */
 			continue;
 		if (!KBD_IS_BUSY(kbd))
