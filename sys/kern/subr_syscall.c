@@ -41,6 +41,7 @@
 #include "opt_capsicum.h"
 #include "opt_ktrace.h"
 #include <sys/capsicum.h>
+#include <sys/jail.h>
 #include <sys/ktr.h>
 #include <sys/vmmeter.h>
 #ifdef KTRACE
@@ -116,6 +117,18 @@ syscallenter(struct thread *td)
 				td->td_errno = error;
 				goto retval;
 			}
+		}
+	}
+
+	/*
+	 * A jail's system call filter.  One predicted branch on a word of
+	 * the credential for processes outside filtered jails.
+	 */
+	if (SYSFIL_ACTIVE(td)) {
+		error = sysfil_check_syscall(td, sa->code);
+		if (error != 0) {
+			td->td_errno = error;
+			goto retval;
 		}
 	}
 

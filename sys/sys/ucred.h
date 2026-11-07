@@ -45,6 +45,7 @@
  */
 #define	CRED_FLAG_CAPMODE	0x00000001	/* In capability mode. */
 #define	CRED_FLAG_GROUPSET	0x00000002	/* Groups have been set. */
+#define	CRED_FLAG_SYSFIL	0x00000004	/* Jail has a syscall filter. */
 
 /*
  * Number of groups inlined in 'struct ucred'.  It must stay reasonably low as

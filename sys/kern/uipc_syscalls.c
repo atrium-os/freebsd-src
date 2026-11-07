@@ -142,6 +142,10 @@ kern_socket(struct thread *td, int domain, int type, int protocol)
 
 	AUDIT_ARG_SOCKET(domain, type, protocol);
 
+	if (SYSFIL_ACTIVE(td) &&
+	    (error = sysfil_check_family(td, domain)) != 0)
+		return (error);
+
 	oflag = 0;
 	fflag = 0;
 	if ((type & SOCK_CLOEXEC) != 0) {
@@ -559,6 +563,10 @@ kern_socketpair(struct thread *td, int domain, int type, int protocol,
 	int fd, error, oflag, fflag;
 
 	AUDIT_ARG_SOCKET(domain, type, protocol);
+
+	if (SYSFIL_ACTIVE(td) &&
+	    (error = sysfil_check_family(td, domain)) != 0)
+		return (error);
 
 	oflag = 0;
 	fflag = 0;
@@ -1257,6 +1265,9 @@ kern_setsockopt(struct thread *td, int s, int level, int name, const void *val,
 		return (EFAULT);
 	if ((int)valsize < 0)
 		return (EINVAL);
+	if (SYSFIL_ACTIVE(td) &&
+	    (error = sysfil_check_sockopt(td, level, name)) != 0)
+		return (error);
 
 	sopt.sopt_dir = SOPT_SET;
 	sopt.sopt_level = level;
@@ -1332,6 +1343,9 @@ kern_getsockopt(struct thread *td, int s, int level, int name, void *val,
 		*valsize = 0;
 	if ((int)*valsize < 0)
 		return (EINVAL);
+	if (SYSFIL_ACTIVE(td) &&
+	    (error = sysfil_check_sockopt(td, level, name)) != 0)
+		return (error);
 
 	sopt.sopt_dir = SOPT_GET;
 	sopt.sopt_level = level;

@@ -3934,6 +3934,7 @@ kern/kern_intr.c		standard
 kern/kern_jail.c		standard
 kern/kern_jaildesc.c		standard
 kern/kern_jailmeta.c		standard
+kern/kern_jail_sysfil.c		standard
 kern/kern_kcov.c		optional kcov			\
 	compile-with "${NOSAN_C} ${MSAN_CFLAGS}"
 kern/kern_kexec.c		standard
