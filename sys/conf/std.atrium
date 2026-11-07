@@ -1,0 +1,75 @@
+#
+# std.atrium -- attack-surface reduction shared by every Atrium kernel
+# config (arm64/conf/ATRIUM*, amd64/conf/ATRIUM*).  Include it after GENERIC.
+#
+# Rationale: atrium docs/reviews/2026-11-07-freebsd-kernel-security-rust.md,
+# step 0.  Each block names the subsystem, why Atrium does not need it, and
+# the advisory class it removes.  Anything removed here is removed both from
+# the kernel and (via WITHOUT_MODULES) from /boot/kernel, so it cannot be
+# kldload'ed from the shipped module directory either.
+#
+# Atrium-specific runtime knobs (sysctls, loader tunables) live in the atrium
+# repo: etc/sysctl.atrium.conf and etc/loader.atrium.conf.
+#
+
+# Zero every automatic variable the compiler cannot prove is written before
+# it is read.  Targets the uninitialised-memory disclosure class (9 kernel
+# advisories 2020-2026, e.g. SA-26:51.ktimer, SA-25:04.ktrace,
+# SA-20:03.thrmisc).  Stack variables only; malloc(9)/uma memory needs M_ZERO.
+# On amd64 and arm64 this relies on the KERN_INIT_ALL memset/memcpy/memmove
+# in {amd64,arm64}/{amd64,arm64}/machdep.c: the ifunc versions are not
+# resolved yet when early boot code runs (amd64 PR 251083; arm64 has the same
+# bug since memset became an ifunc for FEAT_MOPS, and hangs in
+# link_elf_ireloc() before the console is up).
+makeoptions	INIT_ALL=zero
+
+# 32-bit binaries (arm32 on arm64, i386 on amd64).  Atrium ships 64-bit only.
+# compat32 is a second copy of every syscall's argument marshalling.
+nooptions	COMPAT_FREEBSD32
+
+# System V IPC.  Nothing in Atrium uses it; jails already deny it.
+nooptions	SYSVSHM
+nooptions	SYSVMSG
+nooptions	SYSVSEM
+
+# SCTP, kernel TLS, TCP offload engines, IPsec: not used (rustls, no TOE).
+nooptions	SCTP_SUPPORT
+nooptions	KERN_TLS
+nooptions	TCP_OFFLOAD
+nooptions	IPSEC_SUPPORT
+nooptions	IPSEC_OFFLOAD
+
+# NFS client and server (and NFS root).
+nooptions	NFSCL
+nooptions	NFSD
+nooptions	NFSLOCKD
+nooptions	NFS_ROOT
+
+# GEOM RAID tastes metadata on every disk that attaches, including USB
+# sticks: an in-kernel parser of hostile input Atrium never needs.
+nooptions	GEOM_RAID
+
+# Input: Tactus parses HID in user space; evdev is the Linux-shaped shim
+# atrium-input.md rejects.
+nooptions	EVDEV_SUPPORT
+nodevice	evdev
+nodevice	uinput
+
+# netmap: raw ring access, not used.
+nodevice	netmap
+
+# Modules that must not be in the shipped module directory.
+#  linux*        linuxulator (linux-compat scoping: micro-VMs instead)
+#  linuxkpi*     policy: no LinuxKPI
+#  sctp tcp      SCTP, RACK/BBR/HPTS, tcpmd5
+#  ipfw* ipdivert libalias netgraph   pf is the only packet filter;
+#                netgraph includes the in-kernel Bluetooth stack (Vinculum
+#                is user space)
+#  nfs* krpc kgssapi*   NFS and RPCSEC_GSS
+#  fusefs smbfs  user-space and network file systems
+#  netmap ctl cryptodev  raw NIC rings, CAM target, /dev/crypto
+#  vmm           bhyve, until the micro-VM lane needs it
+#  sysvipc ipsec mlx4* mlx5* ibcore ipoib iser hyperv
+#  zfs is NOT listed: the development VM root is ZFS.  Remove it once the
+#  Tessera root is the default.
+makeoptions	WITHOUT_MODULES="linux linux64 linux_common linprocfs linsysfs linuxkpi linuxkpi_hdmi linuxkpi_video linuxkpi_wlan sctp tcp ipfw ipfw_nat ipfw_nat64 ipfw_nptv6 ipfw_pmod ipdivert libalias netgraph nfscl nfsd nfslockd nfscommon nfssvc krpc kgssapi kgssapi_krb5 fusefs smbfs netmap ctl cryptodev vmm sysvipc ipsec mlx4 mlx4en mlx4ib mlx5 mlx5en mlx5ib ibcore ipoib iser hyperv"

@@ -1,0 +1,8 @@
+#
+# ATRIUM-NODEBUG -- shipping Atrium kernel for amd64: ATRIUM without
+# INVARIANTS/WITNESS and the other std.debug options.  Use this one for
+# latency and throughput measurements.
+#
+include ATRIUM
+include "../../conf/std.nodebug"
+ident   ATRIUM-NODEBUG

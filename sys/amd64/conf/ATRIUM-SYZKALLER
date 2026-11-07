@@ -1,0 +1,8 @@
+#
+# ATRIUM-SYZKALLER -- ATRIUM-KASAN plus kcov(4) coverage, the kernel
+# syzkaller fuzzes (review step 1).  Not for anything but fuzzing VMs.
+#
+include ATRIUM-KASAN
+ident   ATRIUM-SYZKALLER
+options COVERAGE
+options KCOV
