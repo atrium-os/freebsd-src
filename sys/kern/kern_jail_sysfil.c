@@ -122,10 +122,15 @@ struct sysfil_sockopt {
 };
 
 struct sysfil {
-	/* Immutable once the jail is visible. */
+	/*
+	 * Immutable once the jail is visible.  sf_sys comes first:
+	 * syscallenter() tests it inline through SYSFIL_SYSBITS().  It is
+	 * all ones when system calls are unrestricted, so that test needs
+	 * no look at sf_flags.
+	 */
+	uint64_t	 sf_sys[SYSFIL_SYS_WORDS];
 	int		 sf_mode;		/* JAIL_SYSFIL_* */
 	u_int		 sf_flags;		/* SF_* */
-	uint64_t	 sf_sys[SYSFIL_SYS_WORDS];
 	uint64_t	 sf_families;
 	u_int		 sf_nioctls;
 	u_int		 sf_nsockopts;
@@ -239,21 +244,56 @@ sf_sockopt_cmp(const void *a, const void *b)
 	return (x->name < y->name ? -1 : x->name > y->name);
 }
 
+/*
+ * Open-coded binary searches: these run on every allowed ioctl(2) and
+ * socket-option call in a filtered jail, and bsearch(3)'s comparator
+ * calls cost more than the search itself on lists this short.
+ */
 static bool
 sf_has_ioctl(const struct sysfil *sf, u_long com)
 {
+	const u_long *v = sf->sf_ioctls;
+	u_int lo = 0, hi = sf->sf_nioctls, mid;
 
-	return (bsearch(&com, sf->sf_ioctls, sf->sf_nioctls,
-	    sizeof(sf->sf_ioctls[0]), sf_ioctl_cmp) != NULL);
+	while (lo < hi) {
+		mid = (lo + hi) / 2;
+		if (v[mid] == com)
+			return (true);
+		if (v[mid] < com)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return (false);
+}
+
+/* Entries are non-negative, so (level, name) orders like this key. */
+static __inline uint64_t
+sf_sockopt_key(int level, int name)
+{
+
+	return ((uint64_t)(u_int)level << 32 | (u_int)name);
 }
 
 static bool
 sf_has_sockopt(const struct sysfil *sf, int level, int name)
 {
-	struct sysfil_sockopt key = { level, name };
+	const struct sysfil_sockopt *v = sf->sf_sockopts;
+	uint64_t key, k;
+	u_int lo = 0, hi = sf->sf_nsockopts, mid;
 
-	return (bsearch(&key, sf->sf_sockopts, sf->sf_nsockopts,
-	    sizeof(sf->sf_sockopts[0]), sf_sockopt_cmp) != NULL);
+	key = sf_sockopt_key(level, name);
+	while (lo < hi) {
+		mid = (lo + hi) / 2;
+		k = sf_sockopt_key(v[mid].level, v[mid].name);
+		if (k == key)
+			return (true);
+		if (k < key)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return (false);
 }
 
 static const char *
@@ -269,6 +309,10 @@ sf_afname(int af)
 
 /* ------------------------------------------------------------------ */
 /* Enforcement.                                                        */
+
+_Static_assert(offsetof(struct sysfil, sf_sys) == 0,
+    "SYSFIL_SYSBITS() reads sf_sys at the start of struct sysfil");
+_Static_assert(SYSFIL_NSYS <= SYSFIL_SYS_WORDS * 64, "sf_sys too small");
 
 static struct sysfil *
 sf_of(struct thread *td)
@@ -430,6 +474,7 @@ sf_alloc(void)
 	struct sysfil *sf;
 
 	sf = malloc(sizeof(*sf), M_SYSFIL, M_WAITOK | M_ZERO);
+	memset(sf->sf_sys, 0xff, sizeof(sf->sf_sys));	/* unrestricted */
 	mtx_init(&sf->sf_mtx, "sysfil", NULL, MTX_DEF);
 	return (sf);
 }
@@ -691,6 +736,7 @@ sf_from_opts(struct vfsoptlist *opts, struct sysfil **sfp)
 	s = NULL;
 	if ((error = sf_getstr(opts, "sysfil.syscalls", SYSFIL_SYSCALLS_LEN, &s)) == 0) {
 		sf->sf_flags |= SF_SYSCALLS;
+		memset(sf->sf_sys, 0, sizeof(sf->sf_sys));
 		error = sf_parse_syscalls(opts, s, sf->sf_sys);
 		free(s, M_SYSFIL);
 	}
