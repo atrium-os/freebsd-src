@@ -609,6 +609,109 @@ ATF_TC_BODY(bad_params, tc)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * What "jls -n" does: every jail parameter in one jail_get(2).  The kernel
+ * caps a whole request at 64 KB, so the sysfil parameters' sizes must leave
+ * room for the rest even when every list is as long as it can be.
+ */
+static void
+get_all(const char *name)
+{
+	struct jailparam *jp;
+	int i, n;
+
+	n = jailparam_all(&jp);
+	ATF_REQUIRE_MSG(n > 0, "jailparam_all: %s", jail_errmsg);
+	for (i = 0; i < n; i++)
+		if (strcmp(jp[i].jp_name, "name") == 0)
+			break;
+	ATF_REQUIRE(i < n);
+	ATF_REQUIRE(jailparam_import(&jp[i], name) == 0);
+	ATF_CHECK_MSG(jailparam_get(jp, n, 0) > 0, "jailparam_get %s: %s",
+	    name, jail_errmsg);
+	jailparam_free(jp, n);
+	free(jp);
+}
+
+static char *
+longest_lists(char **ioctls, char **sockopts)
+{
+	char *sys, *io, *so;
+	size_t len;
+	int i;
+
+	len = 8 * SYS_MAXSYSCALL;
+	sys = malloc(len);
+	sys[0] = '\0';
+	for (i = 0; i < SYS_MAXSYSCALL; i++)
+		snprintf(sys + strlen(sys), len - strlen(sys), "%s%d",
+		    i ? "," : "", i);
+	io = malloc(256 * 12);
+	io[0] = '\0';
+	for (i = 0; i < 256; i++)
+		snprintf(io + strlen(io), 256 * 12 - strlen(io), "%s%#x",
+		    i ? "," : "", 0xfffff000u + i);
+	so = malloc(256 * 24);
+	so[0] = '\0';
+	for (i = 0; i < 256; i++)
+		snprintf(so + strlen(so), 256 * 24 - strlen(so), "%s%#x:%d",
+		    i ? "," : "", 0x7fffff00 + i, 0x7fffff00 + i);
+	*ioctls = io;
+	*sockopts = so;
+	return (sys);
+}
+
+ATF_TC_WITH_CLEANUP(all_params);
+ATF_TC_HEAD(all_params, tc)
+{
+	atf_tc_set_md_var(tc, "descr",
+	    "jls -n works on jails with no filter and with the longest lists; "
+	    "lists over the limits are refused");
+	atf_tc_set_md_var(tc, "require.user", "root");
+}
+ATF_TC_BODY(all_params, tc)
+{
+	char *sys, *io, *so, *big;
+	int jid;
+
+	jid = jail_setv(JAIL_CREATE, "name", "sysfil_all_open", "path", "/",
+	    "persist", NULL, NULL);
+	ATF_REQUIRE_MSG(jid > 0, "jail_setv: %s", jail_errmsg);
+	get_all("sysfil_all_open");
+
+	sys = longest_lists(&io, &so);
+	jid = jail_setv(JAIL_CREATE, "name", "sysfil_all_full", "path", "/",
+	    "persist", NULL, "sysfil.mode", "1", "sysfil.syscalls", sys,
+	    "sysfil.ioctls", io, "sysfil.sockopts", so, "sysfil.families",
+	    "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,"
+	    "25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47",
+	    NULL);
+	ATF_REQUIRE_MSG(jid > 0, "jail_setv: %s", jail_errmsg);
+	get_all("sysfil_all_full");
+
+	/* One more than the limit, and a command wider than 32 bits. */
+	big = malloc(strlen(io) + 32);
+	sprintf(big, "%s,0x1", io);
+	ATF_CHECK_ERRNO(E2BIG, jail_setv(JAIL_CREATE, "name", "sysfil_all_bad",
+	    "path", "/", "persist", NULL, "sysfil.mode", "2",
+	    "sysfil.ioctls", big, NULL) == -1);
+	ATF_CHECK_ERRNO(EINVAL, jail_setv(JAIL_CREATE, "name", "sysfil_all_bad",
+	    "path", "/", "persist", NULL, "sysfil.mode", "2",
+	    "sysfil.ioctls", "0x100000000", NULL) == -1);
+	free(big);
+	free(sys);
+	free(io);
+	free(so);
+}
+ATF_TC_CLEANUP(all_params, tc)
+{
+	remove_jail("sysfil_all_open");
+	remove_jail("sysfil_all_full");
+	remove_jail("sysfil_all_bad");
+}
+
+/* ------------------------------------------------------------------ */
+
 static int
 child_open(void)
 {
@@ -656,6 +759,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, inherit_narrow);
 	ATF_TP_ADD_TC(tp, immutable);
 	ATF_TP_ADD_TC(tp, bad_params);
+	ATF_TP_ADD_TC(tp, all_params);
 	ATF_TP_ADD_TC(tp, unfiltered);
 	return (atf_no_error());
 }
