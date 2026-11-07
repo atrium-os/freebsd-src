@@ -122,13 +122,24 @@ syscallenter(struct thread *td)
 
 	/*
 	 * A jail's system call filter.  One predicted branch on a word of
-	 * the credential for processes outside filtered jails.
+	 * the credential for processes outside filtered jails.  Inside one,
+	 * an allowed native call is a bit test here; everything else
+	 * (a denial, log mode, a foreign ABI) goes to sysfil_check_syscall().
 	 */
 	if (SYSFIL_ACTIVE(td)) {
-		error = sysfil_check_syscall(td, sa->code);
-		if (error != 0) {
-			td->td_errno = error;
-			goto retval;
+		const uint64_t *bits;
+		u_int code;
+
+		bits = SYSFIL_SYSBITS(td->td_ucred->cr_prison);
+		code = sa->code;
+		if (__predict_false(bits == NULL || code >= SYS_MAXSYSCALL ||
+		    p->p_sysent->sv_table != sysent ||
+		    (bits[code / 64] & ((uint64_t)1 << (code % 64))) == 0)) {
+			error = sysfil_check_syscall(td, code);
+			if (error != 0) {
+				td->td_errno = error;
+				goto retval;
+			}
 		}
 	}
 

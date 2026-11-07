@@ -625,6 +625,11 @@ int sysctl_jail_param(SYSCTL_HANDLER_ARGS);
 /* Per-jail system call filter (kern_jail_sysfil.c). */
 #define	SYSFIL_ACTIVE(td)						\
 	(__predict_false(((td)->td_ucred->cr_flags & CRED_FLAG_SYSFIL) != 0))
+/*
+ * The system call bitmap at the start of a jail's filter, for the inline
+ * test in syscallenter(): bit n set means native call n is allowed.
+ */
+#define	SYSFIL_SYSBITS(pr)	((const uint64_t *)(pr)->pr_sysfil)
 int sysfil_check_syscall(struct thread *td, u_int code);
 int sysfil_check_ioctl(struct thread *td, u_long com);
 int sysfil_check_sockopt(struct thread *td, int level, int name);
