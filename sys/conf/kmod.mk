@@ -226,6 +226,13 @@ SRCS+=${SRCS.${_o}}
 
 OBJS+=	${SRCS:N*.h:R:S/$/.o/g}
 
+# Rust sources (RUST_SRCS) build through the out-of-tree Rust KPI makefiles
+# (freebsd-kpi-rs, checked out at sys/rust); see atrium kmod-rust-spike/.
+.if defined(RUST_SRCS) && !empty(RUST_SRCS)
+.include "${SYSDIR}/rust/kmod.rust.mk"
+OBJS+=	${RUST_OBJS}
+.endif
+
 .if !defined(PROG)
 PROG=	${KMOD}.ko
 .endif
