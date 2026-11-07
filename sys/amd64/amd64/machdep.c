@@ -1957,7 +1957,44 @@ void    *memcpy_std(void * _Nonnull dst, const void * _Nonnull src,
 void    *memcpy_erms(void * _Nonnull dst, const void * _Nonnull src,
 	    size_t len);
 
-#ifdef KCSAN
+#if defined(KERN_INIT_ALL)
+/*
+ * -ftrivial-auto-var-init (makeoptions INIT_ALL) makes the compiler call
+ * memset (and, for some initialisers, memcpy) in the prologue of any
+ * function with a large automatic variable.  hammer_time() runs a good deal
+ * of such code before link_elf_ireloc() has resolved the ifuncs, and with
+ * -z ifunc-noplt the unresolved call goes nowhere (PR 251083).  Dispatch at
+ * run time instead: cpu_stdext_feature is zero until identify_cpu*() fills
+ * it in, so early calls take the _std versions, which work on every CPU.
+ * The cost is one load and a well-predicted branch per call.
+ */
+void *
+memset(void *buf, int c, size_t len)
+{
+
+	if ((cpu_stdext_feature & CPUID_STDEXT_ERMS) != 0)
+		return (memset_erms(buf, c, len));
+	return (memset_std(buf, c, len));
+}
+
+void *
+memmove(void * _Nonnull dst, const void * _Nonnull src, size_t len)
+{
+
+	if ((cpu_stdext_feature & CPUID_STDEXT_ERMS) != 0)
+		return (memmove_erms(dst, src, len));
+	return (memmove_std(dst, src, len));
+}
+
+void *
+memcpy(void * _Nonnull dst, const void * _Nonnull src, size_t len)
+{
+
+	if ((cpu_stdext_feature & CPUID_STDEXT_ERMS) != 0)
+		return (memcpy_erms(dst, src, len));
+	return (memcpy_std(dst, src, len));
+}
+#elif defined(KCSAN)
 /*
  * These fail to build as ifuncs when used with KCSAN.
  */
