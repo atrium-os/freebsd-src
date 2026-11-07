@@ -110,6 +110,12 @@ enum prison_state {
 #define	JAIL_SYS_NEW		1
 #define	JAIL_SYS_INHERIT	2
 
+/* Values of the sysfil.mode jail parameter. */
+#define	JAIL_SYSFIL_OFF		0	/* No filter */
+#define	JAIL_SYSFIL_LOG		1	/* Allow, but record and log */
+#define	JAIL_SYSFIL_DENY	2	/* Fail with an error */
+#define	JAIL_SYSFIL_KILL	3	/* Fail and send SIGSYS */
+
 /*
  * Names of the static jail parameters registered by the base kernel.
  * Runtime-registered parameters (allow.mount.*, modules) are only
@@ -247,6 +253,7 @@ struct jaildesc;
 struct knlist;
 struct racct;
 struct prison_racct;
+struct sysfil;
 
 typedef enum {
 	PR_INET		= 0,
@@ -293,7 +300,7 @@ struct prison {
 	struct knlist	*pr_klist;			/* (m) attached knotes */
 	struct label	*pr_label;			/* (m) MAC label */
 	LIST_HEAD(, jaildesc) pr_descs;			/* (a) attached descriptors */
-	void		*pr_sparep;
+	struct sysfil	*pr_sysfil;			/* (c) syscall filter */
 	int		 pr_childcount;			/* (a) number of child jails */
 	int		 pr_childmax;			/* (p) maximum child jails */
 	unsigned	 pr_allow;			/* (p) PR_ALLOW_* flags */
@@ -614,6 +621,14 @@ int prison_if(struct ucred *cred, const struct sockaddr *sa);
 char *prison_name(struct prison *, struct prison *);
 int prison_priv_check(struct ucred *cred, int priv);
 int sysctl_jail_param(SYSCTL_HANDLER_ARGS);
+
+/* Per-jail system call filter (kern_jail_sysfil.c). */
+#define	SYSFIL_ACTIVE(td)						\
+	(__predict_false(((td)->td_ucred->cr_flags & CRED_FLAG_SYSFIL) != 0))
+int sysfil_check_syscall(struct thread *td, u_int code);
+int sysfil_check_ioctl(struct thread *td, u_long com);
+int sysfil_check_sockopt(struct thread *td, int level, int name);
+int sysfil_check_family(struct thread *td, int domain);
 unsigned prison_add_allow(const char *prefix, const char *name,
     const char *prefix_descr, const char *descr);
 void prison_add_vfs(struct vfsconf *vfsp);

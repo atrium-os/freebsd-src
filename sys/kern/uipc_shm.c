@@ -1188,6 +1188,16 @@ kern_shm_open2(struct thread *td, const char *userpath, int flags, mode_t mode,
 		return (EINVAL);
 
 	largepage = (shmflags & SHM_LARGEPAGE) != 0;
+	/*
+	 * A jail's filter governs largepage objects through their
+	 * configuration ioctl: without it such an object is unusable, and
+	 * the object type has a history of its own bugs.
+	 */
+	if (largepage && SYSFIL_ACTIVE(td)) {
+		error = sysfil_check_ioctl(td, FIOSSHMLPGCNF);
+		if (error != 0)
+			return (error);
+	}
 	if (largepage && !PMAP_HAS_LARGEPAGES)
 		return (ENOTTY);
 

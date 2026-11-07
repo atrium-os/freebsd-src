@@ -3225,6 +3225,13 @@ do_jail_attach(struct thread *td, struct prison *pr, int *drflagsp)
 	PROC_LOCK(p);
 	oldcred = crcopysafe(p, newcred);
 	newcred->cr_prison = pr;
+	/*
+	 * A filtered jail's descendants are all filtered (the filter is
+	 * fixed at creation and inherited), so the flag is only ever set
+	 * here, never cleared.
+	 */
+	if (pr->pr_sysfil != NULL)
+		newcred->cr_flags |= CRED_FLAG_SYSFIL;
 #ifdef RACCT
 	racct_proc_ucred_changed(p, oldcred, newcred);
 #endif

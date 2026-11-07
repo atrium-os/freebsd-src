@@ -48,6 +48,7 @@
 #include <sys/fcntl.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/jail.h>
 #include <sys/lock.h>
 #include <sys/proc.h>
 #include <sys/signalvar.h>
@@ -756,6 +757,9 @@ kern_ioctl(struct thread *td, int fd, u_long com, caddr_t data)
 
 	AUDIT_ARG_FD(fd);
 	AUDIT_ARG_CMD(com);
+
+	if (SYSFIL_ACTIVE(td) && (error = sysfil_check_ioctl(td, com)) != 0)
+		return (error);
 
 	fdp = td->td_proc->p_fd;
 
