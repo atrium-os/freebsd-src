@@ -1022,6 +1022,14 @@ ASAN_BUS_WRITE_PTR_FUNC(region, 4, uint32_t)
 ASAN_BUS_WRITE_PTR_FUNC(region_stream, 4, uint32_t)
 
 ASAN_BUS_WRITE_FUNC(, 8, uint64_t)
+#if defined(__aarch64__)
+/* The 64-bit write interceptors bus_san.h declares, mirroring the reads. */
+ASAN_BUS_WRITE_FUNC(_stream, 8, uint64_t)
+ASAN_BUS_WRITE_PTR_FUNC(multi, 8, uint64_t)
+ASAN_BUS_WRITE_PTR_FUNC(multi_stream, 8, uint64_t)
+ASAN_BUS_WRITE_PTR_FUNC(region, 8, uint64_t)
+ASAN_BUS_WRITE_PTR_FUNC(region_stream, 8, uint64_t)
+#endif
 
 #define	ASAN_BUS_SET_FUNC(func, width, type)				\
 	void kasan_bus_space_set_##func##_##width(bus_space_tag_t tag,	\
