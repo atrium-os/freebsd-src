@@ -1,0 +1,138 @@
+#
+# ATRIUM -- Atrium platform kernel for amd64 (development build).
+#
+# GENERIC plus the attack-surface reduction in sys/conf/std.atrium (see the
+# rationale there).  GENERIC already builds Laminar (kern.sched.name).  Debugging
+# (INVARIANTS, WITNESS) stays on, as in GENERIC on -CURRENT; ATRIUM-NODEBUG is
+# the shipping variant and ATRIUM-KASAN the sanitizer variant for kmod tests.
+#
+# amd64 targets: QEMU/KVM guests (virtio) and AMD/Intel desktops and
+# workstations (the R9700 box).  Drivers dropped below are legacy buses,
+# server RAID HBAs, NICs of the 1990s-2000s, hypervisor guests other than
+# KVM, and every Wi-Fi driver (802.11 frame parsing is radio-reachable;
+# review step 6 moves Wi-Fi to its own scoping).
+#
+include GENERIC
+ident   ATRIUM
+
+include "std.atrium"
+
+# 64-bit compat syscalls for FreeBSD 4-10 binaries (arm64 never had them).
+nooptions	COMPAT_FREEBSD4
+nooptions	COMPAT_FREEBSD5
+nooptions	COMPAT_FREEBSD6
+nooptions	COMPAT_FREEBSD7
+nooptions	COMPAT_FREEBSD9
+nooptions	COMPAT_FREEBSD10
+
+# Hypervisor guests other than KVM; mlx5 (needs LinuxKPI, excluded by policy).
+nooptions	XENHVM
+nodevice	xenefi
+nodevice	xenpci
+nodevice	xentimer
+nodevice	hyperv
+nodevice	vmx
+nodevice	pvscsi
+nodevice	mlx5
+nodevice	mlx5en
+nodevice	mlxfw
+nooptions	COMPAT_LINUXKPI
+
+# Legacy buses and devices.
+nodevice	fdc
+nodevice	ppc
+nodevice	ppbus
+nodevice	lpt
+nodevice	ppi
+nodevice	agp
+nodevice	cbb
+nodevice	cardbus
+nodevice	sc
+nooptions	SC_PIXEL_MODE
+
+# SCSI/RAID HBAs and tape/changer (keep ahci, nvme, mps/mpr/mpi3mr, virtio).
+nodevice	ata
+nodevice	mvs
+nodevice	siis
+nodevice	ahc
+nodevice	ahd
+nodevice	hptiop
+nodevice	isp
+nodevice	mpt
+nodevice	sym
+nodevice	isci
+nodevice	ocs_fc
+nodevice	ch
+nodevice	sa
+nodevice	arcmsr
+nodevice	ciss
+nodevice	ips
+nodevice	smartpqi
+nodevice	tws
+nodevice	aac
+nodevice	aacp
+nodevice	aacraid
+nodevice	ida
+nodevice	mfi
+nodevice	mlx
+nodevice	mrsas
+
+# Old or server-only NICs (keep em igc ix ixl ice iavf aq rge re bge vtnet).
+nodevice	ixv
+nodevice	axp
+nodevice	bxe
+nodevice	ti
+nodevice	ae
+nodevice	age
+nodevice	alc
+nodevice	ale
+nodevice	bce
+nodevice	bfe
+nodevice	cas
+nodevice	dc
+nodevice	et
+nodevice	fxp
+nodevice	gem
+nodevice	jme
+nodevice	lge
+nodevice	msk
+nodevice	nfe
+nodevice	nge
+nodevice	rl
+nodevice	sge
+nodevice	sis
+nodevice	sk
+nodevice	ste
+nodevice	stge
+nodevice	vge
+nodevice	vr
+nodevice	xl
+
+# Wi-Fi: the whole net80211 stack and every driver.
+nodevice	wlan
+nooptions	IEEE80211_DEBUG
+nooptions	IEEE80211_SUPPORT_MESH
+nodevice	wlan_wep
+nodevice	wlan_tkip
+nodevice	wlan_ccmp
+nodevice	wlan_gcmp
+nodevice	wlan_amrr
+nodevice	ath
+nodevice	ath_hal
+nooptions	AH_AR5416_INTERRUPT_MITIGATION
+nodevice	ath_rate_sample
+nodevice	ipw
+nodevice	iwi
+nodevice	iwn
+nodevice	malo
+nodevice	mwl
+nodevice	ral
+nodevice	wpi
+
+# Old PCI sound cards (keep snd_hda).
+nodevice	snd_cmi
+nodevice	snd_csa
+nodevice	snd_emu10kx
+nodevice	snd_es137x
+nodevice	snd_ich
+nodevice	snd_via8233

@@ -1,0 +1,9 @@
+#
+# ATRIUM-KASAN -- ATRIUM with the kernel address sanitizer, for Atrium
+# kernel-module test runs and syzkaller (review step 1).  See kasan(9).
+# Modules built against this kernel get the KASAN instrumentation too
+# (KASAN_ENABLED is passed to bsd.kmod.mk).
+#
+include ATRIUM
+ident   ATRIUM-KASAN
+options KASAN
