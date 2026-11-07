@@ -566,6 +566,35 @@ keyvalue_contention_cleanup()
 	return 0
 }
 
+atf_test_case "empty_key" "cleanup"
+empty_key_head()
+{
+	atf_set descr 'An empty key ("meta.") is refused instead of hanging jail_get(2)'
+	atf_set require.user root
+	atf_set execenv jail
+	atf_set timeout 30
+}
+empty_key_body()
+{
+	setup
+
+	atf_check -s exit:0 jail -c name=j persist meta="a=1" env="b=2"
+
+	atf_check -s not-exit:0 -e ignore	jls -jj meta.
+	atf_check -s not-exit:0 -e ignore	jls -jj env.
+	atf_check -s not-exit:0 -e ignore	jail -m name=j meta.=x
+	atf_check -s not-exit:0 -e ignore	jail -m name=j env.=x
+
+	# Still readable afterwards: nothing is left holding the jail lock.
+	atf_check -s exit:0 -o inline:'1\n'	jls -jj meta.a
+	atf_check -s exit:0 -o inline:'2\n'	jls -jj env.b
+}
+empty_key_cleanup()
+{
+	jail -r j
+	return 0
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case "jail_create"
@@ -585,4 +614,5 @@ atf_init_test_cases()
 
 	atf_add_test_case "keyvalue"
 	atf_add_test_case "keyvalue_contention"
+	atf_add_test_case "empty_key"
 }
