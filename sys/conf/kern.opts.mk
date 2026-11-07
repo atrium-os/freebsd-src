@@ -98,10 +98,9 @@ __SINGLE_OPTIONS = \
 
 __INIT_ALL_OPTIONS=	none pattern zero
 __INIT_ALL_DEFAULT=	none
-.if ${MACHINE} == "amd64"
-# PR251083 conflict between INIT_ALL_ZERO and ifunc memset
-BROKEN_SINGLE_OPTIONS+=	INIT_ALL zero none
-.endif
+# PR251083 (INIT_ALL zero vs. the amd64 ifunc memset) is handled in
+# amd64/amd64/machdep.c: with KERN_INIT_ALL defined (kern.mk), memset,
+# memcpy and memmove dispatch at run time instead of through ifuncs.
 
 # expanded inline from bsd.mkopt.mk to avoid share/mk dependency
 

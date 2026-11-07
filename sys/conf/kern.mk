@@ -335,6 +335,7 @@ CFLAGS+=	${SAN_CFLAGS}
 .if ${OPT_INIT_ALL} != "none"
 .if ${COMPILER_FEATURES:Minit-all}
 CFLAGS+= -ftrivial-auto-var-init=${OPT_INIT_ALL}
+CFLAGS+= -DKERN_INIT_ALL
 .if ${OPT_INIT_ALL} == "zero" && ${COMPILER_TYPE} == "clang" && ${COMPILER_VERSION} < 160000
 CFLAGS+= -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang
 .endif

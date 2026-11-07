@@ -1089,6 +1089,40 @@ void    *memcpy_std(void * _Nonnull dst, const void * _Nonnull src,
 void    *memcpy_mops(void * _Nonnull dst, const void * _Nonnull src,
 	    size_t len);
 
+#ifdef KERN_INIT_ALL
+/*
+ * -ftrivial-auto-var-init (makeoptions INIT_ALL) makes the compiler call
+ * memset in the prologue of functions with large automatic variables, and
+ * link_elf_ireloc() itself is one (its struct elf_file): the ifunc call goes
+ * through a PLT slot that link_elf_ireloc() has not filled in yet, and the
+ * kernel faults before the console is up (same cause as amd64 PR 251083).
+ * Dispatch at run time instead.  elf_hwcap2 is zero until CPU identification,
+ * so early calls take the _std versions, which work on every CPU.
+ */
+void *
+memset(void *buf, int c, size_t len)
+{
+	if ((elf_hwcap2 & HWCAP2_MOPS) != 0)
+		return (memset_mops(buf, c, len));
+	return (memset_std(buf, c, len));
+}
+
+void *
+memmove(void * _Nonnull dst, const void * _Nonnull src, size_t len)
+{
+	if ((elf_hwcap2 & HWCAP2_MOPS) != 0)
+		return (memmove_mops(dst, src, len));
+	return (memmove_std(dst, src, len));
+}
+
+void *
+memcpy(void * _Nonnull dst, const void * _Nonnull src, size_t len)
+{
+	if ((elf_hwcap2 & HWCAP2_MOPS) != 0)
+		return (memcpy_mops(dst, src, len));
+	return (memcpy_std(dst, src, len));
+}
+#else
 DEFINE_IFUNC(, void *, memset, (void *, int, size_t))
 {
 	return ((elf_hwcap2 & HWCAP2_MOPS) != 0 ? memset_mops : memset_std);
@@ -1105,3 +1139,4 @@ DEFINE_IFUNC(, void *, memcpy, (void * _Nonnull, const void * _Nonnull,
 {
 	return ((elf_hwcap2 & HWCAP2_MOPS) != 0 ? memcpy_mops : memcpy_std);
 }
+#endif
