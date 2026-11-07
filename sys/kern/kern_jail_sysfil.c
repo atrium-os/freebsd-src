@@ -84,10 +84,29 @@ static MALLOC_DEFINE(M_SYSFIL, "sysfil", "Jail system call filters");
 #define	SYSFIL_NSYS		SYS_MAXSYSCALL
 #define	SYSFIL_SYS_WORDS	howmany(SYSFIL_NSYS, 64)
 #define	SYSFIL_SEEN_WORDS	howmany(SYSFIL_NSYS, 32)
-#define	SYSFIL_MAXIOCTLS	1024
-#define	SYSFIL_MAXSOCKOPTS	1024
+#define	SYSFIL_MAXIOCTLS	256
+#define	SYSFIL_MAXSOCKOPTS	256
 #define	SYSFIL_MAXSEEN		64
-#define	SYSFIL_STRLEN		16384
+
+/*
+ * Parameter string sizes.  Each must hold the longest value the parameter
+ * can read back, and together they must leave room under the 64 KB that
+ * vfs_buildopts() allows a whole jail_get(2) request (VFS_MOUNTARG_SIZE_MAX),
+ * or "jls -n", which asks for every parameter at once, fails.  Read-back
+ * widths: a syscall name is at most 24 bytes and all of syscallnames[] is
+ * under 7 KB; an ioctl command is 32 bits, "0x" and 8 hex digits; a socket
+ * option is "0x7fffffff:2147483647"; a family name is under 12 bytes.
+ */
+#define	SYSFIL_SYSCALLS_LEN	8192
+#define	SYSFIL_IOCTLS_LEN	(SYSFIL_MAXIOCTLS * 11 + 256)
+#define	SYSFIL_SOCKOPTS_LEN	(SYSFIL_MAXSOCKOPTS * 22 + 256)
+#define	SYSFIL_FAMILIES_LEN	1024
+#define	SYSFIL_SEEN_IOCTLS_LEN	(SYSFIL_MAXSEEN * 11 + 64)
+#define	SYSFIL_SEEN_SOCKOPTS_LEN (SYSFIL_MAXSEEN * 22 + 64)
+_Static_assert(2 * SYSFIL_SYSCALLS_LEN + SYSFIL_IOCTLS_LEN +
+    SYSFIL_SOCKOPTS_LEN + 2 * SYSFIL_FAMILIES_LEN + SYSFIL_SEEN_IOCTLS_LEN +
+    SYSFIL_SEEN_SOCKOPTS_LEN <= 32 * 1024,
+    "sysfil parameters must leave room in a jail_get(2) request");
 
 _Static_assert(AF_MAX < 64, "sysfil family bitmap is one 64-bit word");
 
@@ -137,24 +156,25 @@ SYSCTL_INT(_security_jail, OID_AUTO, sysfil_log_rate, CTLFLAG_RWTUN,
 SYSCTL_JAIL_PARAM_NODE(sysfil, "Jail system call filter");
 SYSCTL_JAIL_PARAM(_sysfil, mode, CTLTYPE_INT | CTLFLAG_RW, "I",
     "Filter mode: 0 off, 1 log only, 2 deny, 3 deny and send SIGSYS");
-SYSCTL_JAIL_PARAM_STRING(_sysfil, syscalls, CTLFLAG_RW, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil, syscalls, CTLFLAG_RW, SYSFIL_SYSCALLS_LEN,
     "System calls the jail may use");
-SYSCTL_JAIL_PARAM_STRING(_sysfil, ioctls, CTLFLAG_RW, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil, ioctls, CTLFLAG_RW, SYSFIL_IOCTLS_LEN,
     "ioctl(2) commands the jail may use");
-SYSCTL_JAIL_PARAM_STRING(_sysfil, sockopts, CTLFLAG_RW, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil, sockopts, CTLFLAG_RW, SYSFIL_SOCKOPTS_LEN,
     "Socket options (level:name) the jail may use");
-SYSCTL_JAIL_PARAM_STRING(_sysfil, families, CTLFLAG_RW, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil, families, CTLFLAG_RW, SYSFIL_FAMILIES_LEN,
     "Socket address families the jail may use");
 SYSCTL_JAIL_PARAM(_sysfil, denied, CTLTYPE_UINT | CTLFLAG_RD, "IU",
     "Number of operations the filter denied or would have denied");
 SYSCTL_JAIL_PARAM_SUBNODE(sysfil, seen, "What the filter denied");
-SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, syscalls, CTLFLAG_RD, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, syscalls, CTLFLAG_RD, SYSFIL_SYSCALLS_LEN,
     "System calls denied or, in log mode, that would have been");
-SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, ioctls, CTLFLAG_RD, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, ioctls, CTLFLAG_RD, SYSFIL_SEEN_IOCTLS_LEN,
     "ioctl(2) commands denied");
-SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, sockopts, CTLFLAG_RD, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, sockopts, CTLFLAG_RD,
+    SYSFIL_SEEN_SOCKOPTS_LEN,
     "Socket options denied");
-SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, families, CTLFLAG_RD, SYSFIL_STRLEN,
+SYSCTL_JAIL_PARAM_STRING(_sysfil_seen, families, CTLFLAG_RD, SYSFIL_FAMILIES_LEN,
     "Address families denied");
 
 static const struct {
@@ -515,7 +535,8 @@ sf_parse_ioctls(struct vfsoptlist *opts, char *s, struct sysfil *sf)
 	v = malloc(SYSFIL_MAXIOCTLS * sizeof(*v), M_SYSFIL, M_WAITOK);
 	cnt = 0;
 	while ((tok = sf_token(&s)) != NULL) {
-		if (sf_number(tok, ULONG_MAX, &n) != 0) {
+		/* Commands are 32 bits: sys_ioctl() truncates wider ones. */
+		if (sf_number(tok, UINT32_MAX, &n) != 0) {
 			vfs_opterror(opts, "sysfil.ioctls: bad command: %s",
 			    tok);
 			free(v, M_SYSFIL);
@@ -611,7 +632,7 @@ sf_parse_families(struct vfsoptlist *opts, char *s, uint64_t *map)
  * writable copy in *out.
  */
 static int
-sf_getstr(struct vfsoptlist *opts, const char *name, char **out)
+sf_getstr(struct vfsoptlist *opts, const char *name, int maxlen, char **out)
 {
 	char *v;
 	int error, len;
@@ -623,8 +644,8 @@ sf_getstr(struct vfsoptlist *opts, const char *name, char **out)
 		vfs_opterror(opts, "%s: not a string", name);
 		return (EINVAL);
 	}
-	if (len > SYSFIL_STRLEN) {
-		vfs_opterror(opts, "%s: longer than %d", name, SYSFIL_STRLEN);
+	if (len > maxlen) {
+		vfs_opterror(opts, "%s: longer than %d", name, maxlen - 1);
 		return (ENAMETOOLONG);
 	}
 	*out = malloc(len, M_SYSFIL, M_WAITOK);
@@ -668,7 +689,7 @@ sf_from_opts(struct vfsoptlist *opts, struct sysfil **sfp)
 	sf = sf_alloc();
 	sf->sf_mode = mode;
 	s = NULL;
-	if ((error = sf_getstr(opts, "sysfil.syscalls", &s)) == 0) {
+	if ((error = sf_getstr(opts, "sysfil.syscalls", SYSFIL_SYSCALLS_LEN, &s)) == 0) {
 		sf->sf_flags |= SF_SYSCALLS;
 		error = sf_parse_syscalls(opts, s, sf->sf_sys);
 		free(s, M_SYSFIL);
@@ -676,21 +697,21 @@ sf_from_opts(struct vfsoptlist *opts, struct sysfil **sfp)
 	/* Each class in turn; ENOENT means "not given". */
 	if (error != 0 && error != ENOENT)
 		goto fail;
-	if ((error = sf_getstr(opts, "sysfil.ioctls", &s)) == 0) {
+	if ((error = sf_getstr(opts, "sysfil.ioctls", SYSFIL_IOCTLS_LEN, &s)) == 0) {
 		sf->sf_flags |= SF_IOCTLS;
 		error = sf_parse_ioctls(opts, s, sf);
 		free(s, M_SYSFIL);
 	}
 	if (error != 0 && error != ENOENT)
 		goto fail;
-	if ((error = sf_getstr(opts, "sysfil.sockopts", &s)) == 0) {
+	if ((error = sf_getstr(opts, "sysfil.sockopts", SYSFIL_SOCKOPTS_LEN, &s)) == 0) {
 		sf->sf_flags |= SF_SOCKOPTS;
 		error = sf_parse_sockopts(opts, s, sf);
 		free(s, M_SYSFIL);
 	}
 	if (error != 0 && error != ENOENT)
 		goto fail;
-	if ((error = sf_getstr(opts, "sysfil.families", &s)) == 0) {
+	if ((error = sf_getstr(opts, "sysfil.families", SYSFIL_FAMILIES_LEN, &s)) == 0) {
 		sf->sf_flags |= SF_FAMILIES;
 		error = sf_parse_families(opts, s, &sf->sf_families);
 		free(s, M_SYSFIL);
