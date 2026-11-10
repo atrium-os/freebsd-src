@@ -648,7 +648,7 @@ struct sysfil_hot {
 	((pr)->pr_sysfil == NULL ? NULL : SYSFIL_HOT(pr)->sh_sys)
 
 /* Is com on the list?  False also for no filter at all (fail closed). */
-static __inline bool
+static __always_inline bool
 sysfil_ioctl_ok(const struct sysfil_hot *h, u_long com)
 {
 	u_int lo, hi, mid;
@@ -670,7 +670,7 @@ sysfil_ioctl_ok(const struct sysfil_hot *h, u_long com)
 }
 
 /* Entries are non-negative, so (level, name) orders like this key. */
-static __inline bool
+static __always_inline bool
 sysfil_sockopt_ok(const struct sysfil_hot *h, int level, int name)
 {
 	uint64_t key, k;
