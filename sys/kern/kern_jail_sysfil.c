@@ -82,7 +82,6 @@
 static MALLOC_DEFINE(M_SYSFIL, "sysfil", "Jail system call filters");
 
 #define	SYSFIL_NSYS		SYS_MAXSYSCALL
-#define	SYSFIL_SYS_WORDS	howmany(SYSFIL_NSYS, 64)
 #define	SYSFIL_SEEN_WORDS	howmany(SYSFIL_NSYS, 32)
 #define	SYSFIL_MAXIOCTLS	256
 #define	SYSFIL_MAXSOCKOPTS	256
@@ -116,26 +115,21 @@ _Static_assert(AF_MAX < 64, "sysfil family bitmap is one 64-bit word");
 #define	SF_SOCKOPTS	0x0004
 #define	SF_FAMILIES	0x0008
 
-struct sysfil_sockopt {
-	int	level;
-	int	name;
-};
-
 struct sysfil {
 	/*
-	 * Immutable once the jail is visible.  sf_sys comes first:
-	 * syscallenter() tests it inline through SYSFIL_SYSBITS().  It is
-	 * all ones when system calls are unrestricted, so that test needs
-	 * no look at sf_flags.
+	 * Immutable once the jail is visible.  The first five fields are
+	 * struct sysfil_hot (sys/jail.h), which the hooks read inline.
+	 * sf_sys is all ones when system calls are unrestricted, and
+	 * sf_ioctls and sf_sockopts are NULL when those are.
 	 */
 	uint64_t	 sf_sys[SYSFIL_SYS_WORDS];
-	int		 sf_mode;		/* JAIL_SYSFIL_* */
-	u_int		 sf_flags;		/* SF_* */
-	uint64_t	 sf_families;
 	u_int		 sf_nioctls;
 	u_int		 sf_nsockopts;
 	u_long		*sf_ioctls;		/* sorted */
 	struct sysfil_sockopt *sf_sockopts;	/* sorted */
+	int		 sf_mode;		/* JAIL_SYSFIL_* */
+	u_int		 sf_flags;		/* SF_* */
+	uint64_t	 sf_families;
 
 	/* What was denied, or would have been in log mode. */
 	struct mtx	 sf_mtx;		/* seen lists, rate limit */
@@ -244,56 +238,18 @@ sf_sockopt_cmp(const void *a, const void *b)
 	return (x->name < y->name ? -1 : x->name > y->name);
 }
 
-/*
- * Open-coded binary searches: these run on every allowed ioctl(2) and
- * socket-option call in a filtered jail, and bsearch(3)'s comparator
- * calls cost more than the search itself on lists this short.
- */
 static bool
 sf_has_ioctl(const struct sysfil *sf, u_long com)
 {
-	const u_long *v = sf->sf_ioctls;
-	u_int lo = 0, hi = sf->sf_nioctls, mid;
 
-	while (lo < hi) {
-		mid = (lo + hi) / 2;
-		if (v[mid] == com)
-			return (true);
-		if (v[mid] < com)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
-	return (false);
-}
-
-/* Entries are non-negative, so (level, name) orders like this key. */
-static __inline uint64_t
-sf_sockopt_key(int level, int name)
-{
-
-	return ((uint64_t)(u_int)level << 32 | (u_int)name);
+	return (sysfil_ioctl_ok((const struct sysfil_hot *)sf, com));
 }
 
 static bool
 sf_has_sockopt(const struct sysfil *sf, int level, int name)
 {
-	const struct sysfil_sockopt *v = sf->sf_sockopts;
-	uint64_t key, k;
-	u_int lo = 0, hi = sf->sf_nsockopts, mid;
 
-	key = sf_sockopt_key(level, name);
-	while (lo < hi) {
-		mid = (lo + hi) / 2;
-		k = sf_sockopt_key(v[mid].level, v[mid].name);
-		if (k == key)
-			return (true);
-		if (k < key)
-			lo = mid + 1;
-		else
-			hi = mid;
-	}
-	return (false);
+	return (sysfil_sockopt_ok((const struct sysfil_hot *)sf, level, name));
 }
 
 static const char *
@@ -310,8 +266,14 @@ sf_afname(int af)
 /* ------------------------------------------------------------------ */
 /* Enforcement.                                                        */
 
-_Static_assert(offsetof(struct sysfil, sf_sys) == 0,
-    "SYSFIL_SYSBITS() reads sf_sys at the start of struct sysfil");
+#define	SF_HOT_SAME(f, h)						\
+	_Static_assert(offsetof(struct sysfil, f) ==			\
+	    offsetof(struct sysfil_hot, h), "struct sysfil_hot mismatch")
+SF_HOT_SAME(sf_sys, sh_sys);
+SF_HOT_SAME(sf_nioctls, sh_nioctls);
+SF_HOT_SAME(sf_nsockopts, sh_nsockopts);
+SF_HOT_SAME(sf_ioctls, sh_ioctls);
+SF_HOT_SAME(sf_sockopts, sh_sockopts);
 _Static_assert(SYSFIL_NSYS <= SYSFIL_SYS_WORDS * 64, "sf_sys too small");
 
 static struct sysfil *
