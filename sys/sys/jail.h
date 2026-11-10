@@ -626,10 +626,74 @@ int sysctl_jail_param(SYSCTL_HANDLER_ARGS);
 #define	SYSFIL_ACTIVE(td)						\
 	(__predict_false(((td)->td_ucred->cr_flags & CRED_FLAG_SYSFIL) != 0))
 /*
- * The system call bitmap at the start of a jail's filter, for the inline
- * test in syscallenter(): bit n set means native call n is allowed.
+ * The leading part of a jail's filter, which the hooks test inline so that
+ * an allowed operation costs no function call; anything else goes to the
+ * sysfil_check_*() functions.  kern_jail_sysfil.c asserts that struct
+ * sysfil starts with exactly these fields.
  */
-#define	SYSFIL_SYSBITS(pr)	((const uint64_t *)(pr)->pr_sysfil)
+#define	SYSFIL_SYS_WORDS	16	/* >= howmany(SYS_MAXSYSCALL, 64) */
+struct sysfil_sockopt {
+	int	level;
+	int	name;
+};
+struct sysfil_hot {
+	uint64_t	 sh_sys[SYSFIL_SYS_WORDS]; /* bit n: native call n ok */
+	u_int		 sh_nioctls;
+	u_int		 sh_nsockopts;
+	u_long		*sh_ioctls;	/* sorted; NULL if unrestricted */
+	struct sysfil_sockopt *sh_sockopts; /* sorted; NULL if unrestricted */
+};
+#define	SYSFIL_HOT(pr)	((const struct sysfil_hot *)(pr)->pr_sysfil)
+#define	SYSFIL_SYSBITS(pr)						\
+	((pr)->pr_sysfil == NULL ? NULL : SYSFIL_HOT(pr)->sh_sys)
+
+/* Is com on the list?  False also for no filter at all (fail closed). */
+static __inline bool
+sysfil_ioctl_ok(const struct sysfil_hot *h, u_long com)
+{
+	u_int lo, hi, mid;
+
+	if (h == NULL)
+		return (false);
+	if (h->sh_ioctls == NULL)
+		return (true);
+	for (lo = 0, hi = h->sh_nioctls; lo < hi;) {
+		mid = (lo + hi) / 2;
+		if (h->sh_ioctls[mid] == com)
+			return (true);
+		if (h->sh_ioctls[mid] < com)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return (false);
+}
+
+/* Entries are non-negative, so (level, name) orders like this key. */
+static __inline bool
+sysfil_sockopt_ok(const struct sysfil_hot *h, int level, int name)
+{
+	uint64_t key, k;
+	u_int lo, hi, mid;
+
+	if (h == NULL)
+		return (false);
+	if (h->sh_sockopts == NULL)
+		return (true);
+	key = (uint64_t)(u_int)level << 32 | (u_int)name;
+	for (lo = 0, hi = h->sh_nsockopts; lo < hi;) {
+		mid = (lo + hi) / 2;
+		k = (uint64_t)(u_int)h->sh_sockopts[mid].level << 32 |
+		    (u_int)h->sh_sockopts[mid].name;
+		if (k == key)
+			return (true);
+		if (k < key)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return (false);
+}
 int sysfil_check_syscall(struct thread *td, u_int code);
 int sysfil_check_ioctl(struct thread *td, u_long com);
 int sysfil_check_sockopt(struct thread *td, int level, int name);

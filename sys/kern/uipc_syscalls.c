@@ -1266,7 +1266,8 @@ kern_setsockopt(struct thread *td, int s, int level, int name, const void *val,
 	if ((int)valsize < 0)
 		return (EINVAL);
 	if (SYSFIL_ACTIVE(td) &&
-	    (error = sysfil_check_sockopt(td, level, name)) != 0)
+	    !sysfil_sockopt_ok(SYSFIL_HOT(td->td_ucred->cr_prison), level,
+	    name) && (error = sysfil_check_sockopt(td, level, name)) != 0)
 		return (error);
 
 	sopt.sopt_dir = SOPT_SET;
@@ -1344,7 +1345,8 @@ kern_getsockopt(struct thread *td, int s, int level, int name, void *val,
 	if ((int)*valsize < 0)
 		return (EINVAL);
 	if (SYSFIL_ACTIVE(td) &&
-	    (error = sysfil_check_sockopt(td, level, name)) != 0)
+	    !sysfil_sockopt_ok(SYSFIL_HOT(td->td_ucred->cr_prison), level,
+	    name) && (error = sysfil_check_sockopt(td, level, name)) != 0)
 		return (error);
 
 	sopt.sopt_dir = SOPT_GET;
