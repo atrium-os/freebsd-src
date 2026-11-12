@@ -42,6 +42,7 @@
 #include "opt_ktrace.h"
 #include <sys/capsicum.h>
 #include <sys/jail.h>
+#include <sys/systrap.h>
 #include <sys/ktr.h>
 #include <sys/vmmeter.h>
 #ifdef KTRACE
@@ -66,6 +67,29 @@ syscallenter(struct thread *td)
 	td->td_pticks = 0;
 	if (__predict_false(td->td_cowgen != atomic_load_int(&p->p_cowgen)))
 		thread_cow_update(td);
+
+	/*
+	 * Syscall traps (<sys/systrap.h>).  For a process that set none this
+	 * is one predicted branch.  A trapped call runs nothing, not even the
+	 * argument fetch (it may be another ABI's call): EJUSTRETURN leaves
+	 * every register for the SIGSYS handler.
+	 */
+	if (__predict_false(atomic_load_ptr(&p->p_systrap) != NULL)) {
+		systrap_hook_t *hook;
+
+		hook = atomic_load_ptr(&systrap_hook);
+		if (hook == NULL) {
+			/* Ranges set but no module to judge them: fail closed. */
+			td->td_errno = ENOSYS;
+			(p->p_sysent->sv_set_syscall_retval)(td, ENOSYS);
+			return;
+		}
+		if (hook(td)) {
+			td->td_errno = EJUSTRETURN;
+			(p->p_sysent->sv_set_syscall_retval)(td, EJUSTRETURN);
+			return;
+		}
+	}
 	traced = (p->p_flag & P_TRACED) != 0;
 	if (__predict_false(traced || (td->td_dbgflags & (TDB_USERWR |
 	    TDB_SET_SC_RET)) != 0)) {

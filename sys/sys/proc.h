@@ -726,6 +726,9 @@ struct proc {
 	struct filemon	*p_filemon;	/* (c) filemon-specific data. */
 	int		p_pdeathsig;	/* (c) Signal from parent on exit. */
 	u_int		p_execblock;	/* (c) Blockers for execve. */
+	void		*p_systrap;	/* (c) Syscall trap ranges, see
+					   <sys/systrap.h>; set by the
+					   process itself. */
 /* End area that is zeroed on creation. */
 #define	p_endzero	p_magic
 
