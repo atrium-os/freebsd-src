@@ -447,6 +447,8 @@ do_fork(struct thread *td, struct fork_req *fr, struct proc *p2, struct thread *
 
 	bzero(&p2->p_startzero,
 	    __rangeof(struct proc, p_startzero, p_endzero));
+	/* After the KBI-fixed fields, so not in the zeroed range. */
+	p2->p_systrap = NULL;
 
 	/* Tell the prison that we exist. */
 	prison_proc_hold(p2->p_ucred->cr_prison);
