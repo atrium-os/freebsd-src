@@ -547,6 +547,8 @@ void sched_instance_select(void);
  * sized from this so an inactive scheduler touching its own td_sched fields
  * cannot run off the end of the item (see sched_shim.c). */
 int sched_sizeof_thread_max(void);
+/* The running scheduler, for a scheduler to ask whether it is the one. */
+const struct sched_instance *sched_active_instance(void);
 
 /*
  * Miscellaneous.

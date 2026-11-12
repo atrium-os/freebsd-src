@@ -67,6 +67,7 @@
 #include <sys/pressure.h>
 #include <sys/proc.h>
 #include <sys/runq.h>
+#define SCHED_IMPLEMENTATION	laminar
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/sysctl.h>
@@ -82,6 +83,12 @@
 #include <vm/pmap.h>	/* amd64: VM_{MIN,MAX}_KERNEL_ADDRESS expand to kva_layout */
 
 #include "cpufreq_if.h"
+
+/*
+ * Namespacing for implementation functions to have same name as interface
+ * functions in the code while retaining namespaced symbols in the kernel ELF.
+ */
+#include "sched_laminar_ns.h"
 
 #ifdef SMP
 static void laminar_dvfs_step(int load_lead, int load_bare);
@@ -401,12 +408,12 @@ struct laminar_lane_entity {
  * active_sched is chosen in machdep.c's early init, long before any SYSINIT
  * runs, so this is safe to call from all of them.
  */
-extern struct sched_instance sched_laminar_instance;
+static const struct sched_instance _sched_instance_laminar;	/* DECLARE_SCHEDULER */
 
 static bool
 laminar_is_active(void)
 {
-	return (active_sched == &sched_laminar_instance);
+	return (sched_active_instance() == &_sched_instance_laminar);
 }
 
 static int laminar_deadline_enable = 1;		/* RWTUN master gate (on by default) */
@@ -4068,7 +4075,7 @@ sched_laminar_sleep(struct thread *td, int prio)
 }
 
 static void
-sched_laminar_sswitch(struct thread *td, int flags)
+sched_laminar_switch(struct thread *td, int flags)
 {
 	struct laminar_tdq *tdq;
 	struct thread *newtd;
@@ -4173,7 +4180,7 @@ sched_laminar_sswitch(struct thread *td, int flags)
 		thread_unblock_switch(td, mtx);
 	}
 	KASSERT(curthread->td_md.md_spinlock_count == 1,
-	    ("sched_laminar_sswitch: invalid spinlock count"));
+	    ("sched_laminar_switch: invalid spinlock count"));
 }
 
 static void
@@ -6032,7 +6039,7 @@ sched_laminar_bind(struct thread *td, int cpu)
 		return;
 	ts->ts_cpu = cpu;
 	/*
-	 * mi_switch routes through sched_laminar_sswitch's TD_IS_RUNNING
+	 * mi_switch routes through sched_laminar_switch's TD_IS_RUNNING
 	 * cross-CPU branch (now wired) which moves us to ts_cpu's tdq.
 	 * Returning from mi_switch we are running on the bound CPU.
 	 */
@@ -6239,54 +6246,4 @@ sched_laminar_sysinit(void)
 
 }
 
-struct sched_instance sched_laminar_instance = {
-#define	SLOT(name)	.name = sched_laminar_##name
-	SLOT(load),
-	SLOT(rr_interval),
-	SLOT(runnable),
-	SLOT(exit),
-	SLOT(fork),
-	SLOT(fork_exit),
-	SLOT(class),
-	SLOT(nice),
-	SLOT(ap_entry),
-	SLOT(exit_thread),
-	SLOT(estcpu),
-	SLOT(fork_thread),
-	SLOT(ithread_prio),
-	SLOT(lend_prio),
-	SLOT(lend_user_prio),
-	SLOT(lend_user_prio_cond),
-	SLOT(pctcpu),
-	SLOT(prio),
-	SLOT(sleep),
-	SLOT(sswitch),
-	SLOT(throw),
-	SLOT(unlend_prio),
-	SLOT(user_prio),
-	SLOT(userret_slowpath),
-	SLOT(add),
-	SLOT(choose),
-	SLOT(clock),
-	SLOT(idletd),
-	SLOT(preempt),
-	SLOT(relinquish),
-	SLOT(rem),
-	SLOT(wakeup),
-	SLOT(bind),
-	SLOT(unbind),
-	SLOT(is_bound),
-	SLOT(affinity),
-	SLOT(sizeof_proc),
-	SLOT(sizeof_thread),
-	SLOT(tdname),
-	SLOT(clear_tdname),
-	SLOT(find_l2_neighbor),
-	SLOT(init),
-	SLOT(init_ap),
-	SLOT(setup),
-	SLOT(initticks),
-	SLOT(sysinit),
-#undef	SLOT
-};
-DECLARE_SCHEDULER(laminar_sched_selector, "Laminar", &sched_laminar_instance);
+DECLARE_SCHEDULER("Laminar");

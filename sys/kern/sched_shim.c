@@ -96,11 +96,17 @@ sched_sizeof_thread_max(void)
 	max = 0;
 	SET_FOREACH(ss, sched_instance_set) {
 		s = *ss;
-		n = s->instance->sizeof_thread();
+		n = s->instance->SCHED_ITF_FIELD_NAME(sizeof_thread)();
 		if (n > max)
 			max = n;
 	}
 	return (max);
+}
+
+const struct sched_instance *
+sched_active_instance(void)
+{
+	return (active_sched);
 }
 
 void
