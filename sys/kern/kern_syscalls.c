@@ -39,7 +39,11 @@
 #include <sys/sysent.h>
 #include <sys/sysproto.h>
 #include <sys/systm.h>
+#include <sys/systrap.h>
 #include <machine/atomic.h>
+
+/* Syscall traps (<sys/systrap.h>): set by the module that implements them. */
+systrap_hook_t *systrap_hook;
 
 /*
  * Acts like "nosys" but can be identified in sysent for dynamic call
