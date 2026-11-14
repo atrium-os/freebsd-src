@@ -387,17 +387,20 @@ fuse_internal_fsync(struct vnode *vp,
 	if (fsess_not_impl(mp, op))
 		return 0;
 
-	fdisp_init(&fdi, sizeof(*ffsi));
 	/*
 	 * fsync every open file handle for this file, because we can't be sure
 	 * which file handle the caller is really referring to.
+	 *
+	 * Each handle gets its own ticket.  Reusing one is only safe once its
+	 * answer has been delivered, which is never the case after an
+	 * asynchronous send (MNT_NOWAIT: the ticket is still queued) or a wait
+	 * that timed out or was interrupted (the ticket stays on the answer
+	 * list until the daemon replies).  Refreshing such a ticket inserts it
+	 * on those lists a second time and corrupts them.
 	 */
 	LIST_FOREACH(fufh, &fvdat->handles, next) {
-		fdi.iosize = sizeof(*ffsi);
-		if (ffsi == NULL)
-			fdisp_make_vp(&fdi, op, vp, td, NULL);
-		else
-			fdisp_refresh_vp(&fdi, op, vp, td, NULL);
+		fdisp_init(&fdi, sizeof(*ffsi));
+		fdisp_make_vp(&fdi, op, vp, td, NULL);
 		ffsi = fdi.indata;
 		ffsi->fh = fufh->fh_id;
 		ffsi->fsync_flags = 0;
@@ -412,14 +415,16 @@ fuse_internal_fsync(struct vnode *vp,
 				fuse_internal_fsync_callback);
 			fuse_insert_message(fdi.tick, false);
 		}
+		fdisp_destroy(&fdi);
 		if (err == ENOSYS) {
 			/* ENOSYS means "success, and don't call again" */
 			fsess_set_notimpl(mp, op);
 			err = 0;
 			break;
 		}
+		if (err != 0)
+			break;
 	}
-	fdisp_destroy(&fdi);
 
 	return err;
 }
