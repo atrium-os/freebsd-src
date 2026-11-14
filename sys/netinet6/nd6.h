@@ -409,6 +409,7 @@ void nd6_prefix_unlink(struct nd_prefix *, struct nd_prhead *);
 void nd6_prefix_del(struct nd_prefix *);
 void nd6_prefix_ref(struct nd_prefix *);
 void nd6_prefix_rele(struct nd_prefix *);
+int nd6_prefix_attach_ifa(struct nd_prefix *, struct in6_ifaddr *);
 int nd6_prefix_offlink(struct nd_prefix *);
 void pfxlist_onlink_check(void);
 struct nd_prefix *nd6_prefix_lookup(struct nd_prefixctl *);

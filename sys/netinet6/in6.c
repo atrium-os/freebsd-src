@@ -1354,8 +1354,7 @@ in6_addifaddr(struct ifnet *ifp, struct in6_aliasreq *ifra, struct in6_ifaddr *i
 
 	/* relate the address to the prefix */
 	if (ia->ia6_ndpr == NULL) {
-		ia->ia6_ndpr = pr;
-		pr->ndpr_addrcnt++;
+		int n = nd6_prefix_attach_ifa(pr, ia);
 
 		/*
 		 * If this is the first autoconf address from the
@@ -1363,7 +1362,7 @@ in6_addifaddr(struct ifnet *ifp, struct in6_aliasreq *ifra, struct in6_ifaddr *i
 		 * (when required).
 		 */
 		if ((ia->ia6_flags & IN6_IFF_AUTOCONF) &&
-		    V_ip6_use_tempaddr && pr->ndpr_addrcnt == 1) {
+		    V_ip6_use_tempaddr && n == 1) {
 			int e;
 			if ((e = in6_tmpifadd(ia, 1, 0)) != 0) {
 				log(LOG_NOTICE, "in6_control: failed "
@@ -1476,13 +1475,35 @@ in6_purgeifaddr(struct in6_ifaddr *ia)
 	 * the ioctl operation.
 	 * Note that in6_purgeaddr() will decrement ndpr_addrcnt.
 	 */
+	ND6_RLOCK();
 	pr = ia->ia6_ndpr;
+	if (pr != NULL)
+		nd6_prefix_ref(pr);
+	ND6_RUNLOCK();
 	in6_purgeaddr(&ia->ia_ifa);
-	if (pr != NULL && pr->ndpr_addrcnt == 0) {
+	if (pr != NULL) {
+		struct nd_prefix *p;
+		bool del = false;
+
+		/*
+		 * Decide under the write lock, where addresses attach
+		 * (nd6_prefix_attach_ifa): an RA may have made a new address
+		 * from this prefix since the purge, or nd6_timer() may have
+		 * unlinked it already.
+		 */
 		ND6_WLOCK();
-		nd6_prefix_unlink(pr, NULL);
+		LIST_FOREACH(p, &V_nd_prefix, ndpr_entry) {
+			if (p == pr)
+				break;
+		}
+		if (p != NULL && pr->ndpr_addrcnt == 0) {
+			nd6_prefix_unlink(pr, NULL);
+			del = true;
+		}
 		ND6_WUNLOCK();
-		nd6_prefix_del(pr);
+		if (del)
+			nd6_prefix_del(pr);
+		nd6_prefix_rele(pr);
 	}
 }
 
@@ -1490,6 +1511,7 @@ in6_purgeifaddr(struct in6_ifaddr *ia)
 static void
 in6_unlink_ifa(struct in6_ifaddr *ia, struct ifnet *ifp)
 {
+	struct nd_prefix *pr;
 	char ip6buf[INET6_ADDRSTRLEN];
 	int remove_lle;
 
@@ -1513,13 +1535,18 @@ in6_unlink_ifa(struct in6_ifaddr *ia, struct ifnet *ifp)
 	 * positive reference.
 	 */
 	remove_lle = 0;
-	if (ia->ia6_ndpr != NULL) {
-		ia->ia6_ndpr->ndpr_addrcnt--;
+	/* Under the ND6 write lock, as nd6_prefix_attach_ifa() counts. */
+	ND6_WLOCK();
+	pr = ia->ia6_ndpr;
+	if (pr != NULL) {
+		pr->ndpr_addrcnt--;
 		/* Do not delete lles within prefix if refcont != 0 */
-		if (ia->ia6_ndpr->ndpr_addrcnt == 0)
+		if (pr->ndpr_addrcnt == 0)
 			remove_lle = 1;
 		ia->ia6_ndpr = NULL;
-	} else if (ia->ia_plen < 128) {
+	}
+	ND6_WUNLOCK();
+	if (pr == NULL && ia->ia_plen < 128) {
 		nd6log((LOG_NOTICE,
 		    "in6_unlink_ifa: autoconf'ed address "
 		    "%s has no prefix\n", ip6_sprintf(ip6buf, IA6_IN6(ia))));

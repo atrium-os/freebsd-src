@@ -685,6 +685,9 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 	int lladdr_off, checklink;
 	u_int lladdr_pad, lladdrlen;
 	bool flush_holdchain = false;
+	/* The sender dropped its router flag: handled after LLE_WUNLOCK. */
+	struct ifnet *unrouter_ifp = NULL;
+	struct in6_addr unrouter;
 
 	NET_EPOCH_ASSERT();
 
@@ -928,19 +931,14 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 			 * Remove the sender from the Default Router List and
 			 * update the Destination Cache entries.
 			 */
-			struct ifnet *nd6_ifp;
-
-			nd6_ifp = lltable_get_ifp(ln->lle_tbl);
-			if (!defrouter_remove(&ln->r_l3addr.addr6, nd6_ifp) &&
-			    (nd6_ifp->if_inet6->nd_flags &
-			     ND6_IFF_ACCEPT_RTADV) != 0)
-				/*
-				 * Even if the neighbor is not in the default
-				 * router list, the neighbor may be used as a
-				 * next hop for some destinations (e.g. redirect
-				 * case). So we must call rt6_flush explicitly.
-				 */
-				rt6_flush(&ip6->ip6_src, ifp);
+			/*
+			 * Not here: defrouter_remove() takes the ND6 lock
+			 * and walks neighbor entries (pfxlist_onlink_check),
+			 * while we hold this entry's lock; pfxlist_onlink_check()
+			 * elsewhere takes them in the other order (deadlock).
+			 */
+			unrouter_ifp = lltable_get_ifp(ln->lle_tbl);
+			unrouter = ln->r_l3addr.addr6;
 		}
 		ln->ln_router = is_router;
 	}
@@ -959,6 +957,19 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 		nd6_flush_holdchain(ifp, ln, chain);
 	if (flush_holdchain)
 		nd6_flush_children_holdchain(ifp, ln);
+
+	if (unrouter_ifp != NULL) {
+		if (!defrouter_remove(&unrouter, unrouter_ifp) &&
+		    (unrouter_ifp->if_inet6->nd_flags &
+		     ND6_IFF_ACCEPT_RTADV) != 0)
+			/*
+			 * Even if the neighbor is not in the default
+			 * router list, the neighbor may be used as a
+			 * next hop for some destinations (e.g. redirect
+			 * case). So we must call rt6_flush explicitly.
+			 */
+			rt6_flush(&ip6->ip6_src, ifp);
+	}
 
 	if (checklink)
 		pfxlist_onlink_check();

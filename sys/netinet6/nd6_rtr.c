@@ -1377,6 +1377,33 @@ nd6_prefix_ref(struct nd_prefix *pr)
 	refcount_acquire(&pr->ndpr_refcnt);
 }
 
+/*
+ * Relate an address to its prefix (ndpr_addrcnt), unless the prefix has
+ * already been unlinked for deletion: an address must never point to a
+ * prefix that nd6_prefix_del() is about to free.  The count and the
+ * "still linked" test are made under the ND6 write lock, which is also
+ * where in6_purgeifaddr() and nd6_timer() decide to unlink a prefix whose
+ * count is zero.  Returns the new count, or 0 if not attached.
+ */
+int
+nd6_prefix_attach_ifa(struct nd_prefix *pr, struct in6_ifaddr *ia)
+{
+	struct nd_prefix *p;
+	int n = 0;
+
+	ND6_WLOCK();
+	LIST_FOREACH(p, &V_nd_prefix, ndpr_entry) {
+		if (p == pr)
+			break;
+	}
+	if (p != NULL && ia->ia6_ndpr == NULL) {
+		ia->ia6_ndpr = pr;
+		n = ++pr->ndpr_addrcnt;
+	}
+	ND6_WUNLOCK();
+	return (n);
+}
+
 void
 nd6_prefix_rele(struct nd_prefix *pr)
 {
@@ -1754,8 +1781,7 @@ prelist_update(struct nd_prefixctl *new, struct nd_defrouter *dr,
 			/*
 			 * note that we should use pr (not new) for reference.
 			 */
-			pr->ndpr_addrcnt++;
-			ia6->ia6_ndpr = pr;
+			(void)nd6_prefix_attach_ifa(pr, ia6);
 
 			/*
 			 * RFC 3041 3.3 (2).
@@ -2499,6 +2525,7 @@ in6_tmpifadd(const struct in6_ifaddr *ia0, int forcegen, int delay)
 {
 	struct ifnet *ifp = ia0->ia_ifa.ifa_ifp;
 	struct in6_ifaddr *newia;
+	struct nd_prefix *pr;
 	struct in6_aliasreq ifra;
 	int error;
 	int trylimit = 3;	/* XXX: adhoc value */
@@ -2592,8 +2619,15 @@ in6_tmpifadd(const struct in6_ifaddr *ia0, int forcegen, int delay)
 		    __func__));
 		return (EINVAL); /* XXX */
 	}
-	newia->ia6_ndpr = ia0->ia6_ndpr;
-	newia->ia6_ndpr->ndpr_addrcnt++;
+	ND6_RLOCK();
+	pr = ia0->ia6_ndpr;
+	if (pr != NULL)
+		nd6_prefix_ref(pr);
+	ND6_RUNLOCK();
+	if (pr != NULL) {
+		(void)nd6_prefix_attach_ifa(pr, newia);
+		nd6_prefix_rele(pr);
+	}
 	ifa_free(&newia->ia_ifa);
 
 	/*
