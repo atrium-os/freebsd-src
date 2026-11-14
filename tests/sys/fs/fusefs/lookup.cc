@@ -462,6 +462,53 @@ TEST_F(Lookup, parent_inode)
 	ASSERT_EQ(EIO, errno);
 }
 
+/*
+ * The naughty server returns a directory's grandparent, then the root, as
+ * children of it.  Either would make the directory graph cyclic, and
+ * lookups walking it in opposite directions would deadlock on vnode locks.
+ */
+TEST_F(Lookup, ancestor_inode)
+{
+	const char DIRPATH[] = "mountpoint/a/b";
+	uint64_t a_ino = 2;
+	uint64_t b_ino = 3;
+
+	EXPECT_LOOKUP(FUSE_ROOT_ID, "a")
+	.WillRepeatedly(Invoke(ReturnImmediate([=](auto in __unused, auto& out) {
+		SET_OUT_HEADER_LEN(out, entry);
+		out.body.entry.attr.mode = S_IFDIR | 0755;
+		out.body.entry.nodeid = a_ino;
+		out.body.entry.attr_valid = UINT64_MAX;
+		out.body.entry.entry_valid = UINT64_MAX;
+	})));
+	EXPECT_LOOKUP(a_ino, "b")
+	.WillRepeatedly(Invoke(ReturnImmediate([=](auto in __unused, auto& out) {
+		SET_OUT_HEADER_LEN(out, entry);
+		out.body.entry.attr.mode = S_IFDIR | 0755;
+		out.body.entry.nodeid = b_ino;
+		out.body.entry.attr_valid = UINT64_MAX;
+		out.body.entry.entry_valid = UINT64_MAX;
+	})));
+	EXPECT_LOOKUP(b_ino, "up")
+	.WillOnce(Invoke(ReturnImmediate([=](auto in __unused, auto& out) {
+		SET_OUT_HEADER_LEN(out, entry);
+		out.body.entry.attr.mode = S_IFDIR | 0755;
+		out.body.entry.nodeid = a_ino;
+	})));
+	EXPECT_LOOKUP(b_ino, "top")
+	.WillOnce(Invoke(ReturnImmediate([=](auto in __unused, auto& out) {
+		SET_OUT_HEADER_LEN(out, entry);
+		out.body.entry.attr.mode = S_IFDIR | 0755;
+		out.body.entry.nodeid = FUSE_ROOT_ID;
+	})));
+
+	ASSERT_EQ(0, access(DIRPATH, F_OK)) << strerror(errno);
+	ASSERT_EQ(-1, access("mountpoint/a/b/up", F_OK));
+	ASSERT_EQ(EIO, errno);
+	ASSERT_EQ(-1, access("mountpoint/a/b/top", F_OK));
+	ASSERT_EQ(EIO, errno);
+}
+
 // Lookup in a subdirectory of the fuse mount
 TEST_F(Lookup, subdir)
 {

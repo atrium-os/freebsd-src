@@ -290,6 +290,48 @@ fuse_vnode_alloc(struct mount *mp,
 	return (0);
 }
 
+/*
+ * Would making nodeid a child of dvp close a cycle?  A server that answers
+ * a LOOKUP (or CREATE, MKDIR, ...) in dvp with the node id of dvp's parent,
+ * grandparent or the root makes the directory graph cyclic, and lookups
+ * walking it in opposite directions then take the same vnode locks in
+ * opposite orders: the threads deadlock in lockmgr, unkillable, and the
+ * mount can never be unmounted, whatever the daemon does afterwards (found
+ * by a hostile-server fuzzer).  Walk dvp's recorded ancestors.
+ *
+ * The walk only looks at vnodes that still exist; their parent_nid is read
+ * under the interlock of a held, not yet doomed vnode, so no vnode lock is
+ * taken and the lock order with dvp doesn't matter.
+ */
+static bool
+fuse_vnode_is_ancestor(struct mount *mp, struct vnode *dvp, uint64_t nodeid)
+{
+	struct fuse_vnode_data *fvdat;
+	struct vnode *vp;
+	uint64_t cur;
+	int depth;
+
+	if (nodeid == FUSE_ROOT_ID)
+		return (true);
+	cur = VTOFUD(dvp)->parent_nid;
+	for (depth = 0; cur != 0 && depth < 4096; depth++) {
+		if (cur == nodeid)
+			return (true);
+		if (cur == FUSE_ROOT_ID)
+			return (false);
+		vfs_hash_hold(mp, fuse_vnode_hash(cur), &vp, fuse_vnode_cmp,
+		    &cur);
+		if (vp == NULL)
+			return (false);
+		VI_LOCK(vp);
+		fvdat = VN_IS_DOOMED(vp) ? NULL : VTOFUD(vp);
+		cur = fvdat != NULL ? fvdat->parent_nid : 0;
+		VI_UNLOCK(vp);
+		vdrop(vp);
+	}
+	return (false);
+}
+
 int
 fuse_vnode_get(struct mount *mp,
     struct fuse_entry_out *feo,
@@ -312,6 +354,11 @@ fuse_vnode_get(struct mount *mp,
 	if (dvp != NULL && VTOFUD(dvp)->nid == nodeid) {
 		fuse_warn(fuse_get_mpdata(mp), FSESS_WARN_ILLEGAL_INODE,
 			"Assigned same inode to both parent and child.");
+		return EIO;
+	}
+	if (dvp != NULL && fuse_vnode_is_ancestor(mp, dvp, nodeid)) {
+		fuse_warn(fuse_get_mpdata(mp), FSESS_WARN_DIR_CYCLE,
+			"Assigned a directory's ancestor as its child.");
 		return EIO;
 	}
 	if (feo && feo->nodeid != feo->attr.ino && exportable) {

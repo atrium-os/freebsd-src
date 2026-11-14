@@ -139,6 +139,33 @@ vfs_hash_ref(const struct mount *mp, u_int hash, struct thread *td,
 	}
 }
 
+/*
+ * Like vfs_hash_ref(), but the vnode comes back only held: the caller may
+ * look at it under its interlock and must vdrop() it.  Unlike vrele(),
+ * vdrop() never takes the vnode lock, so this is safe while holding
+ * other vnode locks in any order.
+ */
+void
+vfs_hash_hold(const struct mount *mp, u_int hash, struct vnode **vpp,
+    vfs_hash_cmp_t *fn, void *arg)
+{
+	struct vnode *vp;
+
+	rw_rlock(&vfs_hash_lock);
+	LIST_FOREACH(vp, vfs_hash_bucket(mp, hash), v_hashlist) {
+		if (vp->v_hash != hash)
+			continue;
+		if (vp->v_mount != mp)
+			continue;
+		if (fn != NULL && fn(vp, arg))
+			continue;
+		vhold(vp);
+		break;
+	}
+	rw_runlock(&vfs_hash_lock);
+	*vpp = vp;
+}
+
 void
 vfs_hash_remove(struct vnode *vp)
 {
