@@ -930,7 +930,14 @@ restart:
 	ndp->ni_vp = NULL;
 	vrele(ndp->ni_dvp);
 out:
-	MPASS(error != 0 && error != ERESTART);
+	/*
+	 * vfs_lookup()'s ERESTART is handled above, but VOP_READLINK() in
+	 * namei_follow_link() may sleep interruptibly (fusefs waiting on its
+	 * daemon, NFS with intr) and fail with ERESTART when a signal
+	 * arrives.  That one is passed up, so the system call restarts or
+	 * the thread exits.
+	 */
+	MPASS(error != 0);
 	SDT_PROBE4(vfs, namei, lookup, return, error, NULL, false, ndp);
 	namei_cleanup_cnp(cnp);
 	nameicap_cleanup(ndp, error);
