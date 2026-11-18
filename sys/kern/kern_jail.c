@@ -4246,6 +4246,25 @@ jailed_without_vnet(struct ucred *cred)
 }
 
 /*
+ * Atrium: a jail on the host's network stack with neither IPv4 nor IPv6
+ * sees no network.  The host's interfaces, their link-layer addresses,
+ * routes and neighbours are hidden from it, so such a jail needs no empty
+ * vnet of its own to keep the machine's MAC addresses private (an empty
+ * vnet costs tens of milliseconds to create and destroy).
+ */
+FEATURE(jail_netblind, "Jails without IPv4 and IPv6 cannot see the host's network");
+
+bool
+prison_netblind(struct ucred *cred)
+{
+
+	if (!jailed_without_vnet(cred))
+		return (false);
+	return (prison_check_af(cred, AF_INET) != 0 &&
+	    prison_check_af(cred, AF_INET6) != 0);
+}
+
+/*
  * Return the correct hostname (domainname, et al) for the passed credential.
  */
 void

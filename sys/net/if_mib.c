@@ -30,7 +30,9 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/jail.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 
@@ -78,6 +80,9 @@ sysctl_ifdata(SYSCTL_HANDLER_ARGS) /* XXX bad syntax! */
 	if (namelen != 2)
 		return EINVAL;
 	if (name[0] <= 0)
+		return (ENOENT);
+	/* Atrium: a jail without IPv4 and IPv6 sees no interfaces. */
+	if (prison_netblind(req->td->td_ucred))
 		return (ENOENT);
 	NET_EPOCH_ENTER(et);
 	ifp = ifnet_byindex_ref(name[0]);

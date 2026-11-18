@@ -401,6 +401,8 @@ rts_attach(struct socket *so, int proto, struct thread *td)
 	struct rcb *rcb;
 	int error;
 
+	if (prison_netblind(td->td_ucred))
+		return (EAFNOSUPPORT);
 	error = soreserve(so, rts_sendspace, rts_recvspace);
 	if (error)
 		return (error);
@@ -2609,6 +2611,9 @@ sysctl_rtsock(SYSCTL_HANDLER_ARGS)
 	namelen--;
 	if (req->newptr)
 		return (EPERM);
+	/* Atrium: a jail without IPv4 and IPv6 sees no interfaces or routes. */
+	if (prison_netblind(req->td->td_ucred))
+		return (0);
 	if (name[1] == NET_RT_DUMP || name[1] == NET_RT_NHOP || name[1] == NET_RT_NHGRP) {
 		if (namelen == 3)
 			fib = req->td->td_proc->p_fibnum;

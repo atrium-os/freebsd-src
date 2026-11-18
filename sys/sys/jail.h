@@ -558,6 +558,7 @@ struct vfsconf;
 #define jailed(cred)	(cred->cr_prison != &prison0)
 
 bool jailed_without_vnet(struct ucred *);
+bool prison_netblind(struct ucred *);
 void getcredhostname(struct ucred *, char *, size_t);
 void getcreddomainname(struct ucred *, char *, size_t);
 void getcredhostuuid(struct ucred *, char *, size_t);

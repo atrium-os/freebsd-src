@@ -3025,6 +3025,10 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct thread *td)
 	bool shutdown;
 #endif
 
+	/* Atrium: a jail without IPv4 and IPv6 sees no interfaces. */
+	if (prison_netblind(td->td_ucred))
+		return (ENXIO);
+
 	CURVNET_SET(so->so_vnet);
 #ifdef VIMAGE
 	/* Make sure the VNET is stable. */

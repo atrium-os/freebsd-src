@@ -320,6 +320,9 @@ nl_attach(struct socket *so, int proto, struct thread *td)
 
 	if (__predict_false(netlink_unloading != 0))
 		return (EAFNOSUPPORT);
+	/* Atrium: a jail without IPv4 and IPv6 sees no network. */
+	if (prison_netblind(td->td_ucred))
+		return (EAFNOSUPPORT);
 
 	error = nl_verify_proto(proto);
 	if (error != 0)
