@@ -66,10 +66,11 @@ nodevice	netmap
 #                netgraph includes the in-kernel Bluetooth stack (Vinculum
 #                is user space)
 #  nfs* krpc kgssapi*   NFS and RPCSEC_GSS
-#  fusefs smbfs  user-space and network file systems
+#  smbfs         a network file system (fusefs stays loadable: Capsa
+#                sticks, network shares and trusted-stick grants use FUSE)
 #  netmap ctl cryptodev  raw NIC rings, CAM target, /dev/crypto
 #  vmm           bhyve, until the micro-VM lane needs it
 #  sysvipc ipsec mlx4* mlx5* ibcore ipoib iser hyperv
 #  zfs is NOT listed: the development VM root is ZFS.  Remove it once the
 #  Tessera root is the default.
-makeoptions	WITHOUT_MODULES="linux linux64 linux_common linprocfs linsysfs linuxkpi linuxkpi_hdmi linuxkpi_video linuxkpi_wlan sctp tcp ipfw ipfw_nat ipfw_nat64 ipfw_nptv6 ipfw_pmod ipdivert libalias netgraph nfscl nfsd nfslockd nfscommon nfssvc krpc kgssapi kgssapi_krb5 fusefs smbfs netmap ctl cryptodev vmm sysvipc ipsec mlx4 mlx4en mlx4ib mlx5 mlx5en mlx5ib ibcore ipoib iser hyperv"
+makeoptions	WITHOUT_MODULES="linux linux64 linux_common linprocfs linsysfs linuxkpi linuxkpi_hdmi linuxkpi_video linuxkpi_wlan sctp tcp ipfw ipfw_nat ipfw_nat64 ipfw_nptv6 ipfw_pmod ipdivert libalias netgraph nfscl nfsd nfslockd nfscommon nfssvc krpc kgssapi kgssapi_krb5 smbfs netmap ctl cryptodev vmm sysvipc ipsec mlx4 mlx4en mlx4ib mlx5 mlx5en mlx5ib ibcore ipoib iser hyperv"
