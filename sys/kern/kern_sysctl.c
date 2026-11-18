@@ -51,6 +51,7 @@
 #include <sys/malloc.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
+#include <sys/socket.h>
 #include <sys/jail.h>
 #include <sys/kdb.h>
 #include <sys/lock.h>
@@ -2336,6 +2337,17 @@ sysctl_root(SYSCTL_HANDLER_ARGS)
 	struct sysctl_oid *oid;
 	struct rm_priotracker tracker;
 	int error, indx, lvl;
+
+	/*
+	 * Atrium: a jail that sees no network (prison_netblind) reads nothing
+	 * under net. -- not the host's traffic counters, forwarding or interface
+	 * count.  net.route answers it with an empty list itself, so getifaddrs()
+	 * still works and finds nothing.
+	 */
+	if (arg2 >= 1 && ((int *)arg1)[0] == CTL_NET &&
+	    !(arg2 >= 2 && ((int *)arg1)[1] == PF_ROUTE) &&
+	    req->td != NULL && prison_netblind(req->td->td_ucred))
+		return (ENOENT);
 
 	SYSCTL_RLOCK(&tracker);
 
