@@ -552,10 +552,19 @@ ipv6if()
 	case "${ipv6_network_interfaces}" in
 	$_if|"$_if "*|*" $_if"|*" $_if "*|[Aa][Uu][Tt][Oo])
 		# True if $ifconfig_IF_ipv6 is defined.
-		_tmpargs=`_ifconfig_getargs $_if ipv6`
+		_tmpargs=`get_if_var $_if ifconfig_IF_ipv6`
 		if [ -n "${_tmpargs}" ]; then
 			return 0
 		fi
+
+		# $ifconfig_DEFAULT stands in for it, but is usually
+		# IPv4-only ("DHCP"): count it only when it configures inet6,
+		# or every port counts as IPv6 and netif sleeps for DAD.
+		case " `ifconfig_getargs $_if ipv6` " in
+		*" inet6 "*)
+			return 0
+			;;
+		esac
 
 		# True if $ipv6_prefix_IF is defined.
 		_tmpargs=`get_if_var $_if ipv6_prefix_IF`
